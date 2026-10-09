@@ -3,6 +3,12 @@
     "default_dark_mode": true
   },
   "scan_interval_seconds": 300,
+  "playback": {
+    "max_processes": 2,
+    "ffmpeg_threads": 2,
+    "idle_timeout_seconds": 60,
+    "startup_timeout_seconds": 90
+  },
   "dandanplay": {
     "enabled": false,
     "api_base": ""

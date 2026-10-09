@@ -1,11 +1,10 @@
 <!doctype html>
-<html lang="ja">
+<html lang="en">
 
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Anime Server</title>
-  <link rel="stylesheet" href="/style.css" />
 </head>
 
 <body>
@@ -20,7 +19,7 @@
     <button id="scan" class="primary-button">Scan videos</button>
   </header>
   <main>
-    <section class="panel player-panel">
+    <section class="panel player-panel" tabindex="0" aria-label="Video player">
       <div class="section-heading">
         <div>
           <span class="eyebrow">Now playing</span>
@@ -28,7 +27,40 @@
         </div>
       </div>
       <div class="video-frame">
-        <video id="player" controls></video>
+        <div class="video-stage">
+          <video id="player" playsinline preload="metadata" disablepictureinpicture disableremoteplayback></video>
+        </div>
+      </div>
+      <div class="player-controls">
+        <label class="seek-label" for="seek">Playback position</label>
+        <input id="seek" type="range" min="0" max="0" value="0" step="0.1" disabled aria-label="Playback position" />
+        <div class="control-buttons">
+          <button id="toggle-play" type="button" disabled>Play</button>
+          <button id="stop" type="button">Stop</button>
+          <button id="restart" type="button">Start over</button>
+          <output id="clock">0:00 / 0:00</output>
+          <button id="mute" type="button">Mute</button>
+          <input id="volume" type="range" min="0" max="1" value="1" step="0.05" aria-label="Volume" />
+          <button id="fullscreen" type="button">Fullscreen</button>
+        </div>
+      </div>
+      <div class="track-controls">
+        <label>
+          <span>Audio</span>
+          <select id="audio-track" disabled></select>
+        </label>
+        <label>
+          <span>Subtitles</span>
+          <select id="subtitle-track" disabled></select>
+        </label>
+      </div>
+      <div class="playback-feedback">
+        <span id="playback-status" role="status">Select a video from the library</span>
+        <div id="error" role="alert"></div>
+        <div id="error-actions" hidden>
+          <button id="retry" type="button">Retry</button>
+          <button id="retry-probe" type="button">Retry probe</button>
+        </div>
       </div>
       <div id="meta">Select a video from the library</div>
     </section>
@@ -43,7 +75,7 @@
       <div id="files" class="files-list"></div>
     </section>
   </main>
-  <script type="module" src="/main.js"></script>
+  <script type="module" src="/src/main.ts"></script>
 </body>
 
 </html>

@@ -6,9 +6,12 @@ use axum::{
     Router,
 };
 use serde_json::json;
+use std::path::PathBuf;
 
 use crate::db::models::ProgressInput;
-use crate::{db::repository, AppState};
+use crate::{config::VIDEO_ROOT, db::repository, AppState};
+
+mod playback;
 
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -24,6 +27,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/config", get(get_config))
         .route("/api/scan", post(scan))
+        .merge(playback::router())
         .with_state(state)
 }
 
@@ -73,23 +77,9 @@ async fn get_file(
                 .into_response();
         }
     };
-    let media_url = paths
-        .first()
-        .map(|path| {
-            format!(
-                "/media/{}",
-                path.relative_path()
-                    .split('/')
-                    .map(url_segment)
-                    .collect::<Vec<_>>()
-                    .join("/")
-            )
-        })
-        .unwrap_or_default();
-
     (
         StatusCode::OK,
-        Json(json!({"video": video, "paths": paths, "media_url": media_url})),
+        Json(json!({"video": video, "paths": paths})),
     )
         .into_response()
 }
@@ -141,6 +131,9 @@ async fn save_progress(
     Path(pre16mib_md5): Path<String>,
     Json(input): Json<ProgressInput>,
 ) -> impl IntoResponse {
+    if !input.position.is_finite() || input.position < 0.0 {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "position must be finite and non-negative"}))).into_response();
+    }
     match repository::save_progress(&state.db, &pre16mib_md5, input.position).await {
         Ok(()) => (StatusCode::NO_CONTENT, "").into_response(),
         Err(sqlx::Error::RowNotFound) => (
@@ -167,15 +160,19 @@ async fn scan(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
-fn url_segment(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut output = String::with_capacity(value.len());
-    for &byte in bytes {
-        if byte.is_ascii_alphanumeric() || b"-_.~".contains(&byte) {
-            output.push(byte as char);
-        } else {
-            output.push_str(&format!("%{byte:02X}"));
-        }
+pub async fn media_path(state: &AppState, id: &str) -> anyhow::Result<PathBuf> {
+    anyhow::ensure!(id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()), "invalid file ID");
+    let root = tokio::fs::canonicalize(VIDEO_ROOT).await?;
+    let paths = repository::get_paths(&state.db, id).await?;
+    for entry in paths {
+        let candidate = root.join(entry.relative_path());
+        let resolved = match tokio::fs::canonicalize(&candidate).await {
+            Ok(path) => path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        anyhow::ensure!(resolved.starts_with(&root), "media path resolves outside media directory");
+        if tokio::fs::metadata(&resolved).await?.is_file() { return Ok(resolved); }
     }
-    output
+    anyhow::bail!("no available media path for file");
 }

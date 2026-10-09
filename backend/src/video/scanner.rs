@@ -18,9 +18,16 @@ const EXTENSIONS: &[&str] = &["mp4", "mkv", "webm", "mov", "avi", "m4v"];
 const HASH_LIMIT: u64 = 16 * 1024 * 1024;
 
 pub async fn scan_once(state: &AppState) -> Result<u64> {
+    let _scan = state.scan_lock.lock().await;
+    let files = tokio::task::spawn_blocking(collect_files).await??;
+    repository::sync_scanned_files(&state.db, &files).await?;
+    Ok(files.len() as u64)
+}
+
+fn collect_files() -> Result<Vec<ScannedFile>> {
     let root = Path::new(VIDEO_ROOT);
     if !root.exists() {
-        return Ok(0);
+        anyhow::bail!("media directory is missing");
     }
 
     let mut files = Vec::new();
@@ -33,8 +40,7 @@ pub async fn scan_once(state: &AppState) -> Result<u64> {
         files.push(scan_file(root, absolute_path)?);
     }
 
-    repository::sync_scanned_files(&state.db, &files).await?;
-    Ok(files.len() as u64)
+    Ok(files)
 }
 
 fn scan_file(root: &Path, absolute_path: &Path) -> Result<ScannedFile> {

@@ -1,10 +1,17 @@
 {
   "name": "anime-server-web",
   "private": true,
+  "type": "module",
   "scripts": {
-    "build": "tsc"
+    "dev": "vite --host 0.0.0.0",
+    "build": "tsc --noEmit && vite build && mkdir -p dist/licenses && cp node_modules/hls.js/LICENSE dist/licenses/hls.txt",
+    "test": "node --experimental-strip-types --test src/playback/*.test.*"
+  },
+  "dependencies": {
+    "hls.js": "1.7.3"
   },
   "devDependencies": {
-    "typescript": "^5.8.3"
+    "typescript": "5.9.3",
+    "vite": "8.3.4"
   }
 }
