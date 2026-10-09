@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="ja">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Anime Server</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+
+<body>
+  <header>
+    <div class="brand">
+      <span class="brand-mark">A</span>
+      <div>
+        <h1>Anime Server</h1>
+        <p>Local video library</p>
+      </div>
+    </div>
+    <button id="scan" class="primary-button">Scan videos</button>
+  </header>
+  <main>
+    <section class="panel player-panel">
+      <div class="section-heading">
+        <div>
+          <span class="eyebrow">Now playing</span>
+          <h2>Video player</h2>
+        </div>
+      </div>
+      <div class="video-frame">
+        <video id="player" controls></video>
+      </div>
+      <div id="meta">Select a video from the library</div>
+    </section>
+    <section class="panel files-panel">
+      <div class="section-heading files-heading">
+        <div>
+          <span class="eyebrow">Library</span>
+          <h2>Video files</h2>
+        </div>
+        <span id="files-count" class="count-badge">0</span>
+      </div>
+      <div id="files" class="files-list"></div>
+    </section>
+  </main>
+  <script type="module" src="/main.js"></script>
+</body>
+
+</html>

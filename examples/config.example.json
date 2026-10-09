@@ -1,0 +1,10 @@
+{
+  "web": {
+    "default_dark_mode": true
+  },
+  "scan_interval_seconds": 300,
+  "dandanplay": {
+    "enabled": false,
+    "api_base": ""
+  }
+}

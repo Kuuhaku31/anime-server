@@ -1,0 +1,12 @@
+services:
+  anime-server:
+    build: .
+    image: anime-server:dev
+    container_name: anime-server
+    ports:
+      - "${PORT}:8080"
+    volumes:
+      - "${CONFIG_DIR}:/config:ro"
+      - "${MEDIA_DIR}:/media:ro"
+      - "${DATA_DIR}:/data"
+    restart: unless-stopped

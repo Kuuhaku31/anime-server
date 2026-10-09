@@ -1,0 +1,10 @@
+{
+  "name": "anime-server-web",
+  "private": true,
+  "scripts": {
+    "build": "tsc"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.3"
+  }
+}
