@@ -1,7 +1,8 @@
-"""Exercise unified playback against an isolated server with generated media."""
+"""Exercise shared HLS caches against an isolated server with generated media."""
 
 import argparse
 import array
+import hashlib
 import json
 import math
 import struct
@@ -95,7 +96,11 @@ def fixtures(directory, font):
         str(directory / "hevc.mkv"),
     )
     ffmpeg("-i", source, "-an", "-c:v", "copy", str(directory / "silent.mkv"))
-    ffmpeg("-stream_loop", "59", "-i", source, "-c", "copy", str(directory / "long.mkv"))
+    ffmpeg("-f", "lavfi", "-i", "testsrc2=size=320x180:rate=120", "-t", "3",
+        "-c:v", "libx264", "-threads", "1", str(directory / "high-fps.mp4"))
+    for name, rate in [("sixty-fps.mkv", "60"), ("fractional-fps.mkv", "60000/1001")]:
+        ffmpeg("-f", "lavfi", "-i", f"testsrc2=size=320x180:rate={rate}", "-t", "3",
+            "-c:v", "libx264", "-threads", "1", str(directory / name))
     subtitle = Path(__file__).parent / "fixtures" / "sample.ass"
     srt = Path(__file__).parent / "fixtures" / "sample.srt"
     ffmpeg(
@@ -142,6 +147,7 @@ def fixtures(directory, font):
     ffmpeg(
         "-itsoffset", "5", "-i", str(directory / "tracks.mkv"), "-map", "0", "-c", "copy", str(directory / "offset.mkv")
     )
+    ffmpeg("-stream_loop", "29", "-i", str(directory / "tracks.mkv"), "-map", "0", "-c", "copy", str(directory / "long.mkv"))
     bitmap_fixture(directory / "sample.sup")
     ffmpeg(
         "-i",
@@ -170,6 +176,7 @@ class Client:
         self.media = Path("/media") if container else media
         self.limit = limit
         self.sessions = []
+        self.keys = {}
 
     def call(self, path, body=None, method="GET", headers=None, status=200):
         data = json.dumps(body).encode() if body is not None else None
@@ -197,7 +204,6 @@ class Client:
         result = self.call(
             f"/api/files/{file}/playback-plan",
             {
-                "source_version": info["source_version"],
                 "video_stream_index": 0,
                 "audio_stream_index": audio,
                 "subtitle_stream_index": subtitle,
@@ -206,6 +212,11 @@ class Client:
             "POST",
         )
         self.sessions.append(result["session_id"])
+        config = {
+            "src_file_pre16mib_md5": file, "video_stream": 0, "audio_stream": audio,
+            "subtitle_stream": subtitle, "encoder_profile": "h264-high-yuv420p-aac-fmp4-v1",
+        }
+        self.keys[result["session_id"]] = hashlib.md5(json.dumps(config, separators=(",", ":")).encode()).hexdigest()
         assert set(result) == {
             "session_id",
             "url",
@@ -218,25 +229,40 @@ class Client:
             "error",
         }, result
         assert result["mime_type"] == "application/vnd.apple.mpegurl"
-        assert result["start_time"] == position, result
+        assert result["start_time"] == 0, result
         return result
 
-    def ready(self, plan):
+    def ready(self, plan, position=0, complete=False):
         deadline = time.monotonic() + 120
         while time.monotonic() < deadline:
             state = self.call(f"/api/playback/{plan['session_id']}/status")
             assert state["state"] not in ("failed", "cancelled"), state
-            if state["ready"]:
+            if state["ready"] and state["buffered_until"] > position and (not complete or state["state"] == "complete"):
                 return state
             time.sleep(0.2)
         raise AssertionError("playback never became ready")
 
-    def exists(self, id):
+    def cache_path(self, plan):
+        return f"/cache/playback/{self.keys[plan['session_id']]}"
+
+    def exists(self, path):
         result = subprocess.run(
-            ["docker", "exec", self.container, "test", "-d", f"/data/playback-sessions/{id}"], check=False
+            ["docker", "exec", self.container, "test", "-e", path], check=False
         )
         assert result.returncode in (0, 1)
         return result.returncode == 0
+
+    def restart(self, seconds=5):
+        subprocess.run(["docker", "restart", "--time", str(seconds), self.container],
+            check=True, stdout=subprocess.DEVNULL)
+        deadline = time.monotonic() + 30
+        while True:
+            try:
+                self.call("/health")
+                return
+            except (urllib.error.URLError, ConnectionError):
+                assert time.monotonic() < deadline, "server failed to restart"
+                time.sleep(0.2)
 
     def release(self, plan):
         id = plan["session_id"]
@@ -244,16 +270,24 @@ class Client:
         self.sessions.remove(id)
         self.call(f"/api/playback/{id}/status", status=404)
         if self.container:
-            assert not self.exists(id), "released session directory still exists"
+            assert self.exists(self.cache_path(plan)), "releasing a lease deleted its cache"
 
-    def stream(self, plan, audio=True):
+    def stream(self, plan, audio=True, position=0):
         playlist = self.call(plan["url"]).decode()
         assert '#EXT-X-MAP:URI="init.mp4"' in playlist
         assert "#EXT-X-INDEPENDENT-SEGMENTS" in playlist
         first = next(line for line in playlist.splitlines() if line.endswith(".m4s"))
         base = plan["url"].rsplit("/", 1)[0]
         assert len(self.call(f"{base}/{first}", headers={"Range": "bytes=0-31"}, status=206)) == 32
-        data = self.call(f"{base}/init.mp4") + self.call(f"{base}/{first}")
+        data = self.call(f"{base}/init.mp4")
+        duration = 0
+        for line in playlist.splitlines():
+            if line.startswith("#EXTINF:"):
+                duration += float(line.split(":", 1)[1].split(",")[0])
+            elif line.endswith(".m4s"):
+                data += self.call(f"{base}/{line}")
+                if duration > position + 0.5:
+                    break
         streams = json.loads(
             self.command("ffprobe", "-v", "error", "-show_streams", "-of", "json", "-i", "pipe:0", data=data)
         )["streams"]
@@ -271,13 +305,15 @@ class Client:
             ), sound
         return data
 
-    def frame(self, data):
+    def frame(self, data, position=0):
         result = self.command(
             "ffmpeg",
             "-v",
             "error",
             "-i",
             "pipe:0",
+            "-ss",
+            str(position),
             "-frames:v",
             "1",
             "-vf",
@@ -336,21 +372,39 @@ class Client:
             "bitmap.mkv",
             "long.mkv",
             "invalid.mp4",
+            "high-fps.mp4",
+            "sixty-fps.mkv",
+            "fractional-fps.mkv",
         ]
         assert all(name in files for name in required), "Use an isolated server containing --fixtures output"
         info = {name: self.call(f"/api/files/{files[name]}/streams") for name in required if name != "invalid.mp4"}
+        assert info["direct.mp4"]["subtitle_tracks"] == [], "external subtitles were exposed"
+        assert all("source_version" not in value for value in info.values())
         for name in required[:6]:
             plan = self.ready(self.plan(files[name], info[name], audio=None if name == "silent.mkv" else 1))
             self.stream(plan, audio=name != "silent.mkv")
             self.release(plan)
             print("PASS unified H.264/AAC fMP4 HLS:", name)
 
+        for name in ["high-fps.mp4", "sixty-fps.mkv", "fractional-fps.mkv"]:
+            plan = self.ready(self.plan(files[name], info[name], audio=None), complete=True)
+            data = self.stream(plan, audio=False)
+            rate = json.loads(self.command("ffprobe", "-v", "error", "-select_streams", "v:0",
+                "-count_frames", "-show_entries", "stream=nb_read_frames,duration",
+                "-of", "json", "pipe:0", data=data))["streams"][0]
+            assert int(rate["nb_read_frames"]) <= math.ceil(float(rate["duration"]) * 60)
+            if name != "high-fps.mp4":
+                assert int(rate["nb_read_frames"]) == 180, ("frames dropped below the rate limit", name, rate)
+            self.release(plan)
+        print("PASS 60 fps ceiling without dropping 60 fps or fractional-rate source frames")
+
         id = files["tracks.mkv"]
         tracks = info["tracks.mkv"]
-        a = self.ready(self.plan(id, tracks, position=7.375))
+        a = self.ready(self.plan(id, tracks, position=7.375), position=7.375)
         b = self.plan(id, tracks, position=7.375)
         assert a["session_id"] != b["session_id"] and a["url"] != b["url"]
-        data = self.stream(a)
+        assert self.keys[a["session_id"]] == self.keys[b["session_id"]]
+        data = self.stream(a, position=7.375)
         reference = self.command(
             "ffmpeg",
             "-v",
@@ -367,19 +421,26 @@ class Client:
             "rawvideo",
             "pipe:1",
         )
-        error = sum(abs(x - y) for x, y in zip(self.frame(data), reference)) / len(reference)
+        error = sum(abs(x - y) for x, y in zip(self.frame(data, 7.375), reference)) / len(reference)
         assert error < 4, ("seek frame differs from exact source frame", error)
+        if self.container:
+            decoded_hls = self.command("ffmpeg", "-v", "error", "-live_start_index", "0",
+                "-i", "http://127.0.0.1:8080" + a["url"],
+                "-ss", "7.375", "-frames:v", "1", "-vf", "format=gray", "-f", "rawvideo", "pipe:1")
+            assert len(decoded_hls) == len(reference)
+            error = sum(abs(x - y) for x, y in zip(decoded_hls, reference)) / len(reference)
+            assert error < 4, ("HLS seek frame differs from exact source frame", error)
         self.frequency(data, 440)
         self.release(a)
         self.stream(self.ready(b))
         self.release(b)
-        alternate = self.ready(self.plan(id, tracks, audio=2, position=7.375))
+        alternate = self.ready(self.plan(id, tracks, audio=2, position=7.375), position=7.375)
         self.frequency(self.stream(alternate), 880)
         self.release(alternate)
         muted = self.ready(self.plan(id, tracks, audio=None))
         self.stream(muted, audio=False)
         self.release(muted)
-        print("PASS exact fractional seek, selected audio, no audio and independent sessions")
+        print("PASS cached fractional seek, selected audio, no audio and shared cache leases")
 
         for name, index, top, position in [
             ("tracks.mkv", 3, False, 7.375),
@@ -388,21 +449,17 @@ class Client:
             ("offset.mkv", 3, True, 9.375),
             ("bitmap.mkv", 2, False, 7.375),
             ("bitmap.mkv", 2, True, 9.375),
-            *[
-                ("direct.mp4", track["stream_index"], track["codec_name"] == "ass", 9.375)
-                for track in info["direct.mp4"]["subtitle_tracks"]
-            ],
         ]:
-            off = self.ready(self.plan(files[name], info[name], position=position))
-            baseline = self.frame(self.stream(off))
+            off = self.ready(self.plan(files[name], info[name], position=position), position=position)
+            baseline = self.frame(self.stream(off, position=position), position)
             self.release(off)
-            on = self.ready(self.plan(files[name], info[name], subtitle=index, position=position))
-            burned = self.frame(self.stream(on))
+            on = self.ready(self.plan(files[name], info[name], subtitle=index, position=position), position=position)
+            burned = self.frame(self.stream(on, position=position), position)
             start, end = (0, 70 * 320) if top else (110 * 320, 180 * 320)
             pixels = sum(abs(x - y) > 50 for x, y in zip(baseline[start:end], burned[start:end]))
             assert pixels > 80, (name, index, position, "subtitle was not burned at the expected position", pixels)
             self.release(on)
-        print("PASS embedded/external ASS, SRT, fonts, bitmap subtitles, source offsets and subtitle off")
+        print("PASS embedded ASS, SRT, fonts, bitmap subtitles, source offsets and subtitle off")
 
         for change in [
             {"position": -1},
@@ -411,11 +468,13 @@ class Client:
             {"subtitle_stream_index": 99},
             {"source_version": "stale"},
             {"capabilities": {}},
+            {"encoder_profile": "client-controlled"},
+            {"subtitle_stream_index": -1},
+            {"variant_key": "a" * 32},
         ]:
             self.call(
                 f"/api/files/{id}/playback-plan",
                 {
-                    "source_version": tracks["source_version"],
                     "audio_stream_index": 1,
                     **change,
                 },
@@ -435,37 +494,93 @@ class Client:
         self.call(f"/api/files/{invalid}/probe", {}, "POST", status=422)
         print("PASS validation, removed routes, progress and process-local probe errors")
 
-        active = [self.plan(files["long.mkv"], info["long.mkv"]) for _ in range(self.limit)]
-        for plan in active:
-            self.ready(plan)
-        queued = self.plan(files["long.mkv"], info["long.mkv"])
-        assert self.call(f"/api/playback/{queued['session_id']}/status")["state"] == "queued"
+        durable = self.ready(self.plan(id, tracks), complete=True)
+        if self.container:
+            stamp = self.command("stat", "-c", "%i:%Y:%s", self.cache_path(durable) + "/segment_000000.m4s")
+            self.command("sh", "-c", 'test -z "$(find /cache/subtitles /cache/fonts -mindepth 1 -print)"')
+        self.release(durable)
+        first = self.ready(self.plan(files["long.mkv"], info["long.mkv"], subtitle=3))
+        shared = self.plan(files["long.mkv"], info["long.mkv"], subtitle=3, position=200.375)
+        assert self.keys[first["session_id"]] == self.keys[shared["session_id"]]
+        if self.container:
+            output = subprocess.check_output(["docker", "top", self.container, "-eo", "pid,comm,args"], text=True)
+            assert sum(line.split()[1] == "ffmpeg" and "long.mkv" in line for line in output.splitlines()[1:]) == 1
+        self.release(first)
+        self.stream(self.ready(shared))
+        active = [shared]
+        if self.limit > 1:
+            active.append(self.ready(self.plan(files["long.mkv"], info["long.mkv"], audio=2)))
+        queued = self.plan(files["long.mkv"], info["long.mkv"], audio=None)
+        if self.limit <= 2:
+            assert self.call(f"/api/playback/{queued['session_id']}/status")["state"] == "queued"
         if self.container:
             output = subprocess.check_output(["docker", "top", self.container, "-eo", "pid,comm,args"], text=True)
             assert sum(line.split()[1] == "ffmpeg" for line in output.splitlines()[1:]) <= self.limit
-        self.release(queued)
+        active.append(queued)
         for plan in active:
             self.release(plan)
-        print("PASS process limit, queued cancellation, active cancellation and directory removal")
+        if self.container:
+            deadline = time.monotonic() + 180
+            for plan in active:
+                while not self.exists(self.cache_path(plan) + "/complete"):
+                    assert time.monotonic() < deadline, "unleased generation did not finish"
+                    time.sleep(0.5)
+            self.command("sh", "-c", 'test -z "$(find /cache/subtitles /cache/fonts -mindepth 1 -print)"')
+        print("PASS shared FFmpeg, process limit, queued work and background completion after lease release")
 
         if self.container:
+            for seconds in [5, 0]:
+                interrupted = self.ready(self.plan(files["long.mkv"], info["long.mkv"], subtitle=4))
+                assert interrupted["state"] != "complete", "interruption fixture finished too quickly"
+                self.command("sh", "-c", 'test -n "$(find /cache/subtitles /cache/fonts -mindepth 1 -print)"')
+                self.restart(seconds)
+                self.sessions.remove(interrupted["session_id"])
+                self.call(f"/api/playback/{interrupted['session_id']}/status", status=404)
+                assert not self.exists(self.cache_path(interrupted)), "interrupted cache survived recovery"
+                self.command("sh", "-c", 'test -z "$(find /cache/subtitles /cache/fonts -mindepth 1 -print)"')
+            print("PASS graceful shutdown and forced interruption clean active generation and temporary assets")
+
             abandoned = "0123456789abcdef" * 2
-            subprocess.run(
-                ["docker", "exec", self.container, "mkdir", f"/data/playback-sessions/{abandoned}"], check=True
-            )
-            subprocess.run(["docker", "restart", "--time", "5", self.container], check=True, stdout=subprocess.DEVNULL)
-            deadline = time.monotonic() + 30
-            while True:
-                try:
-                    self.call("/health")
-                    break
-                except (urllib.error.URLError, ConnectionError):
-                    assert time.monotonic() < deadline, "server failed to restart"
-                    time.sleep(0.2)
-            assert not self.exists(abandoned)
+            self.command("mkdir", f"/cache/playback/{abandoned}")
+            self.command("touch", f"/cache/subtitles/{abandoned}.ass")
+            self.command("mkdir", f"/cache/fonts/{abandoned}")
+            self.command("touch", "/cache/subtitles/keep.txt")
+            invalid_cache = f"/cache/playback/{'f' * 32}"
+            self.command("mkdir", invalid_cache)
+            self.command("touch", invalid_cache + "/complete")
+            self.command("rm", self.cache_path(muted) + "/segment_000000.m4s")
+            self.restart()
+            assert not self.exists(f"/cache/playback/{abandoned}")
+            assert not self.exists(invalid_cache)
+            assert not self.exists(self.cache_path(muted))
+            assert not self.exists(f"/cache/subtitles/{abandoned}.ass")
+            assert not self.exists(f"/cache/fonts/{abandoned}")
+            assert self.exists("/cache/subtitles/keep.txt")
+            self.command("rm", "/cache/subtitles/keep.txt")
             assert self.call(f"/api/files/{id}/progress")["watch_pos"] == 12.5
             assert "cached probe failure" not in self.call(f"/api/files/{invalid}/streams", status=422)["error"]
-            print("PASS restart cleanup, persistent progress and nonpersistent metadata")
+            reused = self.plan(id, tracks, position=9.375)
+            assert reused["state"] == "complete" and reused["ready"]
+            assert stamp == self.command("stat", "-c", "%i:%Y:%s", self.cache_path(reused) + "/segment_000000.m4s")
+            self.stream(reused, position=9.375)
+            self.release(reused)
+            print("PASS restart reuse without encoding, corrupt cache cleanup, progress and transient asset recovery")
+
+    def eviction(self):
+        assert self.container, "--eviction-only requires an isolated container with cache_max_bytes=1"
+        self.call("/api/scan", {}, "POST")
+        file = next(file for file in self.call("/api/files") if file["name"] == "tracks.mkv")
+        id = file["pre16mib_md5"]
+        info = self.call(f"/api/files/{id}/streams")
+        plan = self.ready(self.plan(id, info, subtitle=3), complete=True)
+        path = self.cache_path(plan)
+        assert self.exists(path + "/complete"), "active cache was evicted"
+        self.stream(plan)
+        self.call(f"/api/playback/{plan['session_id']}", method="DELETE", status=204)
+        self.sessions.remove(plan["session_id"])
+        assert not self.exists(path), "unleased oversize cache was not evicted"
+        self.command("sh", "-c", 'test -z "$(find /cache/subtitles /cache/fonts -mindepth 1 -print)"')
+        print("PASS real byte limit overshoot while leased and cleanup after release")
 
     def close(self):
         for id in self.sessions[:]:
@@ -481,6 +596,7 @@ if __name__ == "__main__":
     parser.add_argument("--container", help="Isolated test container; enables process checks and restarts it")
     parser.add_argument("--media-dir", type=Path, default=Path("/media"))
     parser.add_argument("--max-processes", type=int, default=2)
+    parser.add_argument("--eviction-only", action="store_true", help="Requires cache_max_bytes=1 on an isolated container")
     args = parser.parse_args()
     if args.fixtures:
         assert args.font and args.font.is_file(), "--font must be an existing test font"
@@ -488,6 +604,9 @@ if __name__ == "__main__":
     if args.url:
         client = Client(args.url, args.container, args.media_dir, args.max_processes)
         try:
-            client.run()
+            if args.eviction_only:
+                client.eviction()
+            else:
+                client.run()
         finally:
             client.close()

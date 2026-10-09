@@ -8,8 +8,8 @@ SQLite 保存文件信息和进度, Vite/TypeScript 提供自定义播放器. �
 - 所有源视频统一转为 H.264 High, 8-bit `yuv420p`, 最高 1080p/60fps.
 - 选中的音轨统一转为 AAC-LC, 双声道, 48 kHz. 无音轨时输出纯视频.
 - 统一通过 fMP4 HLS 传输. Safari 使用原生 HLS, 其他支持 MSE 的浏览器使用 HLS.js.
-- 选中的 ASS/SSA, SRT 等文本字幕和 PGS 等位图字幕统一由服务器烧录, 支持内嵌字体和外挂文本字幕.
-- 切换音轨, 切换字幕或关闭字幕时重新建流, 保留原视频时间位置及暂停/播放状态.
+- 只支持视频容器内的字幕和字体附件. 选中的 ASS/SSA, SRT 等文本字幕和 PGS 等位图字幕由服务器烧录.
+- 切换音轨, 字幕或关闭字幕时切换缓存变体, 保留原视频时间位置及暂停/播放状态.
 - 浏览器解析或解码失败时直接显示错误并释放会话, 不自动请求其他格式. Retry 只重复同一种输出.
 
 播放器区域始终保留, 桌面布局右侧显示文件列表. 支持进度拖动, 音量, 全屏, 手动扫描,
@@ -20,13 +20,20 @@ Remux, 自适应码率或客户端字幕渲染.
 
 ## 运行模型
 
-每个播放会话独占一个 FFmpeg 转码进程和临时目录. 不去重任务, 不复用已经生成的流.
-播放结束, 停止, 换流或关闭页面时释放会话; 无客户端保活时超时清理.
-服务启动时清理上次遗留的会话目录.
+Rust 播放配置包含文件前 16 MiB MD5, 视频轨, 音轨, 字幕轨和固定编码配置版本.
+对配置的规范化 JSON 计算 MD5, 得到 `variant-key`, 对应一份持久 HLS 缓存.
+同一配置的并发请求共享生成任务. 会话只是缓存租约,
+停止, 换流, 关闭页面或保活超时只释放租约, 不删除缓存, 后台仍继续生成到视频结尾.
 
 默认最多使用 2 个媒体处理名额, 每个转码进程使用 2 个编码线程.
-首次播放和每次换轨都需要等待首段生成. 始终重编码会消耗 CPU,
-长视频在活跃会话期间也可能占用较多临时磁盘空间.
+缓存从时间 0 连续生成约 4 秒的分片, 首段验证后即可播放.
+恢复播放或跳转到较后位置时, 必须等缓存生成到目标位置, 不优先编码跳转位置.
+完整缓存跨重启复用; 启动时清理未完成或无效缓存以及遗留的字幕和字体中间文件.
+
+`playback.cache_max_bytes` 默认 `10737418240` 字节, 即 10 GiB.
+LRU 按最后使用时间淘汰无租约的完整缓存, 不淘汰正在生成或使用中的缓存.
+这些条目允许暂时超限, 可淘汰后再清理. 后台转码持续占用 CPU 和磁盘,
+容量配置不是文件系统硬配额.
 
 媒体探测结果只保存在内存中, 重启后重新探测. 播放进度保存在 SQLite 中, 不受会话清理影响.
 
@@ -44,7 +51,7 @@ anime-server/
 |   |   |-- api/
 |   |   |-- db/
 |   |   |-- tasks/
-|   |   `-- video/           # 探测, 烧录, 编码及临时会话
+|   |   `-- video/           # 探测, 烧录, 共享缓存及会话租约
 |   |-- sql/init.sql
 |   `-- tests/
 |-- frontend/
@@ -61,29 +68,33 @@ Rust 目录模块使用同名 `.rs` 文件声明, 不使用 `mod.rs`.
 
 ## 挂载与端口
 
-| 宿主机目录 | 容器目录 | 用途 |
-| --- | --- | --- |
-| 配置目录 | `/config/` | 只读, 保存 `config.json` |
-| 视频目录 | `/media/` | 只读, 保存视频和外挂字幕 |
-| 数据目录 | `/data/` | 读写, 保存数据库及临时播放数据 |
+| 宿主机目录 | 容器目录   | 用途                             |
+| ---------- | ---------- | -------------------------------- |
+| 配置目录   | `/config/` | 只读, 保存 `config.json`         |
+| 视频目录   | `/media/`  | 只读, 保存视频                   |
+| 数据目录   | `/data/`   | 读写, 保存数据库和 API 数据      |
+| 缓存目录   | `/cache/`  | 读写, 保存播放缓存和渲染中间文件 |
 
 ```text
 /data/
 |-- main.db
 |-- ddp-ani/
-|-- ddp-danmaku/
-`-- playback-sessions/
-    `-- <session-id>/
-        |-- index.m3u8
-        |-- init.mp4
-        |-- segment_*.m4s
-        |-- subtitle.ass     # 仅文本字幕会话
-        `-- fonts/           # 仅服务端烧录使用
+`-- ddp-danmaku/
+
+/cache/
+|-- playback/
+|   `-- <variant-key>/
+|       |-- complete
+|       |-- index.m3u8
+|       |-- init.mp4
+|       `-- segment_*.m4s
+|-- subtitles/
+`-- fonts/
 ```
 
 `ddp-ani/` 和 `ddp-danmaku/` 是预留的 API 缓存目录.
-`playback-sessions/` 下的内容不是持久缓存, 会话释放后删除.
-字幕和字体不提供浏览器下载接口.
+`complete` 是成功生成并验证后的空标记文件, 没有额外 JSON 状态文件.
+临时字幕和任务独立字体目录在生成结束后立即清理, 不提供浏览器下载接口.
 
 容器固定监听 `8080`, 宿主机端口由根目录 `.env` 控制.
 
@@ -100,12 +111,13 @@ PORT=56080
 MEDIA_DIR=/srv/media
 CONFIG_DIR=/srv/anime-server/config
 DATA_DIR=/srv/anime-server/data
+CACHE_DIR=/srv/anime-server/cache
 ```
 
 准备目录和配置, 然后启动:
 
 ```bash
-mkdir -p /srv/anime-server/config /srv/anime-server/data
+mkdir -p /srv/anime-server/config /srv/anime-server/data /srv/anime-server/cache
 cp examples/config.example.json /srv/anime-server/config/config.json
 docker compose up -d --build
 docker compose ps
@@ -118,11 +130,13 @@ docker compose logs -f anime-server
 docker compose down
 ```
 
-删除容器不会删除宿主机数据库或视频. 当前服务没有用户鉴权, 不要直接暴露到公网.
+删除容器不会删除宿主机数据库, 视频或已完成的播放缓存.
+缓存目录使用独占锁, 不能同时供多个服务实例使用.
+当前服务没有用户鉴权, 不要直接暴露到公网.
 
 ## 文档
 
-| 文档 | 内容 |
-| --- | --- |
+| 文档                                       | 内容                                             |
+| ------------------------------------------ | ------------------------------------------------ |
 | [development.md](documents/development.md) | 开发, 调试, 编译, 部署, 播放接口, 验证和故障排查 |
-| [database.md](documents/database.md) | 数据库结构, 文件标识和进度持久化 |
+| [database.md](documents/database.md)       | 数据库结构, 文件标识和进度持久化                 |

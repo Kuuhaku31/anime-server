@@ -48,13 +48,13 @@ class Video extends EventTarget {
 
 const file = { pre16mib_md5: "a".repeat(32), name: "video.mkv" };
 const info = {
-  source_version: "test", duration: 120,
+  duration: 120,
   video_tracks: [{ stream_index: 0 }],
   audio_tracks: [{ stream_index: 1, is_default: true }, { stream_index: 2 }],
   subtitle_tracks: [{ stream_index: 3 }],
 };
 
-function server(context) {
+function server(context, generated = 120) {
   const calls = [];
   const sessions = new Map();
   context.mock.method(globalThis, "fetch", async (url, options = {}) => {
@@ -70,8 +70,8 @@ function server(context) {
     } else if (url.endsWith("/playback-plan")) {
       const id = `session-${calls.filter((call) => call.url.endsWith("/playback-plan")).length}`;
       result = {
-        session_id: id, url: `/playback/${id}/index.m3u8`, start_time: body.position,
-        duration: 120, state: "ready", ready: true, buffered_until: 120, error: null,
+        session_id: id, url: `/playback/${id}/index.m3u8`, start_time: 0,
+        duration: 120, state: "ready", ready: true, buffered_until: generated, error: null,
       };
       sessions.set(id, result);
     } else if (url.endsWith("/status")) result = sessions.get(url.split("/").at(-2));
@@ -101,7 +101,7 @@ test("track changes and subtitle off preserve fractional position and pause stat
   const controller = new PlaybackController(video);
   await operation(controller, () => controller.open(file));
   assert.equal(api.creations()[0].body.position, 12.375);
-  video.currentTime = 1.625;
+  video.currentTime = 14;
   video.dispatchEvent(new Event("timeupdate"));
   video.pause();
   await operation(controller, () => controller.select({ audio: 2, subtitle: 3 }));
@@ -110,7 +110,7 @@ test("track changes and subtitle off preserve fractional position and pause stat
   assert.equal(controller.position, 14);
   assert.equal(api.sessions.size, 1);
   assert.deepEqual(api.creations()[1].body, {
-    source_version: "test", video_stream_index: 0,
+    video_stream_index: 0,
     audio_stream_index: 2, subtitle_stream_index: 3, position: 14,
   });
   const release = api.calls.findIndex((call) => call.method === "DELETE");
@@ -124,7 +124,7 @@ test("track changes and subtitle off preserve fractional position and pause stat
   assert.equal(api.sessions.size, 0);
 });
 
-test("local seeking reuses the session and remote seeking retains play state", async (context) => {
+test("forward and backward seeks within cached ranges reuse the session", async (context) => {
   const api = server(context);
   const video = new Video();
   const controller = new PlaybackController(video);
@@ -133,7 +133,7 @@ test("local seeking reuses the session and remote seeking retains play state", a
   assert.equal(controller.position, 18.75);
   assert.equal(api.creations().length, 1);
   await operation(controller, () => controller.seek(7.375));
-  assert.equal(api.creations()[1].body.position, 7.375);
+  assert.equal(api.creations().length, 1);
   assert.equal(video.paused, false);
   assert.equal(controller.position, 7.375);
   await operation(controller, () => controller.stop());
@@ -145,7 +145,7 @@ test("decoder failure releases the session without an automatic playback request
   const video = new Video();
   const controller = new PlaybackController(video);
   await operation(controller, () => controller.open(file));
-  video.currentTime = 2.5;
+  video.currentTime = 14.875;
   video.decodeError();
   await until(() => api.sessions.size === 0);
   assert.match(controller.error, /Test decoder failure/);
@@ -182,4 +182,58 @@ test("initial decode errors are terminal and manual retry repeats the same reque
   assert.deepEqual(api.creations()[0].body, api.creations()[1].body);
   assert.equal(controller.error, "");
   await operation(controller, () => controller.stop());
+});
+
+test("seek waits for new segments without creating a new session and can be redirected", async (context) => {
+  const api = server(context);
+  const video = new Video();
+  const controller = new PlaybackController(video);
+  await operation(controller, () => controller.open(file));
+  const session = [...api.sessions.values()][0];
+  session.buffered_until = 20;
+  controller.session = { ...session };
+  controller.seek(65.375);
+  await until(() => controller.message.includes("Waiting for 1:05"));
+  assert.equal(controller.pending, true);
+  assert.equal(video.paused, true);
+  assert.equal(controller.position, 65.375);
+  assert.equal(api.creations().length, 1);
+  session.buffered_until = 80;
+  await until(() => !controller.pending);
+  assert.equal(controller.position, 65.375);
+  assert.equal(video.paused, false);
+  assert.equal(controller.error, "");
+  assert.equal(api.creations().length, 1);
+  video.pause();
+  controller.seek(100);
+  await until(() => controller.message.includes("Waiting for 1:40"));
+  await operation(controller, () => controller.seek(7.375));
+  assert.equal(controller.position, 7.375);
+  assert.equal(video.paused, true);
+  assert.equal(api.creations().length, 1);
+  await operation(controller, () => controller.stop());
+  assert.equal(api.sessions.size, 0);
+});
+
+test("resuming waits for the target range and stop cancels the wait", async (context) => {
+  const api = server(context, 4);
+  const video = new Video();
+  const controller = new PlaybackController(video);
+  controller.open(file);
+  await until(() => controller.message.includes("Waiting for 0:12"));
+  assert.equal(video.src, "");
+  assert.equal(controller.position, 12.375);
+  const session = [...api.sessions.values()][0];
+  session.buffered_until = 16;
+  await until(() => !controller.pending);
+  assert.equal(controller.position, 12.375);
+  assert.equal(video.currentTime, 12.375);
+  controller.seek(95.125);
+  await until(() => controller.message.includes("Waiting for 1:35"));
+  await operation(controller, () => controller.stop());
+  assert.equal(controller.position, 95.125);
+  assert.equal(controller.message, "Stopped");
+  assert.equal(controller.error, "");
+  assert.equal(api.sessions.size, 0);
+  assert.equal(api.creations().length, 1);
 });

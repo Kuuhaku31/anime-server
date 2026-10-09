@@ -4,6 +4,7 @@
   },
   "scan_interval_seconds": 300,
   "playback": {
+    "cache_max_bytes": 10737418240,
     "max_processes": 2,
     "ffmpeg_threads": 2,
     "idle_timeout_seconds": 60,

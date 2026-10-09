@@ -1,6 +1,6 @@
 import type { PlaybackController } from "../playback/playback-controller.ts";
 import { formatTime } from "../playback/timeline.ts";
-import type { Selection, Track } from "../state/player-state.ts";
+import type { MediaInfo, Selection, Track } from "../state/player-state.ts";
 
 export function element<T extends HTMLElement>(selector: string): T {
   const value = document.querySelector<T>(selector);
@@ -23,7 +23,7 @@ export function attachControls(controller: PlaybackController, video: HTMLVideoE
   const mute = element<HTMLButtonElement>("#mute");
   const fullscreen = element<HTMLButtonElement>("#fullscreen");
   const panel = element<HTMLElement>(".player-panel");
-  let listId = "";
+  let previousInfo: MediaInfo | null = null;
   let scrubbing = false;
   play.onclick = () => controller.toggle();
   element<HTMLButtonElement>("#stop").onclick = () => controller.stop();
@@ -82,9 +82,8 @@ export function attachControls(controller: PlaybackController, video: HTMLVideoE
   });
   controller.addEventListener("change", () => {
     const info = controller.info;
-    const id = `${controller.file?.pre16mib_md5}/${info?.source_version}`;
-    if (info && listId !== id) {
-      listId = id;
+    if (info && previousInfo !== info) {
+      previousInfo = info;
       audio.replaceChildren(new Option("No audio", "off"), ...info.audio_tracks.map((track) => new Option(label(track), String(track.stream_index))));
       subtitles.replaceChildren(new Option("Off", "off"), ...info.subtitle_tracks.map((track) => new Option(label(track), String(track.stream_index))));
     }
@@ -93,7 +92,7 @@ export function attachControls(controller: PlaybackController, video: HTMLVideoE
     audio.disabled = subtitles.disabled = !info || controller.pending;
     play.disabled = !controller.file || controller.pending;
     play.textContent = video.paused ? "Play" : "Pause";
-    seek.disabled = !controller.info || controller.pending;
+    seek.disabled = !controller.info;
     seek.max = String(controller.duration);
     if (!scrubbing) {
       seek.value = String(controller.position);

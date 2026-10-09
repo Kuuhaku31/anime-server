@@ -7,7 +7,7 @@ pub const DATA_DIR: &str = "/data";
 pub const VIDEO_ROOT: &str = "/media";
 pub const DDP_ANI_CACHE_DIR: &str = "/data/ddp-ani";
 pub const DDP_DANMAKU_CACHE_DIR: &str = "/data/ddp-danmaku";
-pub const PLAYBACK_SESSION_DIR: &str = "/data/playback-sessions";
+pub const CACHE_DIR: &str = "/cache";
 pub const FALLBACK_FONT: &str = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc";
 
 #[derive(Debug, Clone, Deserialize)]
@@ -25,6 +25,7 @@ pub struct AppConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PlaybackConfig {
+    pub cache_max_bytes: u64,
     pub max_processes: usize,
     pub ffmpeg_threads: usize,
     pub idle_timeout_seconds: u64,
@@ -34,6 +35,7 @@ pub struct PlaybackConfig {
 impl Default for PlaybackConfig {
     fn default() -> Self {
         Self {
+            cache_max_bytes: 10 * 1024 * 1024 * 1024,
             max_processes: 2,
             ffmpeg_threads: 2,
             idle_timeout_seconds: 60,
@@ -44,13 +46,44 @@ impl Default for PlaybackConfig {
 
 impl PlaybackConfig {
     pub fn validate(&self) -> Result<()> {
-        ensure!((1..=16).contains(&self.max_processes), "max_processes must be 1..16");
-        ensure!((1..=32).contains(&self.ffmpeg_threads), "ffmpeg_threads must be 1..32");
-        ensure!((20..=3600).contains(&self.idle_timeout_seconds),
-            "idle_timeout_seconds must be 20..3600");
-        ensure!((10..=600).contains(&self.startup_timeout_seconds),
-            "startup_timeout_seconds must be 10..600");
+        ensure!(self.cache_max_bytes > 0, "cache_max_bytes must be positive");
+        ensure!(
+            (1..=16).contains(&self.max_processes),
+            "max_processes must be 1..16"
+        );
+        ensure!(
+            (1..=32).contains(&self.ffmpeg_threads),
+            "ffmpeg_threads must be 1..32"
+        );
+        ensure!(
+            (20..=3600).contains(&self.idle_timeout_seconds),
+            "idle_timeout_seconds must be 20..3600"
+        );
+        ensure!(
+            (10..=600).contains(&self.startup_timeout_seconds),
+            "startup_timeout_seconds must be 10..600"
+        );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_capacity_is_a_positive_byte_count_with_a_ten_gib_default() {
+        let config: PlaybackConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.cache_max_bytes, 10_737_418_240);
+        assert!(config.validate().is_ok());
+        let config: PlaybackConfig = serde_json::from_str(r#"{"cache_max_bytes":0}"#).unwrap();
+        assert!(config.validate().is_err());
+        for value in ["-1", "1.5", "\"10GiB\""] {
+            assert!(serde_json::from_str::<PlaybackConfig>(&format!(
+                r#"{{"cache_max_bytes":{value}}}"#
+            ))
+            .is_err());
+        }
     }
 }
 
@@ -89,7 +122,10 @@ impl AppConfig {
         let content = fs::read_to_string(path)?;
         let config: Self = serde_json::from_str(&content)?;
         config.playback.validate()?;
-        ensure!(config.scan_interval_seconds > 0, "scan_interval_seconds must be positive");
+        ensure!(
+            config.scan_interval_seconds > 0,
+            "scan_interval_seconds must be positive"
+        );
         Ok(config)
     }
 }

@@ -3,8 +3,9 @@ export function absoluteTime(mediaTime: number, start: number, duration: number)
   return Math.min(duration, Math.max(0, start + mediaTime));
 }
 
-export function needsNewStream(position: number, start: number, bufferedUntil: number): boolean {
-  return position < start || position >= bufferedUntil - 0.5;
+export function rangeReady(position: number, bufferedUntil: number, duration: number, complete: boolean): boolean {
+  return Number.isFinite(position) && position >= 0 && position < bufferedUntil
+    && (complete || bufferedUntil >= Math.min(duration, position + 0.5));
 }
 
 export function formatTime(seconds: number): string {

@@ -62,7 +62,7 @@ async fn plan(State(state): State<AppState>, Path(id): Path<String>,
     input: Result<Json<PlaybackRequest>, JsonRejection>) -> Result<Json<SessionStatus>, ApiError> {
     let Json(input) = input.map_err(ApiError::bad)?;
     let (source, info) = metadata(&state, &id, false).await?;
-    let spec = EncodeSpec::new(source, info, input, state.config.playback.ffmpeg_threads).map_err(ApiError::bad)?;
+    let spec = EncodeSpec::new(&id, source, info, input, state.config.playback.ffmpeg_threads).map_err(ApiError::bad)?;
     Ok(Json(state.playback.create(spec).await.map_err(ApiError::internal)?))
 }
 
@@ -82,7 +82,7 @@ async fn release(State(state): State<AppState>, Path(id): Path<String>) -> Resul
 
 async fn media(State(state): State<AppState>, Path((id, asset)): Path<(String, String)>, request: Request)
     -> Result<Response, ApiError> {
-    let (path, mime) = state.playback.media_path(&id, &asset).await.map_err(ApiError::missing)?;
+    let (path, mime, _lease) = state.playback.media_path(&id, &asset).await.map_err(ApiError::missing)?;
     let response = ServeFile::new(path).try_call(request).await.map_err(ApiError::internal)?;
     let mut response = response.map(Body::new);
     if response.status().is_success() {

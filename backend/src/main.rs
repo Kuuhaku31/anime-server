@@ -18,9 +18,9 @@ mod video;
 
 use config::{
     AppConfig, DATABASE_PATH, DATA_DIR, DDP_ANI_CACHE_DIR, DDP_DANMAKU_CACHE_DIR,
-    PLAYBACK_SESSION_DIR, VIDEO_ROOT,
+    CACHE_DIR,
 };
-use video::{sessions::SessionManager, metadata::MetadataCache, process::Processes};
+use video::{cache::CacheManager, sessions::SessionManager, metadata::MetadataCache, process::Processes};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -63,8 +63,9 @@ async fn main() -> Result<()> {
         .await?;
 
     let processes = Processes::new(config.playback.max_processes);
-    let playback = SessionManager::new(PLAYBACK_SESSION_DIR.into(), config.playback.clone(), processes.clone()).await?;
-    let metadata = MetadataCache::new(tokio::fs::canonicalize(VIDEO_ROOT).await?, processes);
+    let cache = CacheManager::new(CACHE_DIR.into(), config.playback.clone(), processes.clone()).await?;
+    let playback = SessionManager::new(cache, config.playback.idle_timeout_seconds);
+    let metadata = MetadataCache::new(processes);
     let state = AppState {
         db: pool,
         config: Arc::new(config),

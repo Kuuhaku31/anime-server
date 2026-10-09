@@ -1,7 +1,6 @@
-use std::{collections::HashMap, path::{Path, PathBuf}, sync::Arc, time::UNIX_EPOCH};
+use std::{collections::HashMap, path::Path, sync::Arc};
 
 use anyhow::{bail, ensure, Context, Result};
-use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 use tokio::{process::Command, sync::Mutex};
 use tracing::warn;
@@ -18,8 +17,6 @@ pub struct Track {
     pub is_forced: bool,
     #[serde(skip_serializing)]
     pub color_transfer: Option<String>,
-    #[serde(skip_serializing)]
-    pub external_path: Option<PathBuf>,
 }
 
 impl Track {
@@ -41,7 +38,6 @@ pub struct Attachment {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MediaInfo {
-    pub source_version: String,
     pub duration: f64,
     #[serde(skip_serializing)]
     pub start_time: f64,
@@ -63,6 +59,8 @@ struct Probe {
 struct ProbeFormat {
     duration: Option<String>,
     start_time: Option<String>,
+    #[serde(default)]
+    format_name: String,
 }
 
 #[derive(Deserialize)]
@@ -77,73 +75,55 @@ struct ProbeStream {
     disposition: HashMap<String, i32>,
 }
 
-struct Cached {
-    version: String,
-    result: Result<MediaInfo, String>,
-}
-
 #[derive(Clone)]
 pub struct MetadataCache {
-    entries: Arc<Mutex<HashMap<String, Cached>>>,
-    media_root: PathBuf,
+    entries: Arc<Mutex<HashMap<String, Result<MediaInfo, String>>>>,
     processes: Processes,
 }
 
 impl MetadataCache {
-    pub fn new(media_root: PathBuf, processes: Processes) -> Self {
-        Self { entries: Arc::new(Mutex::new(HashMap::new())), media_root, processes }
+    pub fn new(processes: Processes) -> Self {
+        Self { entries: Arc::new(Mutex::new(HashMap::new())), processes }
     }
 
     pub async fn get(&self, id: &str, path: &Path, retry: bool) -> Result<MediaInfo> {
-        let sidecars = sidecars(path, &self.media_root).await?;
-        let version = source_version(path, &sidecars).await?;
         if !retry {
             let entries = self.entries.lock().await;
-            if let Some(entry) = entries.get(id).filter(|entry| entry.version == version) {
-                return match &entry.result {
+            if let Some(entry) = entries.get(id) {
+                return match entry {
                     Ok(info) => Ok(info.clone()),
                     Err(error) => bail!("cached probe failure (use Retry probe): {error}"),
                 };
             }
         }
-        let result = self.probe(path, &version, sidecars).await;
+        let result = self.probe(path).await;
         if let Err(error) = &result { warn!(file_id = id, "media probe failed: {error:#}"); }
-        self.entries.lock().await.insert(id.to_string(), Cached {
-            version,
-            result: result.as_ref().map(Clone::clone).map_err(|error| format!("{error:#}")),
-        });
+        self.entries.lock().await.insert(id.to_string(),
+            result.as_ref().map(Clone::clone).map_err(|error| format!("{error:#}")));
         result
     }
 
-    async fn probe(&self, path: &Path, version: &str, sidecars: Vec<PathBuf>) -> Result<MediaInfo> {
+    async fn probe(&self, path: &Path) -> Result<MediaInfo> {
         let mut command = Command::new("ffprobe");
         command.args(["-v", "error", "-show_streams", "-show_format", "-of", "json"]).arg(path);
         let probe: Probe = serde_json::from_slice(&self.processes.output(&mut command, 60).await?)
             .context("invalid ffprobe JSON")?;
-        let mut info = normalize(probe, version)?;
-        for (ordinal, external) in sidecars.into_iter().enumerate() {
-            let extension = external.extension().and_then(|s| s.to_str()).context("subtitle extension missing")?
-                .to_ascii_lowercase();
-            info.subtitle_tracks.push(Track {
-                stream_index: -i32::try_from(ordinal)? - 1,
-                codec_name: match extension.as_str() { "srt" => "subrip", "vtt" => "webvtt", _ => &extension }.to_string(),
-                language: None,
-                title: Some(external.file_name().context("subtitle filename missing")?.to_string_lossy().into_owned()),
-                is_default: false, is_forced: false, color_transfer: None,
-                external_path: Some(external),
-            });
-        }
-        Ok(info)
+        normalize(probe)
     }
 }
 
-fn normalize(probe: Probe, version: &str) -> Result<MediaInfo> {
+fn normalize(probe: Probe) -> Result<MediaInfo> {
     let duration = probe.format.duration.as_deref().context("missing media duration")?.parse::<f64>()?;
     ensure!(duration.is_finite() && duration > 0.0, "media duration must be finite and positive");
     let start_time = probe.format.start_time.as_deref().unwrap_or("0").parse::<f64>()?;
     ensure!(start_time.is_finite(), "invalid media start time");
+    // Matroska's duration is an end timestamp, including a positive source offset.
+    let duration = if probe.format.format_name.split(',').any(|name| name == "matroska" || name == "webm") {
+        duration - start_time.max(0.0)
+    } else { duration };
+    ensure!(duration > 0.0, "media has no duration after its start timestamp");
     let mut info = MediaInfo {
-        source_version: version.to_string(), duration, start_time,
+        duration, start_time,
         video_tracks: Vec::new(), audio_tracks: Vec::new(), subtitle_tracks: Vec::new(),
         attachments: Vec::new(),
     };
@@ -171,7 +151,7 @@ fn normalize(probe: Probe, version: &str) -> Result<MediaInfo> {
             title: stream.tags.get("title").cloned(),
             is_default: stream.disposition.get("default") == Some(&1),
             is_forced: stream.disposition.get("forced") == Some(&1),
-            color_transfer: stream.color_transfer, external_path: None,
+            color_transfer: stream.color_transfer,
         });
     }
     ensure!(!info.video_tracks.is_empty(), "media has no playable video stream");
@@ -187,36 +167,6 @@ fn font_extension(name: &str, mime: Option<&str>) -> Option<String> {
     } else { None }
 }
 
-async fn sidecars(path: &Path, root: &Path) -> Result<Vec<PathBuf>> {
-    let stem = path.file_stem().context("media filename missing")?.to_string_lossy();
-    let mut entries = tokio::fs::read_dir(path.parent().context("media directory missing")?).await?;
-    let mut paths = Vec::new();
-    while let Some(entry) = entries.next_entry().await? {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !name.starts_with(&format!("{stem}.")) { continue; }
-        let candidate = entry.path();
-        let extension = candidate.extension().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
-        if !matches!(extension.as_str(), "ass" | "ssa" | "srt" | "vtt") { continue; }
-        let resolved = tokio::fs::canonicalize(candidate).await?;
-        ensure!(resolved.starts_with(root), "subtitle resolves outside media root");
-        if tokio::fs::metadata(&resolved).await?.is_file() { paths.push(resolved); }
-    }
-    paths.sort();
-    Ok(paths)
-}
-
-async fn source_version(path: &Path, sidecars: &[PathBuf]) -> Result<String> {
-    let mut digest = Md5::new();
-    for path in std::iter::once(path).chain(sidecars.iter().map(PathBuf::as_path)) {
-        let metadata = tokio::fs::metadata(path).await?;
-        digest.update(path.as_os_str().as_encoded_bytes());
-        digest.update([0]);
-        digest.update(metadata.len().to_le_bytes());
-        digest.update(metadata.modified()?.duration_since(UNIX_EPOCH)?.as_nanos().to_le_bytes());
-    }
-    Ok(format!("{:x}", digest.finalize()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,21 +178,24 @@ mod tests {
         assert_eq!(font_extension("cover.jpg", Some("image/jpeg")), None);
     }
 
-    #[tokio::test]
-    async fn sidecar_changes_invalidate_the_source_version() {
-        let root = std::env::temp_dir().join(format!("anime-probe-{}", super::super::sessions::session_id().unwrap()));
-        tokio::fs::create_dir(&root).await.unwrap();
-        let source = root.join("video.mkv");
-        let subtitle = root.join("video.eng.srt");
-        tokio::fs::write(&source, b"video").await.unwrap();
-        let original = source_version(&source, &[]).await.unwrap();
-        tokio::fs::write(&subtitle, b"subtitle").await.unwrap();
-        let files = sidecars(&source, &root).await.unwrap();
-        assert_eq!(files, vec![subtitle.clone()]);
-        let added = source_version(&source, &files).await.unwrap();
-        assert_ne!(original, added);
-        tokio::fs::write(&subtitle, b"changed subtitle").await.unwrap();
-        assert_ne!(added, source_version(&source, &files).await.unwrap());
-        tokio::fs::remove_dir_all(root).await.unwrap();
+    #[test]
+    fn only_container_stream_indexes_are_exposed() {
+        let probe = serde_json::from_value(serde_json::json!({
+            "format": {"duration": "25", "start_time": "5", "format_name": "matroska,webm"},
+            "streams": [
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 3, "codec_type": "subtitle", "codec_name": "ass"},
+                {"index": 4, "codec_type": "attachment", "tags": {"filename": "font.ttf"}}
+            ]
+        })).unwrap();
+        let info = normalize(probe).unwrap();
+        assert_eq!(info.start_time, 5.0);
+        assert_eq!(info.duration, 20.0);
+        assert_eq!(info.subtitle_tracks.len(), 1);
+        assert_eq!(info.subtitle_tracks[0].stream_index, 3);
+        assert_eq!(info.attachments.len(), 1);
+        let public = serde_json::to_value(info).unwrap();
+        assert!(public.get("attachments").is_none());
+        assert!(public.get("source_version").is_none());
     }
 }

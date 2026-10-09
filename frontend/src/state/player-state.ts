@@ -18,7 +18,6 @@ export interface Track {
 }
 
 export interface MediaInfo {
-  source_version: string;
   duration: number;
   video_tracks: Track[];
   audio_tracks: Track[];

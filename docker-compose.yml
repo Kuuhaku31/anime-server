@@ -9,4 +9,5 @@ services:
       - "${CONFIG_DIR}:/config:ro"
       - "${MEDIA_DIR}:/media:ro"
       - "${DATA_DIR}:/data"
+      - "${CACHE_DIR:?Set CACHE_DIR to an absolute cache directory}:/cache"
     restart: unless-stopped

@@ -1,7 +1,7 @@
 import { isAbort, jsonRequest, releaseSession, request, saveProgress, wait } from "../api/anime-server.ts";
 import type { MediaInfo, PlaybackSession, Selection, VideoFile } from "../state/player-state.ts";
 import { MediaAdapter } from "./hls-adapter.ts";
-import { absoluteTime, needsNewStream } from "./timeline.ts";
+import { absoluteTime, formatTime, rangeReady } from "./timeline.ts";
 
 export class PlaybackController extends EventTarget {
   file: VideoFile | null = null;
@@ -153,8 +153,8 @@ export class PlaybackController extends EventTarget {
     }
     const target = Math.max(0, Math.min(position, this.duration - 0.1));
     if (this.session && this.loaded && !this.pending
-      && !needsNewStream(target, this.session.start_time, this.session.buffered_until)) {
-      this.video.currentTime = target - this.session.start_time;
+      && rangeReady(target, this.session.buffered_until, this.duration, this.session.state === "complete")) {
+      this.video.currentTime = target;
       this.savedPosition = target;
       this.persist().catch((error) => this.fail(error));
       this.changed();
@@ -163,7 +163,11 @@ export class PlaybackController extends EventTarget {
       this.enqueue(async (signal) => {
         this.savedPosition = target;
         await this.persist();
-        await this.start(target, playing, signal);
+        if (this.session) {
+          this.loaded = false;
+          this.adapter.destroy();
+          await this.loadRange(target, playing, signal);
+        } else { await this.start(target, playing, signal); }
       });
     }
   }
@@ -256,25 +260,47 @@ export class PlaybackController extends EventTarget {
     this.changed();
     // Read the creation response even if superseded, so its session can be released.
     const session = await jsonRequest<PlaybackSession>(`/api/files/${this.file.pre16mib_md5}/playback-plan`, {
-      source_version: this.info.source_version, video_stream_index: this.info.video_tracks[0].stream_index,
+      video_stream_index: this.info.video_tracks[0].stream_index,
       audio_stream_index: this.selection.audio, subtitle_stream_index: this.selection.subtitle, position,
     });
     if (signal.aborted) { await releaseSession(session.session_id); signal.throwIfAborted(); }
     this.session = session;
-    const deadline = Date.now() + 180_000;
-    while (!this.session.ready) {
+    await this.loadRange(position, autoplay, signal);
+  }
+
+  private async loadRange(position: number, autoplay: boolean, signal: AbortSignal): Promise<void> {
+    if (!this.session) throw new Error("Playback session is missing");
+    const id = this.session.session_id;
+    let deadline = Date.now() + 180_000;
+    let generated = this.session.buffered_until;
+    let state = this.session.state;
+    while (true) {
+      signal.throwIfAborted();
+      if (!this.session || this.session.session_id !== id) throw new Error("Playback session changed");
       if (this.session.error || ["failed", "cancelled"].includes(this.session.state)) {
         throw new Error(this.session.error || "Playback session stopped");
       }
-      if (Date.now() > deadline) throw new Error("Playback startup timed out. Stop another stream or retry.");
-      this.message = this.session.state === "queued" ? "Waiting for a media process slot..." : "Generating first segment...";
+      if (this.session.ready && rangeReady(position, this.session.buffered_until, this.duration,
+        this.session.state === "complete")) break;
+      if (this.session.state === "complete") throw new Error("Cached video does not cover the requested position.");
+      if (this.session.buffered_until > generated || this.session.state !== state) {
+        generated = this.session.buffered_until;
+        state = this.session.state;
+        deadline = Date.now() + 180_000;
+      }
+      if (Date.now() > deadline) throw new Error("Cache generation made no progress for 180 seconds. Retry later.");
+      this.message = this.session.state === "queued" ? "Waiting for a media process slot..."
+        : `Generating cache: ${formatTime(this.session.buffered_until)} / ${formatTime(this.duration)}. Waiting for ${formatTime(position)}...`;
       this.changed();
       await wait(500, signal);
-      this.session = await request<PlaybackSession>(`/api/playback/${session.session_id}/status`, { signal });
+      const status: PlaybackSession = await request<PlaybackSession>(`/api/playback/${id}/status`, { signal });
+      signal.throwIfAborted();
+      this.session = status;
     }
     signal.throwIfAborted();
-    await this.adapter.attach(this.session.url, position - this.session.start_time, signal, (error) => this.fatal(error));
+    await this.adapter.attach(this.session.url, position, signal, (error) => this.fatal(error));
     this.loaded = true;
+    this.playRequested = autoplay;
     this.message = autoplay ? "Starting playback..." : "Paused";
     if (autoplay) {
       try { await this.video.play(); }
