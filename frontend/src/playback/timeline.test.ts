@@ -1,7 +1,26 @@
 // 验证时间换算和缓存半开区间, 特别覆盖末端相等与非有限数值.
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { absoluteTime, rangeReady, formatTime } from "./timeline.ts";
+import { absoluteTime, cacheProgress, rangeReady, formatTime } from "./timeline.ts";
+import type { PlaybackSession } from "../state/player-state.ts";
+
+test("cache generation shows verified time independently of playback and completion rounding", () => {
+  // 播放目标和浏览器缓冲不参与百分比, 完成标记将舍入不足的末端显示为 100%.
+  const session: PlaybackSession = {
+    session_id: "test", url: "/test", mime_type: "application/vnd.apple.mpegurl",
+    duration: 120, position: 12, start_time: 0, buffered_until: 30,
+    complete: false, generating: true, stopping: false, ready: true, encoding_threads: 8, error: null,
+  };
+  assert.deepEqual(cacheProgress(session), { percent: 25, text: "Generating (8 threads): 25.0% / 0:30 of 2:00" });
+  assert.match(cacheProgress({ ...session, encoding_threads: 0 }).text, /^Preparing \/ queued/);
+  assert.match(cacheProgress({ ...session, stopping: true }).text, /^Stopping/);
+  assert.match(cacheProgress({ ...session, error: "encoder failed" }).text, /^Generation failed/);
+  assert.match(cacheProgress({ ...session, generating: false }).text, /^Stopped/);
+  const complete = cacheProgress({ ...session, complete: true, buffered_until: 119.99 });
+  assert.equal(complete.percent, 100);
+  assert.match(complete.text, /^Complete: 100.0%/);
+  assert.equal(cacheProgress({ ...session, buffered_until: 120.1 }).percent, 100);
+});
 
 test("fractional HLS source offsets preserve the original timeline", () => {
   assert.equal(absoluteTime(12.5, 600, 1400), 612.5);

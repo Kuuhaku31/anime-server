@@ -64,7 +64,9 @@ export class PlaybackController extends EventTarget {
     window.setInterval(() => {
       if (!this.pending && this.loaded && !video.paused) this.persist().catch((error) => this.fail(error));
     }, 5000);
-    window.setInterval(() => { void this.report(); }, 10_000);
+    // 活动生成每秒刷新, 完成或失败后只保留低频心跳, 等待阶段由 loadRange 自行轮询.
+    window.setInterval(() => { if (this.session?.generating) void this.report(); }, 1000);
+    window.setInterval(() => { if (!this.session?.generating) void this.report(); }, 10_000);
     document.addEventListener("visibilitychange", () => {
       if (document.hidden) this.persist(true).catch((error) => console.error("Progress save failed", error));
       else if (!this.pending) void this.report();

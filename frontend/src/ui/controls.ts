@@ -1,6 +1,6 @@
 // 绑定播放器控件, 将用户操作转交控制器并同步界面状态.
 import type { PlaybackController } from "../playback/playback-controller.ts";
-import { formatTime } from "../playback/timeline.ts";
+import { cacheProgress, formatTime } from "../playback/timeline.ts";
 import type { MediaInfo, Selection, Track } from "../state/player-state.ts";
 
 export function element<T extends HTMLElement>(selector: string): T {
@@ -24,6 +24,10 @@ export function attachControls(controller: PlaybackController, video: HTMLVideoE
   const mute = element<HTMLButtonElement>("#mute");
   const fullscreen = element<HTMLButtonElement>("#fullscreen");
   const panel = element<HTMLElement>(".player-panel");
+  // 独立展示服务端生成范围, 不复用表示浏览器下载缓冲的播放滑块.
+  const cachePanel = element<HTMLElement>("#cache-generation");
+  const cacheBar = element<HTMLProgressElement>("#cache-progress");
+  const cacheText = element<HTMLOutputElement>("#cache-status");
   let previousInfo: MediaInfo | null = null;
   let scrubbing = false;
   play.onclick = () => controller.toggle();
@@ -104,6 +108,17 @@ export function attachControls(controller: PlaybackController, video: HTMLVideoE
     }
     seek.style.setProperty("--played", `${100 * controller.position / (controller.duration || 1)}%`);
     seek.style.setProperty("--buffered", `${100 * controller.buffered / (controller.duration || 1)}%`);
+    cachePanel.hidden = !controller.session;
+    if (controller.session) {
+      const progress = cacheProgress(controller.session);
+      cacheBar.value = progress.percent;
+      cacheBar.setAttribute("aria-valuetext", progress.text);
+      cacheText.textContent = progress.text;
+    } else {
+      // 换片或停止时清空旧配置的进度, 防止下一会话短暂显示旧数据.
+      cacheBar.value = 0;
+      cacheText.textContent = "";
+    }
     element("#playback-status").textContent = controller.message;
     element("#error").textContent = controller.error;
     element("#error-actions").hidden = !controller.error;

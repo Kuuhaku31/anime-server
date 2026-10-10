@@ -31,7 +31,7 @@ pub fn router(state: AppState) -> Router {
     .route("/api/config", get(get_config))
     .route("/api/scan", post(scan))
     .merge(playback::router())
-    .with_state(state)
+    .with_state(state) // 将应用状态传递给所有路由处理函数
 }
 
 /// 获取 Web 前端配置.

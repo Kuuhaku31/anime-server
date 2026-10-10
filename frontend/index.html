@@ -56,6 +56,12 @@
       </div>
       <div class="playback-feedback">
         <span id="playback-status" role="status">Select a video from the library</span>
+        <!-- 缓存生成进度独立于播放位置和浏览器下载缓冲. -->
+        <div id="cache-generation" hidden>
+          <label for="cache-progress">Cache generation</label>
+          <output id="cache-status" for="cache-progress"></output>
+          <progress id="cache-progress" max="100" value="0"></progress>
+        </div>
         <div id="error" role="alert"></div>
         <div id="error-actions" hidden>
           <button id="retry" type="button">Retry</button>

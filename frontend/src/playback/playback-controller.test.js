@@ -106,6 +106,43 @@ async function operation(controller, action) {
   await until(() => !controller.pending);
 }
 
+test("active generation refreshes every second while paused and completion keeps only heartbeat polling", async (context) => {
+  // 捕获定时回调而不等待真实时间, 验证刷新频率和停止后的请求边界.
+  const timers = new Map();
+  context.mock.method(window, "setInterval", (callback, milliseconds) => {
+    timers.set(milliseconds, callback);
+    return 0;
+  });
+  const api = server(context, 30);
+  const video = new Video();
+  const controller = new PlaybackController(video);
+  await operation(controller, () => controller.open(file));
+  video.pause();
+  let changes = 0;
+  controller.addEventListener("change", () => { changes += 1; });
+  const session = [...api.sessions.values()][0];
+  session.buffered_until = 60;
+  timers.get(1000)();
+  await until(() => controller.session.buffered_until === 60);
+  assert.ok(changes > 0);
+  assert.equal(video.paused, true);
+  session.complete = true;
+  session.generating = false;
+  timers.get(1000)();
+  await until(() => controller.session.complete);
+  const polls = () => api.calls.filter((call) => call.url.endsWith("/status")).length;
+  const completedPolls = polls();
+  timers.get(1000)();
+  assert.equal(polls(), completedPolls);
+  timers.get(10_000)();
+  await until(() => polls() > completedPolls);
+  await operation(controller, () => controller.stop());
+  const stoppedPolls = polls();
+  timers.get(1000)();
+  timers.get(10_000)();
+  assert.equal(polls(), stoppedPolls);
+});
+
 test("track changes and subtitle off preserve fractional position and pause state", async (context) => {
   const api = server(context);
   const video = new Video();
