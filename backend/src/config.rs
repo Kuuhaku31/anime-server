@@ -49,6 +49,8 @@ impl Default for PlaybackConfig {
 }
 
 impl PlaybackConfig {
+
+    /// 校验播放配置的合法性, 主要是线程预算和缓存容量.
     pub fn validate(&self) -> Result<()> {
         ensure!(self.cache_max_bytes > 0, "cache_max_bytes must be positive");
         ensure!(

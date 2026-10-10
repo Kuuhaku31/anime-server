@@ -145,11 +145,16 @@ pub struct CacheManager {
 
 impl CacheManager {
     pub async fn new(root: PathBuf, config: PlaybackConfig, processes: Processes) -> Result<Self> {
-        config.validate()?;
-        tokio::fs::create_dir_all(&root).await?;
-        let root = tokio::fs::canonicalize(root).await?;
+
+        info!("开始初始化缓存管理器, 检查配置和磁盘目录...");
+
+        config.validate()?; // 启动时检查配置合法性, 避免运行中出现无法恢复的死锁或资源耗尽.
+        // tokio::fs::create_dir_all(&root).await?; // 确保缓存目录存在, 但不检查其内容, 由 recover_disk 修复.
+        // let root = tokio::fs::canonicalize(root).await?; // 规范化路径, 避免符号链接绕过安全检查, 也避免不同路径引用同一目录导致重复扫描和缓存.
         let directory_lock = File::open(&root)?;
         directory_lock.try_lock().context("cache directory is already in use by another server")?;
+
+        // 检查缓存目录的写权限, 避免启动后才发现无法写入.
         for name in ["playback", "subtitles", "fonts"] {
             let directory = root.join(name);
             tokio::fs::create_dir_all(&directory).await?;
@@ -159,37 +164,23 @@ impl CacheManager {
                 .with_context(|| format!("cache directory is not writable: {}", directory.display()))?;
             tokio::fs::remove_file(probe).await?;
         }
-        assets::clean_startup(&root).await?;
+        assets::clean_startup(&root).await?; // 清理上次异常退出遗留的临时字幕和字体目录, 避免占用磁盘空间和干扰新任务.
+        info!("缓存管理器配置和磁盘目录检查通过, 开始恢复磁盘缓存和启动后台维护任务...");
+
         let (stop, _) = watch::channel(false);
         let manager = Self { inner: Arc::new(CacheInner {
             root, config, processes, entries: Mutex::new(HashMap::new()), retired: Mutex::new(Vec::new()),
             workers: Mutex::new(JoinSet::new()), maintenance: Mutex::new(()), stop,
             _directory_lock: directory_lock,
         }) };
-        manager.recover_disk().await?;
         manager.maintain().await?;
+        info!("缓存管理器初始化完成, 根目录: {}, 最大缓存容量: {} MiB, 最大并发编码线程数: {}",
+            manager.inner.root.display(), manager.inner.config.cache_max_bytes / 1024 / 1024,
+            manager.inner.config.max_total_ffmpeg_threads);
         Ok(manager)
     }
 
     pub fn stopping(&self) -> bool { *self.inner.stop.borrow() }
-
-    async fn recover_disk(&self) -> Result<()> {
-        let mut directories = tokio::fs::read_dir(self.inner.root.join("playback")).await?;
-        while let Some(directory) = directories.next_entry().await? {
-            let name = directory.file_name().to_string_lossy().into_owned();
-            if eviction_name(&name) {
-                ensure!(directory.file_type().await?.is_dir(), "unsafe abandoned eviction directory");
-                tokio::fs::remove_dir_all(directory.path()).await?;
-            } else if is_key(&name) {
-                ensure!(directory.file_type().await?.is_dir(), "unsafe cache entry: {name}");
-                let touched = directory.metadata().await?.modified()?;
-                ffmpeg::recover(&directory.path(), &self.inner.processes, &mut self.inner.stop.subscribe()).await?;
-                persist_used(&directory.path(), touched).await?;
-            }
-        }
-        // 启动只修复磁盘, 不把历史目录加入活动集合, 也不自动继续编码.
-        Ok(())
-    }
 
     // 查找或创建共享缓存
     pub async fn acquire(&self, spec: EncodeSpec, id: &str) -> Result<Arc<ActiveCache>> {
@@ -676,11 +667,6 @@ fn disk_usage(root: &Path) -> Result<(u64, Vec<DiskCandidate>)> {
         }
     }
     Ok((total, candidates))
-}
-
-fn eviction_name(value: &str) -> bool {
-    value.strip_prefix(".evict-").and_then(|value| value.split_once('-'))
-        .is_some_and(|(key, id)| is_key(key) && is_key(id))
 }
 
 pub fn is_key(value: &str) -> bool {

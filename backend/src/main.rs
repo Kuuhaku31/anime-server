@@ -51,12 +51,14 @@ async fn main() -> Result<()> {
     // 加载配置
     let config_path = std::env::var("ANIME_SERVER_CONFIG").unwrap_or_else(|_| "/config/config.json".to_string());
     let config = AppConfig::load(Path::new(&config_path))?;
+    info!("loaded config from {}", config_path);
 
     // 创建数据目录和缓存目录, 并检查 FFmpeg 等工具是否可用
     std::fs::create_dir_all(constants::DATA_DIR)?;
     std::fs::create_dir_all(constants::DDP_ANI_CACHE_DIR)?;
     std::fs::create_dir_all(constants::DDP_DANMAKU_CACHE_DIR)?;
     utils::check_tools().await?;
+    info!("tools check passed, ffmpeg and ffprobe are available");
 
     // 初始化数据库连接池, 并执行初始化 SQL 脚本, 创建必要的表和索引
     let database_options = SqliteConnectOptions::new()
@@ -70,10 +72,12 @@ async fn main() -> Result<()> {
     sqlx::raw_sql(include_str!("../sql/init.sql"))
     .execute(&pool)
     .await?;
+    info!("database initialized at {}", constants::DATABASE_PATH);
 
     // 探测, 资源准备, 编码和解码校验共用进程预算, 防止不同模块各自突破全局上限.
     let processes = Processes::new(config.playback.max_processes, config.playback.max_total_ffmpeg_threads);
     let cache = CacheManager::new(constants::CACHE_DIR.into(), config.playback.clone(), processes.clone()).await?;
+    info!("cache manager initialized at {}", constants::CACHE_DIR);
     let playback = SessionManager::new(cache, config.playback.idle_timeout_seconds);
     let metadata = MetadataCache::new(processes);
     let state = AppState {
@@ -95,6 +99,7 @@ async fn main() -> Result<()> {
         }
     });
     state.playback.spawn_expiration(); // 启动一个后台异步任务, 定期回收失去联系的播放会话并维护磁盘缓存
+    info!("background tasks started: video scan and playback session expiration");
 
     // API 和前端静态文件由同一端口提供, 浏览器通过同源相对 URL 访问服务.
     let app = api::router(state)
@@ -125,6 +130,8 @@ async fn main() -> Result<()> {
             tracing::error!("playback shutdown failed: {error:#}");
         }
     }).await?;
+
+    info!("Anime Server exited gracefully");
 
     Ok(())
 }
