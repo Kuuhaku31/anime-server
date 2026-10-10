@@ -1,3 +1,5 @@
+//! 管理客户端播放会话和缓存租约.
+
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::{Duration, Instant}};
 
 use anyhow::{ensure, Context, Result};

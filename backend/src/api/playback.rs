@@ -1,3 +1,5 @@
+//! 提供媒体探测和播放会话 API.
+
 use std::path::PathBuf;
 
 use axum::{

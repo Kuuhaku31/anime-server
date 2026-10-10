@@ -1,3 +1,7 @@
+
+// backend/src/main.rs
+//! 启动 Web 服务并组装应用依赖.
+
 use std::{net::SocketAddr, path::Path, sync::Arc};
 
 use anyhow::Result;
@@ -22,17 +26,21 @@ use config::{
 };
 use video::{cache::CacheManager, sessions::SessionManager, metadata::MetadataCache, process::Processes};
 
+
 #[derive(Clone)]
+/// 应用状态
 pub struct AppState {
-    pub db: SqlitePool,
-    pub config: Arc<AppConfig>,
-    pub metadata: MetadataCache,
-    pub playback: SessionManager,
-    pub scan_lock: Arc<tokio::sync::Mutex<()>>,
+    pub db: SqlitePool, // 数据库连接池
+    pub config: Arc<AppConfig>, // 应用配置
+    pub metadata: MetadataCache, // 元数据缓存
+    pub playback: SessionManager, // 播放会话管理
+    pub scan_lock: Arc<tokio::sync::Mutex<()>>, // 扫描锁, 防止同时进行多个扫描任务
 }
+
 
 #[tokio::main]
 async fn main() -> Result<()> {
+
     if std::env::args().any(|arg| arg == "--healthcheck") {
         return video::health::http_check();
     }

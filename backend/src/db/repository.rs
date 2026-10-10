@@ -1,3 +1,5 @@
+//! 封装 SQLite 数据访问操作.
+
 use crate::db::models::{FilePath, ScannedFile, VideoFile, WatchProgress};
 use sqlx::SqlitePool;
 

@@ -1,3 +1,7 @@
+
+// backend/src/video.rs
+//! 声明媒体探测和播放处理模块.
+
 pub mod scanner;
 pub mod assets;
 pub mod metadata;

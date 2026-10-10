@@ -1,3 +1,5 @@
+//! 定义数据库记录和接口数据结构.
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, sqlx::FromRow)]

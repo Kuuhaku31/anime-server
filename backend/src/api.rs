@@ -1,3 +1,5 @@
+//! 定义业务 API 路由和处理函数.
+
 use axum::{
     extract::{Json, Path, State},
     http::StatusCode,

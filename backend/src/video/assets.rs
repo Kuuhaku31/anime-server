@@ -1,3 +1,5 @@
+//! 准备并清理字幕和字体渲染资源.
+
 use std::{path::{Path, PathBuf}, time::Instant};
 
 use anyhow::{ensure, Context, Result};

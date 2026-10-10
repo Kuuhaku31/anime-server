@@ -1,3 +1,5 @@
+//! 扫描媒体目录并同步文件索引.
+
 use std::{
     fs::File,
     io::Read,

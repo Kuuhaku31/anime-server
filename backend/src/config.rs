@@ -1,3 +1,5 @@
+//! 加载并校验应用配置.
+
 use anyhow::{ensure, Result};
 use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};

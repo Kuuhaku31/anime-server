@@ -1,3 +1,5 @@
+//! 定时执行媒体目录扫描任务.
+
 use crate::AppState;
 use tokio::time::{sleep, Duration};
 use tracing::{info, warn};

@@ -1,3 +1,5 @@
+//! 管理媒体子进程的限流和生命周期.
+
 use std::{process::Stdio, sync::Arc, time::Duration};
 
 use anyhow::{bail, Context, Result};

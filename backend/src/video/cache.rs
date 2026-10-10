@@ -1,3 +1,5 @@
+//! 管理持久播放缓存及其生成和淘汰.
+
 use std::{
     collections::HashMap, fs::{File, FileTimes}, io::Read, path::{Path, PathBuf},
     sync::Arc, time::{Duration, Instant, SystemTime},

@@ -1,3 +1,5 @@
+//! 构建 FFmpeg 转码命令并校验 HLS 输出.
+
 use std::{io::{Read, Seek, SeekFrom}, path::{Path, PathBuf}, process::Stdio};
 
 use anyhow::{ensure, Context, Result};

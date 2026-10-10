@@ -1,3 +1,5 @@
+//! 探测并缓存媒体轨道元数据.
+
 use std::{collections::HashMap, path::Path, sync::Arc};
 
 use anyhow::{bail, ensure, Context, Result};

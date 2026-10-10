@@ -1,3 +1,5 @@
+//! 检查服务存活状态和媒体工具依赖.
+
 use anyhow::{ensure, Result};
 use tokio::process::Command;
 
