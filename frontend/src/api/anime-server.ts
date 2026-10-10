@@ -1,3 +1,4 @@
+// 封装同源 JSON 请求, 会话释放和观看进度保存.
 export class ApiError extends Error {
   status: number;
 
@@ -7,6 +8,7 @@ export class ApiError extends Error {
   }
 }
 
+// 保留失败响应的状态码和正文, 不把请求失败转换为默认业务数据.
 export async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const response = await fetch(url, options);
   if (!response.ok) {
@@ -23,6 +25,7 @@ export function jsonRequest<T>(url: string, body: unknown, method = "POST", sign
   });
 }
 
+// 页面卸载时用 keepalive 尽力发送释放请求, 未送达的租约仍由服务端超时回收.
 export function releaseSession(id: string, keepalive = false): Promise<void> {
   return request(`/api/playback/${id}`, { method: "DELETE", keepalive });
 }
@@ -38,6 +41,7 @@ export function isAbort(error: unknown): boolean {
   return error instanceof DOMException && error.name === "AbortError";
 }
 
+// 等待绑定本轮操作信号, 换片或重新拖动取消后不再继续旧的状态轮询.
 export function wait(milliseconds: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     signal.throwIfAborted();

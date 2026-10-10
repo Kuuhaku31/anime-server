@@ -1,8 +1,10 @@
+// 在无浏览器环境验证会话生命周期, 播放意图和异步竞态.
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { PlaybackController } from "./playback-controller.ts";
 import { preferNativeHls } from "./hls-adapter.ts";
 
+// 保留操作所需的事件和延迟, 禁用周期定时器以免测试遗留后台轮询.
 globalThis.window = Object.assign(new EventTarget(), { setTimeout, setInterval: () => 0 });
 globalThis.document = new EventTarget();
 
@@ -62,24 +64,33 @@ function server(context, generated = 120) {
     const method = options.method ?? "GET";
     calls.push({ url, method, body });
     let result;
-    if (url.endsWith("/streams")) result = info;
-    else if (url.endsWith("/progress") && method === "GET") result = { watch_pos: 12.375 };
+    if (url.endsWith("/probe")) result = info;
     else if (method === "DELETE") {
       sessions.delete(url.split("/").at(-1));
       return new Response(null, { status: 204 });
-    } else if (url.endsWith("/playback-plan")) {
-      const id = `session-${calls.filter((call) => call.url.endsWith("/playback-plan")).length}`;
+    } else if (url.endsWith("/playback")) {
+      const id = `session-${calls.filter((call) => call.url.endsWith("/playback")).length}`;
       result = {
         session_id: id, url: `/playback/${id}/index.m3u8`, start_time: 0,
-        duration: 120, state: "ready", ready: true, buffered_until: generated, error: null,
+        mime_type: "application/vnd.apple.mpegurl", duration: 120, position: body?.position ?? 12.375,
+        complete: false, generating: true, stopping: false, encoding_threads: 8,
+        ready: true, buffered_until: generated, error: null,
       };
       sessions.set(id, result);
+      // 模拟服务端默认选择, 明确区分字段缺省与显式 null.
+      result = { ...result, media: info, selection: {
+        audio: body && "audio_stream_index" in body ? body.audio_stream_index : 1,
+        subtitle: body && "subtitle_stream_index" in body ? body.subtitle_stream_index : null,
+      } };
+    } else if (url.endsWith("/target")) {
+      result = sessions.get(url.split("/").at(-2));
+      result.position = body.position;
     } else if (url.endsWith("/status")) result = sessions.get(url.split("/").at(-2));
     else if (method === "PUT") return new Response(null, { status: 204 });
     else throw new Error(`Unexpected request: ${method} ${url}`);
     return Response.json(result);
   });
-  return { calls, sessions, creations: () => calls.filter((call) => call.url.endsWith("/playback-plan")) };
+  return { calls, sessions, creations: () => calls.filter((call) => call.url.endsWith("/playback")) };
 }
 
 async function until(predicate) {
@@ -100,7 +111,10 @@ test("track changes and subtitle off preserve fractional position and pause stat
   const video = new Video();
   const controller = new PlaybackController(video);
   await operation(controller, () => controller.open(file));
-  assert.equal(api.creations()[0].body.position, 12.375);
+  assert.equal(api.creations()[0].body, null);
+  assert.equal(controller.position, 12.375);
+  assert.deepEqual(controller.selection, { audio: 1, subtitle: null });
+  assert.equal(api.calls.some((call) => call.url.endsWith("/streams") || call.method === "GET" && call.url.endsWith("/progress")), false);
   video.currentTime = 14;
   video.dispatchEvent(new Event("timeupdate"));
   video.pause();
@@ -110,7 +124,6 @@ test("track changes and subtitle off preserve fractional position and pause stat
   assert.equal(controller.position, 14);
   assert.equal(api.sessions.size, 1);
   assert.deepEqual(api.creations()[1].body, {
-    video_stream_index: 0,
     audio_stream_index: 2, subtitle_stream_index: 3, position: 14,
   });
   const release = api.calls.findIndex((call) => call.method === "DELETE");
@@ -136,6 +149,20 @@ test("forward and backward seeks within cached ranges reuse the session", async 
   assert.equal(api.creations().length, 1);
   assert.equal(video.paused, false);
   assert.equal(controller.position, 7.375);
+  await operation(controller, () => controller.stop());
+});
+
+test("immediate track switching keeps a pause whose browser event has not arrived yet", async (context) => {
+  // HTMLMediaElement.paused 先改变, pause 事件稍后到达, 不能靠事件更新唯一的播放意图.
+  server(context);
+  const video = new Video();
+  const controller = new PlaybackController(video);
+  await operation(controller, () => controller.open(file));
+  context.mock.method(video, "pause", function () { this.paused = true; });
+  controller.toggle();
+  await operation(controller, () => controller.select({ audio: 2, subtitle: null }));
+  assert.equal(controller.error, "");
+  assert.equal(video.paused, true);
   await operation(controller, () => controller.stop());
 });
 
@@ -179,7 +206,9 @@ test("initial decode errors are terminal and manual retry repeats the same reque
   assert.equal(api.creations().length, 1);
   video.failOnLoad = false;
   await operation(controller, () => controller.retry());
-  assert.deepEqual(api.creations()[0].body, api.creations()[1].body);
+  assert.deepEqual(api.creations()[1].body, {
+    audio_stream_index: 1, subtitle_stream_index: null, position: 12.375,
+  });
   assert.equal(controller.error, "");
   await operation(controller, () => controller.stop());
 });
@@ -198,6 +227,7 @@ test("seek waits for new segments without creating a new session and can be redi
   assert.equal(video.paused, true);
   assert.equal(controller.position, 65.375);
   assert.equal(api.creations().length, 1);
+  assert.ok(api.calls.some((call) => call.url.endsWith("/target") && call.body.position === 65.375));
   session.buffered_until = 80;
   await until(() => !controller.pending);
   assert.equal(controller.position, 65.375);
@@ -234,6 +264,47 @@ test("resuming waits for the target range and stop cancels the wait", async (con
   assert.equal(controller.position, 95.125);
   assert.equal(controller.message, "Stopped");
   assert.equal(controller.error, "");
+  assert.equal(api.sessions.size, 0);
+  assert.equal(api.creations().length, 1);
+});
+
+test("the exact cache boundary waits but even a sub-half-second covered target starts", async (context) => {
+  // 测量严格的不等式, 而不是用一个更远的已缓存位置代替边界验证.
+  const api = server(context, 12.375);
+  const video = new Video();
+  const controller = new PlaybackController(video);
+  controller.open({ ...file, watch_pos: 99 });
+  await until(() => controller.message.includes("Waiting for 0:12"));
+  assert.equal(video.src, "");
+  assert.equal(controller.position, 12.375);
+  const session = [...api.sessions.values()][0];
+  session.buffered_until = 12.376;
+  await until(() => !controller.pending);
+  assert.equal(controller.error, "");
+  assert.equal(video.currentTime, 12.375);
+  assert.equal(api.creations().length, 1);
+  video.currentTime = 10;
+  await operation(controller, () => controller.select({ audio: null, subtitle: null }));
+  assert.deepEqual(controller.selection, { audio: null, subtitle: null });
+  assert.equal(api.creations()[1].body.audio_stream_index, null);
+  await operation(controller, () => controller.stop());
+});
+
+test("a published prefix remains usable when generation fails beyond it", async (context) => {
+  const api = server(context);
+  const video = new Video();
+  const controller = new PlaybackController(video);
+  await operation(controller, () => controller.open(file));
+  const session = [...api.sessions.values()][0];
+  session.error = "Test encoder failure";
+  session.generating = false;
+  session.buffered_until = 20;
+  await controller.report();
+  assert.equal(controller.error, "Test encoder failure");
+  assert.equal(video.paused, false);
+  context.mock.method(console, "error", () => {});
+  await operation(controller, () => controller.seek(30));
+  assert.equal(controller.error, "Test encoder failure");
   assert.equal(api.sessions.size, 0);
   assert.equal(api.creations().length, 1);
 });

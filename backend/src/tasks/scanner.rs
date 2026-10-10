@@ -4,6 +4,7 @@ use crate::AppState;
 use tokio::time::{sleep, Duration};
 use tracing::{info, warn};
 
+// 启动后立即扫描, 每轮完成后再等待间隔, 避免慢扫描积累重叠的定时任务.
 pub fn spawn(state: AppState) {
     tokio::spawn(async move {
         loop {

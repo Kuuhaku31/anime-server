@@ -82,8 +82,8 @@ docker compose port anime-server 8080
 ```
 
 不要同时让多个服务实例使用同一个 `DATA_DIR` 或 `CACHE_DIR`.
-缓存根目录使用独占锁, 第二个实例会明确报错. 服务启动时保留完整缓存,
-删除未完成或无效的变体及遗留的字幕和字体中间文件.
+缓存根目录使用独占锁, 第二个实例会明确报错. 服务启动时校验并修复完整或部分缓存,
+清理无效尾部及遗留中间文件, 不恢复客户端会话或自动启动编码.
 
 ## 应用配置
 
@@ -99,6 +99,8 @@ docker compose port anime-server 8080
     "cache_max_bytes": 10737418240,
     "max_processes": 2,
     "ffmpeg_threads": 2,
+    "max_variant_threads": 8,
+    "max_total_ffmpeg_threads": 16,
     "idle_timeout_seconds": 60,
     "startup_timeout_seconds": 90
   },
@@ -112,8 +114,10 @@ docker compose port anime-server 8080
 | 播放配置                  | 说明                                                                       |
 | ------------------------- | -------------------------------------------------------------------------- |
 | `cache_max_bytes`         | 缓存容量字节数, 正整数 `u64`, 默认 `10737418240`, 即 10 GiB                 |
-| `max_processes`           | 媒体处理名额, 范围 `1..16`. 播放准备及编码占用一个名额, 外部探测请求也受限 |
-| `ffmpeg_threads`          | 每个转码进程的编码线程数, 范围 `1..32`                                     |
+| `max_processes`           | 全部媒体进程上限, 范围 `2..16`, 默认 2. 编码器最多占用 `max_processes - 1`, 为解码校验保留名额 |
+| `ffmpeg_threads`          | 编码器启动需要的基础线程数, 默认 2, 必须不大于单变体上限                   |
+| `max_variant_threads`    | 单个编码器线程上限, 默认 8, 最大 32                                       |
+| `max_total_ffmpeg_threads` | 全部 H.264 编码器的加权线程预算, 默认 16, 范围为基础线程数到 256           |
 | `idle_timeout_seconds`    | 无保活请求后的会话过期时间, 范围 `20..3600` 秒                             |
 | `startup_timeout_seconds` | 字幕准备及首段生成各阶段的超时, 范围 `10..600` 秒                          |
 
@@ -121,7 +125,14 @@ docker compose port anime-server 8080
 修改应用配置后重启容器. DandanPlay 当前未实现真实 API 调用.
 Web 界面在缓存状态及生成范围连续 180 秒没有进展时显示错误.
 生成正常推进时允许继续等待较远的目标位置, 不设置 180 秒总时限.
-HLS 元数据加载最多等待 30 秒, 超时后显示错误并释放租约, 不取消后台生成.
+HLS 元数据加载最多等待 30 秒, 超时后显示错误并释放租约.
+最后一个租约释放时, 编码器最多再提交一个完整分片, 30 秒内仍未完成则强制停止.
+
+任务启动前, 如果任一客户端目标尚未覆盖, 非阻塞申请最多 `max_variant_threads` 个线程;
+否则只申请基础线程. 预算不足时使用当前可取得且不低于基础值的数量启动.
+运行中的任务不热调, 不抢占其他任务的线程, 实际编码进程退出时归还许可.
+这个预算不包括解码器, 滤镜和工具内部辅助线程, 不是操作系统线程总数上限.
+默认 2 个进程名额仅容纳一个编码器加一个校验进程; 需要两个编码器时将 `max_processes` 设为 3.
 
 ## 开发与编译
 
@@ -199,7 +210,7 @@ docker compose down
 | 项目         | 固定规则                                                 |
 | ------------ | -------------------------------------------------------- |
 | 视频         | libx264, High, 8-bit `yuv420p`, CRF 23, veryfast         |
-| 分辨率与帧率 | 保持比例, 不放大小视频, 最高 1920x1080 和 60fps          |
+| 分辨率与帧率 | 保持比例, 不放大小视频, 最高 1920x1080; 按源声明帧率与 60 的较小值进行有理数恒帧率采样 |
 | HDR          | 转为 BT.709 SDR                                          |
 | 音频         | 选定一轨, AAC-LC, 双声道, 48 kHz, 192 kbps; 可选择无音轨 |
 | 字幕         | 选定一轨服务端烧录, 或关闭字幕                           |
@@ -213,18 +224,22 @@ docker compose down
 ASS/SSA 和其他文本字幕先提取到 `/cache/subtitles/<random-id>.ass`, 再由 libass 渲染.
 内嵌字体提取到 `/cache/fonts/<generation-id>/`, 文件名独立随机生成;
 缺少字体时使用运行镜像的回退字体. 位图字幕直接通过 overlay 烧录, 不提取 ASS.
-所有生成任务从时间 0 开始, 保留字幕历史状态和源容器的时间偏移.
-生成结束, 失败或服务关闭取消任务后, 立即删除中间字幕和字体.
+首次生成从时间 0 开始. 续接只编码未缓存的视频尾部, 但音频重采样和位图字幕状态依赖历史:
+第二路输入从源头读取音频和位图字幕, 不重新编码已有视频.
+文本字幕在原时间轴上烧录, 再归一化容器偏移和视频采样时钟.
+VFR 输入按同一恒帧率规则采样, 必要的重复或丢帧来自固定输出规则, 不是续接边界丢失.
+生成结束, 失败或停止后立即删除中间字幕和字体.
 
 切换音轨, 字幕或字幕关闭时:
 
 1. 保存原始视频时间及暂停/播放状态.
 2. 停止浏览器加载并释放旧会话.
 3. 以选定轨道和原始时间创建新租约, 复用或开始生成对应缓存.
-4. 等待缓存覆盖目标时间及少量播放余量, 然后附加新流.
+4. 当目标时间严格小于 `buffered_until` 时附加新流, 不额外等待 0.5 秒.
 5. 原先正在播放时继续播放, 原先暂停时保持暂停.
 
-服务端不按请求位置执行 FFmpeg seek, 也不优先渲染跳转位置.
+服务端不按用户跳转位置创建新编码任务. 仅在恢复部分缓存时 seek 到已验证尾部附近,
+精确裁切并继续顺序生成.
 所有缓存的 `start_time` 固定为 0, 浏览器直接定位原视频时间,
 实际画面仍受源视频帧间隔约束.
 已生成范围内的 seek 可以直接使用当前流. 超出范围时保持同一租约,
@@ -237,18 +252,22 @@ ASS/SSA 和其他文本字幕先提取到 `/cache/subtitles/<random-id>.ass`, �
 
 ## 播放 API
 
-先读取轨道:
+默认播放只提交文件 ID, 不需要先读取轨道或历史进度:
 
 ```bash
-curl http://localhost:56080/api/files/FILE_ID/streams
+curl -X POST http://localhost:56080/api/files/FILE_ID/playback
 ```
 
-使用返回的流索引:
+服务端查询文件和 `watch_pos`, 选择第一条视频轨, 默认音轨或第一条音轨,
+以及默认或强制字幕. 没有对应轨道时关闭音轨或字幕.
+距结尾不足 2 秒的历史进度从 0 开始. 响应同时返回媒体信息及实际选择.
+
+换轨可以使用响应中的真实流索引, 并提交当前绝对播放位置:
 
 ```bash
-curl -X POST http://localhost:56080/api/files/FILE_ID/playback-plan \
+curl -X POST http://localhost:56080/api/files/FILE_ID/playback \
   -H 'Content-Type: application/json' \
-  -d '{"video_stream_index":0,"audio_stream_index":1,"subtitle_stream_index":3,"position":125.5}'
+  -d '{"audio_stream_index":1,"subtitle_stream_index":3,"position":125.5}'
 ```
 
 响应:
@@ -256,21 +275,44 @@ curl -X POST http://localhost:56080/api/files/FILE_ID/playback-plan \
 ```json
 {
   "session_id": "SESSION_ID",
-  "url": "/playback/SESSION_ID/index.m3u8",
+  "url": "/playback/SESSION_ID/index.m3u8?revision=2",
   "mime_type": "application/vnd.apple.mpegurl",
   "start_time": 0.0,
   "duration": 1400.0,
-  "state": "queued",
+  "position": 125.5,
+  "complete": false,
+  "generating": true,
+  "stopping": false,
   "ready": false,
   "buffered_until": 0.0,
-  "error": null
+  "encoding_threads": 8,
+  "error": null,
+  "media": {
+    "duration": 1400.0,
+    "video_tracks": [],
+    "audio_tracks": [],
+    "subtitle_tracks": []
+  },
+  "selection": {
+    "audio": 1,
+    "subtitle": 3
+  }
 }
 ```
 
 `audio_stream_index: null` 表示无音轨, `subtitle_stream_index: null` 表示关闭字幕.
-缺省视频索引时选第一条视频轨. 时间必须为有限非负数且小于视频时长.
-客户端不能指定缓存键, 路径或编码配置版本, 也不提交 `source_version`.
-`position` 不参与缓存键计算, 只用于请求校验和前端恢复位置.
+省略轨道字段则使用服务端默认选择, 和显式 `null` 不同.
+客户端不能指定视频索引, 缓存键, 路径或编码配置版本, 未知请求字段会被拒绝.
+`position` 必须有限, 非负且小于视频时长; 省略或 `null` 表示读取数据库进度.
+位置只影响会话目标和下次启动时的线程申请, 不进入播放配置或缓存键.
+示例省略了轨道数组内容. `status` 返回相同的状态字段, 不重复返回 `media` 和 `selection`.
+
+等待期间拖动进度条只更新当前会话:
+
+```bash
+curl -X POST http://localhost:56080/api/playback/SESSION_ID/target \
+  -H 'Content-Type: application/json' -d '{"position":300.5}'
+```
 
 | 方法          | 路径                                | 说明                                   |
 | ------------- | ----------------------------------- | -------------------------------------- |
@@ -283,18 +325,27 @@ curl -X POST http://localhost:56080/api/files/FILE_ID/playback-plan \
 | `POST`        | `/api/scan`                         | 扫描视频目录                           |
 | `GET`         | `/api/files/{id}/streams`           | 进程内缓存的轨道信息                   |
 | `POST`        | `/api/files/{id}/probe`             | 强制重新探测                           |
-| `POST`        | `/api/files/{id}/playback-plan`     | 创建共享缓存的客户端租约               |
+| `POST`        | `/api/files/{id}/playback`          | 服务端构造播放配置并创建租约           |
 | `GET`         | `/api/playback/{session}/status`    | 获取状态, 同时保活                     |
+| `POST`        | `/api/playback/{session}/target`    | 更新目标位置, 返回状态, 不创建新任务   |
 | `POST`        | `/api/playback/{session}/heartbeat` | 显式保活                               |
-| `DELETE`      | `/api/playback/{session}`           | 仅释放租约并触发容量清理, 可重复调用   |
+| `DELETE`      | `/api/playback/{session}`           | 立即释放租约, 最后一个触发后台停止, 可重复调用 |
 | `GET`         | `/playback/{session}/{asset}`       | 只读取 manifest, init 和编号媒体分片   |
 
-会话状态为 `queued`, `starting`, `ready`, `complete`, `failed` 或 `cancelled`.
-只有 `ready: true` 才能开始读取 HLS. 前端准备阶段轮询状态,
+缓存只有 `complete: true` 和 `false` 两种状态. `generating`, `stopping`,
+`encoding_threads` 和 `error` 独立描述任务活动, 不再返回状态枚举.
+`generating` 也包括排队, 准备和最终清理, 实际编码器未运行时 `encoding_threads` 为 0.
+首次激活先登记唯一活动元素再校验磁盘, 创建响应等待加载结果, 不把完整缓存误报为新空缓存.
+尚未返回 ID 的创建预留使用 `max(idle_timeout_seconds, 120)` 秒宽限,
+防止等待清理时提前过期, 也避免被中断的创建请求永久占用名额.
+
+前端准备阶段轮询状态,
 播放阶段每 10 秒查询状态保活; 媒体请求也延长会话有效期.
 `buffered_until` 是从时间 0 开始已经生成的范围终点, 不是浏览器本地缓冲长度.
-`ready: true` 表示首段验证通过, 较后的目标位置仍可能需要等待.
-会话释放或过期后, 完整缓存保留到 LRU 淘汰, 未完成的缓存继续生成.
+`ready: true` 只表示至少一个分片已通过验证. 目标必须满足 `target < buffered_until`;
+相等仍需等待. 已发布前缀可以在后续生成失败后继续播放, 未覆盖目标则明确报错,
+需要用户 Retry, 不自动启动新编码器.
+最后一个租约释放或过期后, 停止任务并从活动集合移除, 磁盘缓存保留到 LRU 淘汰.
 
 非法请求返回 `400`, 无法探测的文件返回 `422`, 不存在或过期的会话返回 `404`.
 异步字幕准备或编码失败由状态响应的 `error` 返回.
@@ -307,7 +358,9 @@ curl -X POST http://localhost:56080/api/files/FILE_ID/playback-plan \
 Rust `PlaybackVariantConfig` 依次包含 `src_file_pre16mib_md5`, `video_stream`,
 `audio_stream`, `subtitle_stream`, `encoder_profile`.
 使用 `serde_json::to_vec` 按字段顺序生成紧凑 JSON, 保留空轨道的 `null`,
-计算 MD5 后得到 32 位小写 `variant-key`. 固定编码配置为 `h264-high-yuv420p-aac-fmp4-v1`.
+计算 MD5 后得到 32 位小写 `variant-key`. 固定编码配置为 `h264-high-yuv420p-aac-fmp4-v2`.
+v2 固定无 B 帧, 视频时间基 90000, 音频时间基 48000, AAC 预热处理和有理数采样时钟,
+不能与旧 v1 缓存混用. 动态线程数不是配置字段, 同一配置的不同线程任务仍使用兼容的 init.
 路径, 请求位置和文件修改时间不参与计算. 文件改名或移动可以复用缓存,
 但仅修改前 16 MiB 之后的内容不会使缓存自动失效.
 此时需停止服务后删除对应缓存, 或随编码规则调整更新服务端 `encoder_profile`.
@@ -327,24 +380,42 @@ Rust `PlaybackVariantConfig` 依次包含 `src_file_pre16mib_md5`, `video_stream
 
 相同播放配置共享一份缓存及一个生成任务, 不同音轨或字幕配置可以同时存在.
 每个客户端仍获得独立会话 ID 和媒体地址. 最多允许 32 个租约和 32 个排队或生成中的缓存任务.
-Stop 只释放租约, 不终止 FFmpeg, 因而不会立即释放媒体处理名额.
-服务关闭时取消并回收所有未完成的生成任务, 完整缓存保留.
-强制终止留下的不完整输出及中间文件在下次启动时清理.
+运行时 `HashMap<variant-key, Arc<ActiveCache>>` 只保存活动元素.
+session 保存键和保活时间, 客户端目标与租约计数由活动元素中的同一张租约表维护.
+状态和媒体请求必须通过 session 及活动集合, 不支持按客户端提供的缓存键访问磁盘.
+
+最后一个租约离开时, 排队和准备任务立即取消; 编码任务记录当前已提交数量,
+最多再验证和发布一个分片后停止. 30 秒未等到新分片则强制终止并回收进程.
+停止期间新租约可撤销尚未结束的停止请求; 如果已经开始最终清理, 则等待旧写入者退出.
+DELETE 不等待此过程. 服务正常关闭采用相同停止规则, Compose 的宽限期为 40 秒.
 
 不保存 `metadata.json` 或单独的持久缓存索引.
-FFmpeg 成功退出, 最终 playlist 和所有 MP4 分片结构校验通过,
-且中间文件清理完成后, 原子创建空的 `complete` 标记.
-重启时校验完成标记, playlist, 分片文件和首段编码, 只加载有效的完整缓存.
-缓存命中不重新编码或提取字幕, 缺失或损坏的文件会明确报错.
+FFmpeg 写入变体下的私有 `.work-<id>` 目录. 首次发布正式 init 后不再替换它.
+Rust 比较新旧 init 的轨道, timescale, AVC/AAC 描述和默认值, 去除可选 `sidx`,
+修正 `mfhd` 序号与逐轨 `tfdt`, 保持媒体负载不变.
+每段都与正式 init 执行实际解码, 通过后原子发布分片和 playlist.
+续接只追加已验证尾部, 不覆盖已有 init 或分片.
+
+音频从固定原点重采样, 仅编码少量预热音频和新尾部, 丢弃负时间的 AAC 预热包.
+读取旧音频或字幕历史有额外成本, 但不重编码已缓存的视频.
+任务正常到 EOF 并验证全部输出后原子写入 ENDLIST 和空 `complete` 标记,
+然后清理中间文件. 标记只表示媒体完整, 不表示后台清理已经结束.
+
+重启校验所有连续分片的 MP4 结构, 样本范围, 序号和逐轨时间轴, 并实际解码首段及尾段.
+损坏尾部从末端截断, 保留有效前缀; 已发布的中间段不会在每次恢复时全部重新解码.
+崩溃前已发布但尚未写入 playlist 的有效分片可以找回, 已写 ENDLIST 而未写标记时也可恢复完成状态.
+未完成缓存保留没有 ENDLIST 的 event playlist, 启动时不创建活动元素或自动续接.
+真正的恢复, 编码和清理错误均明确记录, 正常取消不会掩盖其他错误.
 启动清理仅针对服务生成的命名, 不删除未知名称的文件.
 只保留 FFmpeg 最近 4000 字节 stderr 作为错误详情, 不写持久转码日志.
 
 容量统计包含 HLS 和字幕, 字体中间文件的实际字节数.
 最后使用时间记录在内存中, 并通过变体目录修改时间跨重启保留;
 每 5 秒维护一次, 释放和生成完成时也执行维护, 避免每个分片请求都写盘.
-超过 `cache_max_bytes` 时, 按 LRU 删除无租约的完整变体, 直到满足上限或没有可淘汰条目.
-正在生成或使用中的变体不淘汰, 允许暂时超限. 超过上限的单个完整变体也会在无租约时被删除.
-后台生成在无人观看时仍消耗 CPU 和磁盘, 必须为受保护的缓存预留额外空间.
+超过 `cache_max_bytes` 时, 按 LRU 删除活动集合外的完整或部分变体,
+直到满足上限或没有可淘汰条目. 文件打开期间持有的旧元素引用同样受到保护.
+淘汰先在锁内原子改名, 再在锁外删除, 不长时间阻塞其他缓存的状态请求.
+停止清理中的变体仍受保护, 允许暂时超限; 超大单个变体在退出活动集合后也会被删除.
 不要在服务运行时手动删除缓存, 修改完成标记或接管中间文件.
 备份数据库前建议停止容器, 并保留整个数据目录中的 SQLite 数据及可能存在的 WAL 文件.
 
@@ -357,7 +428,7 @@ npm run build --prefix frontend
 ```
 
 完整媒体测试必须使用隔离实例. 测试会扫描媒体, 写入播放进度,
-创建和释放会话, 并在传入 `--container` 时破坏指定测试缓存及重启该容器.
+创建和释放会话, 并在传入 `--container` 时暂停或终止测试编码器, 破坏测试缓存及重启容器.
 不要针对实际媒体库运行.
 
 ```bash
@@ -386,7 +457,10 @@ docker stop anime-server-test
 
 每次完整测试使用新的空缓存目录, 不复用旧测试的生成结果.
 执行测试的用户需要 Docker 权限. 如果修改了测试实例的 `max_processes`,
-用同值的 `--max-processes` 参数运行测试.
+用同值的 `--max-processes` 参数运行测试. 全局线程预算和空闲时间有修改时,
+同时传入对应的 `--thread-budget` 和 `--idle-timeout`.
+验证两编码器预算分配可使用 `max_processes=3`, `max_total_ffmpeg_threads=10`,
+配合 `--max-processes 3 --thread-budget 10`.
 
 实际容量淘汰测试另建隔离实例, 使用独立的配置和空缓存目录,
 把 `playback.cache_max_bytes` 设为 `1`, 再运行:
@@ -399,10 +473,11 @@ python3 backend/tests/playback_smoke.py \
 ```
 
 测试覆盖统一编码, 帧率上限, 实际音轨信号, 文本和位图字幕画面,
-小数时间定位, 共享租约, 同键单任务, 并发限流, 无人观看后继续生成,
-中间文件清理, 重启复用, 损坏缓存清理及进度持久化.
-另检查实际转码中的正常停服和强制中断恢复, 确保未完成输出不被复用.
-后端单元测试覆盖规范化缓存键, LRU 顺序, 活动和生成条目保护, 目录时间和启动恢复.
+小数时间定位, 服务端进度与选轨, 共享租约, 同键单任务, 加权线程预算,
+排队取消, 分片边界停止, 新租约撤销停止, 30 秒强制回收和会话过期.
+续接检查原前缀的 inode 和摘要不变, 全部帧和音频样本数一致, 时间戳误差小于 1 毫秒,
+逐帧图像与逐窗口波形满足误差阈值, 包括文本字幕, 位图字幕, 44.1 kHz 重采样及 VFR 输入.
+另检查完整复用, 正常和强制重启, 损坏尾部修复, 部分缓存 LRU 和进度持久化.
 前端回归测试覆盖同租约跳转等待及改选目标, 暂停状态换轨和解码失败不自动发起新播放请求.
 原生 iOS Safari 的最终兼容性仍需在真实设备上确认.
 
@@ -413,13 +488,13 @@ python3 backend/tests/playback_smoke.py \
 | 启动后没有端口映射     | 检查 `docker compose config` 和 `docker compose port anime-server 8080`, 必要时重新创建容器 |
 | Docker socket 权限不足 | 使用具备 Docker 权限的用户; 修改用户组后重新登录, 或按宿主机策略使用 sudo                   |
 | 视频列表为空           | 检查 `/media` 挂载和读取权限, 然后点击 Scan videos                                          |
-| 长时间等待名额         | 等待已有缓存生成完成, 或按机器能力调整并发数; 停止播放不取消生成                             |
+| 长时间等待名额         | 检查进程名额和全局线程预算; 默认仅一个编码器, 需要两个时将 `max_processes` 设为 3           |
 | 恢复位置等待很久       | 新缓存从 0 连续生成, 等待生成范围覆盖目标; 可以拖回已生成位置                                |
-| 首段生成很慢           | 检查 CPU, 字幕复杂度和字体大小; 首次使用新的轨道配置需要完整编码                            |
+| 首段或续接启动很慢     | 检查 CPU, 字幕和字体; 首次配置从 0 编码, 续接仍需读取音频及字幕历史                          |
 | 字幕没有字形           | 检查内嵌字体和镜像的 Noto CJK 字体; 查看播放器返回的 FFmpeg 错误                            |
 | 探测失败被记住         | 点击 Retry probe, 或调用 `/probe`; 错误不会跨进程持久保存                                   |
 | 会话不存在或过期       | 页面后台休眠可能停止保活; 手动点击 Play 或 Retry 创建同格式的新会话                         |
 | 解码或 HLS 解析失败    | 查看播放器错误及容器日志. 不会自动请求其他编码或封装                                        |
 | 缓存目录被占用         | 检查是否有另一实例挂载相同 `CACHE_DIR`, 为测试实例使用独立目录                              |
-| 缓存超过配置大小       | 生成和活动条目受保护, 等待完成并释放租约; 容量上限不是硬配额                                |
-| 磁盘已满               | 停止服务后清理 `/cache` 中指定的变体, 或增加空间; Stop 按钮不终止后台生成, 不要删除数据库  |
+| 缓存超过配置大小       | 活动目录及媒体打开引用受保护, 等待最后租约释放和后台停止; 容量上限不是硬配额                  |
+| 磁盘已满               | 停止服务后清理 `/cache` 中指定的变体或增加空间, 不要删除数据库                               |

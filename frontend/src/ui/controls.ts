@@ -1,3 +1,4 @@
+// 绑定播放器控件, 将用户操作转交控制器并同步界面状态.
 import type { PlaybackController } from "../playback/playback-controller.ts";
 import { formatTime } from "../playback/timeline.ts";
 import type { MediaInfo, Selection, Track } from "../state/player-state.ts";
@@ -31,6 +32,7 @@ export function attachControls(controller: PlaybackController, video: HTMLVideoE
   element<HTMLButtonElement>("#retry").onclick = () => controller.retry();
   element<HTMLButtonElement>("#retry-probe").onclick = () => controller.retry(true);
   video.addEventListener("click", () => controller.toggle());
+  // input 只预览时间, change 才提交目标, 状态刷新不得覆盖正在拖动的滑块.
   seek.addEventListener("input", () => {
     scrubbing = true;
     clock.textContent = `${formatTime(Number(seek.value))} / ${formatTime(controller.duration)}`;
@@ -68,6 +70,7 @@ export function attachControls(controller: PlaybackController, video: HTMLVideoE
     fullscreen.textContent = document.fullscreenElement ? "Exit fullscreen" : "Fullscreen";
   });
   panel.addEventListener("keydown", (event) => {
+    // 表单控件保留自身键盘行为, 播放快捷键不应吞掉输入或按钮操作.
     if (event.target instanceof HTMLInputElement || event.target instanceof HTMLSelectElement
       || event.target instanceof HTMLButtonElement || event.ctrlKey || event.metaKey || event.altKey) return;
     switch (event.key.toLowerCase()) {
@@ -82,6 +85,7 @@ export function attachControls(controller: PlaybackController, video: HTMLVideoE
   });
   controller.addEventListener("change", () => {
     const info = controller.info;
+    // 仅媒体信息变化时重建选项, 普通进度刷新只同步服务端确认的轨道选择.
     if (info && previousInfo !== info) {
       previousInfo = info;
       audio.replaceChildren(new Option("No audio", "off"), ...info.audio_tracks.map((track) => new Option(label(track), String(track.stream_index))));

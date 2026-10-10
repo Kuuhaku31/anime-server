@@ -1,5 +1,7 @@
+// 按浏览器能力选择 HLS 引擎并管理媒体加载与释放.
 import Hls from "hls.js";
 
+// Safari 优先原生 HLS, 其他支持 MSE 的浏览器优先 hls.js, 加载失败后不切换引擎重试.
 export function preferNativeHls(nativeSupport: boolean, mseSupport: boolean, vendor: string): boolean {
   return nativeSupport && (vendor === "Apple Computer, Inc." || !mseSupport);
 }
@@ -15,7 +17,7 @@ export class MediaAdapter {
     this.destroy();
     signal.throwIfAborted();
     const mse = Hls.isSupported();
-    // Chromium can advertise native HLS yet reject a growing fMP4 event playlist.
+    // Chromium 即使声明支持原生 HLS, 也可能拒绝持续增长的 fMP4 event 清单.
     const native = preferNativeHls(!!this.video.canPlayType("application/vnd.apple.mpegurl"), mse, navigator.vendor);
     if (!native && !mse) {
       return Promise.reject(new Error("This browser has no supported HLS playback engine."));
@@ -28,12 +30,14 @@ export class MediaAdapter {
         failed = true;
         clearTimeout(timer);
         this.hls?.stopLoad();
+        // 加载完成前拒绝 Promise, 完成后的解码错误改由 fatal 回调通知控制器.
         if (settled) fatal(error);
         else { settled = true; reject(error); }
       };
       const loaded = (): void => {
         if (settled || signal.aborted) return;
         try {
+          // 元数据就绪后设置绝对位置, 实际缓冲和解码仍由媒体引擎异步完成.
           this.video.currentTime = Math.max(0, position);
           settled = true;
           clearTimeout(timer);
@@ -81,6 +85,7 @@ export class MediaAdapter {
     });
   }
 
+  // 先解除旧加载回调再重置 video, 避免旧媒体事件污染新会话.
   destroy(): void {
     this.cleanup?.();
     this.cleanup = null;

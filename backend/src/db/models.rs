@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+/// 文件列表的去重记录, 同一指纹存在多个副本时只选一条路径作为展示信息.
 #[derive(Debug, Serialize, sqlx::FromRow)]
 pub struct VideoFile {
     pub pre16mib_md5: String,
@@ -16,6 +17,7 @@ pub struct VideoFile {
     pub extension: String,
 }
 
+/// 相对于媒体根目录的路径拆分记录, 同一文件指纹可以对应多个副本.
 #[derive(Debug, Serialize, sqlx::FromRow)]
 pub struct FilePath {
     pub path: String,
@@ -49,6 +51,7 @@ pub struct ProgressInput {
     pub position: f64,
 }
 
+/// 进度按文件指纹保存原视频绝对秒数, 跨路径副本和不同播放配置复用.
 #[derive(Debug, Serialize, sqlx::FromRow)]
 pub struct WatchProgress {
     pub pre16mib_md5: String,

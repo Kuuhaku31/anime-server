@@ -3,6 +3,7 @@
 use crate::db::models::{FilePath, ScannedFile, VideoFile, WatchProgress};
 use sqlx::SqlitePool;
 
+// 同一指纹对应多个路径时仅展示排序后的第一条, 避免列表重复并保持展示结果稳定.
 const VIDEO_SELECT: &str = r#"
     SELECT
         f.pre16mib_md5,
@@ -53,6 +54,7 @@ pub async fn get_paths(
     .await
 }
 
+/// 在一次事务中替换路径快照但保留 file 业务记录, 避免移动或暂时离线丢失观看进度.
 pub async fn sync_scanned_files(
     pool: &SqlitePool,
     files: &[ScannedFile],

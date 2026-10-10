@@ -19,8 +19,10 @@ use crate::{
 const EXTENSIONS: &[&str] = &["mp4", "mkv", "webm", "mov", "avi", "m4v"];
 const HASH_LIMIT: u64 = 16 * 1024 * 1024;
 
+/// 手动和定时扫描共用互斥锁, 只有完整收集成功后才能替换数据库路径快照.
 pub async fn scan_once(state: &AppState) -> Result<u64> {
     let _scan = state.scan_lock.lock().await;
+    // 遍历和文件哈希使用同步 I/O, 放到阻塞线程池以免拖住 HTTP 请求和播放心跳.
     let files = tokio::task::spawn_blocking(collect_files).await??;
     repository::sync_scanned_files(&state.db, &files).await?;
     Ok(files.len() as u64)
@@ -76,6 +78,7 @@ fn scan_file(root: &Path, absolute_path: &Path) -> Result<ScannedFile> {
     })
 }
 
+// 最多读取前 16 MiB, 短文件读到 EOF, 文件名或目录变化不会改变业务身份.
 fn hash_prefix(path: &Path) -> Result<String> {
     let mut file =
         File::open(path).with_context(|| format!("failed to open {}", path.display()))?;

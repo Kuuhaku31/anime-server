@@ -7,6 +7,7 @@ use tokio::{process::Command, sync::watch};
 
 use super::{cache::{is_key, random_id}, ffmpeg::EncodeSpec, process::checked_output_cancellable};
 
+/// 资源只属于本次字幕渲染任务, 不进入持久播放配置或缓存身份.
 pub struct RenderAssets {
     id: String,
     subtitle: PathBuf,
@@ -27,13 +28,14 @@ impl RenderAssets {
     }
 
     pub fn filter(&self) -> String {
-        // These relative paths contain only server-generated hexadecimal names.
-        format!("subtitles=filename='../../subtitles/{}.ass':fontsdir='../../fonts/{}'", self.id, self.id)
+        // FFmpeg 在 variant 的私有工作目录运行, 路径只包含服务端生成的十六进制名称.
+        format!("subtitles=filename='../../../subtitles/{}.ass':fontsdir='../../../fonts/{}'", self.id, self.id)
     }
 
     pub async fn prepare(&self, spec: &EncodeSpec, seconds: u64, cancel: &mut watch::Receiver<bool>) -> Result<()> {
         let track = spec.subtitle.as_ref().context("text subtitle is missing")?;
         let started = Instant::now();
+        // 保留原始字幕时间抽取为 ASS, 续接后仍能烧录在边界之前已开始的字幕.
         let mut command = Command::new("ffmpeg");
         command.args(["-nostdin", "-v", "error", "-y", "-threads", "1", "-copyts", "-i"])
             .arg(&spec.source).args(["-map", &format!("0:{}", track.stream_index), "-c:s", "ass", "-f", "ass"])
@@ -43,13 +45,15 @@ impl RenderAssets {
         let mut paths = Vec::new();
         let mut command = Command::new("ffmpeg");
         command.args(["-nostdin", "-v", "error", "-y"]);
-        for font in &spec.attachments {
+        for font in &spec.info.attachments {
             let Some(extension) = &font.font_extension else { continue; };
+            // 输出路径由服务端随机命名, 不信任容器内附件的文件名或目录.
             let path = self.fonts.join(format!("{}.{}", random_id()?, extension));
             command.arg(format!("-dump_attachment:t:{}", font.ordinal)).arg(&path);
             paths.push(path);
         }
         if !paths.is_empty() {
+            // 字幕提取和字体导出共用准备预算, 不能分别消耗一遍完整超时.
             let remaining = seconds.checked_sub(started.elapsed().as_secs())
                 .filter(|seconds| *seconds > 0).context("subtitle preparation timed out")?;
             command.arg("-i").arg(&spec.source)
@@ -75,6 +79,7 @@ impl RenderAssets {
     }
 }
 
+/// 只清理符合本程序随机命名规则的遗留资源, 不处理目录中的其他文件.
 pub async fn clean_startup(root: &Path) -> Result<()> {
     for directory in ["subtitles", "fonts"] {
         let mut entries = tokio::fs::read_dir(root.join(directory)).await?;

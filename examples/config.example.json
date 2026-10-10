@@ -7,6 +7,8 @@
     "cache_max_bytes": 10737418240,
     "max_processes": 2,
     "ffmpeg_threads": 2,
+    "max_variant_threads": 8,
+    "max_total_ffmpeg_threads": 16,
     "idle_timeout_seconds": 60,
     "startup_timeout_seconds": 90
   },

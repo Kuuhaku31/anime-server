@@ -4,6 +4,7 @@ use anyhow::{ensure, Result};
 use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
 
+// 容器路径保持固定, 宿主机目录和端口映射由 Compose 与 .env 决定.
 pub const DATABASE_PATH: &str = "/data/main.db";
 pub const DATA_DIR: &str = "/data";
 pub const VIDEO_ROOT: &str = "/media";
@@ -24,12 +25,18 @@ pub struct AppConfig {
     pub playback: PlaybackConfig,
 }
 
+/// 只控制资源调度和租约生命周期, 不参与播放配置的缓存身份计算.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PlaybackConfig {
+    // 按目录实际字节数统计, 活动缓存受保护时允许暂时超过此淘汰目标.
     pub cache_max_bytes: u64,
+    // 总进程名额包含探测和校验, 至少预留一个名额避免编码等待校验时死锁.
     pub max_processes: usize,
+    // 先获得基础线程预算才启动, 目标未覆盖时最多申请到单个任务上限.
     pub ffmpeg_threads: usize,
+    pub max_variant_threads: usize,
+    pub max_total_ffmpeg_threads: usize,
     pub idle_timeout_seconds: u64,
     pub startup_timeout_seconds: u64,
 }
@@ -40,6 +47,8 @@ impl Default for PlaybackConfig {
             cache_max_bytes: 10 * 1024 * 1024 * 1024,
             max_processes: 2,
             ffmpeg_threads: 2,
+            max_variant_threads: 8,
+            max_total_ffmpeg_threads: 16,
             idle_timeout_seconds: 60,
             startup_timeout_seconds: 90,
         }
@@ -50,12 +59,18 @@ impl PlaybackConfig {
     pub fn validate(&self) -> Result<()> {
         ensure!(self.cache_max_bytes > 0, "cache_max_bytes must be positive");
         ensure!(
-            (1..=16).contains(&self.max_processes),
-            "max_processes must be 1..16"
+            (2..=16).contains(&self.max_processes),
+            "max_processes must be 2..16, including one reserved validation slot"
         );
         ensure!(
-            (1..=32).contains(&self.ffmpeg_threads),
-            "ffmpeg_threads must be 1..32"
+            self.ffmpeg_threads >= 1 && self.ffmpeg_threads <= self.max_variant_threads
+                && self.max_variant_threads <= 32,
+            "require 1 <= ffmpeg_threads <= max_variant_threads <= 32"
+        );
+        // 这是 H.264 编码预算, 不包含解码器, 滤镜或系统内部线程.
+        ensure!(
+            (self.ffmpeg_threads..=256).contains(&self.max_total_ffmpeg_threads),
+            "max_total_ffmpeg_threads must be between ffmpeg_threads and 256"
         );
         ensure!(
             (20..=3600).contains(&self.idle_timeout_seconds),
@@ -77,6 +92,8 @@ mod tests {
     fn cache_capacity_is_a_positive_byte_count_with_a_ten_gib_default() {
         let config: PlaybackConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(config.cache_max_bytes, 10_737_418_240);
+        assert_eq!(config.max_variant_threads, 8);
+        assert_eq!(config.max_total_ffmpeg_threads, 16);
         assert!(config.validate().is_ok());
         let config: PlaybackConfig = serde_json::from_str(r#"{"cache_max_bytes":0}"#).unwrap();
         assert!(config.validate().is_err());
@@ -85,6 +102,19 @@ mod tests {
                 r#"{{"cache_max_bytes":{value}}}"#
             ))
             .is_err());
+        }
+
+    }
+
+    #[test]
+    fn encoder_budgets_and_the_validation_slot_are_required() {
+        // 非法预算必须在启动时拒绝, 不能让加权许可永久等待.
+        for value in [
+            r#"{"max_processes":1}"#, r#"{"ffmpeg_threads":0}"#,
+            r#"{"ffmpeg_threads":9}"#, r#"{"max_variant_threads":33}"#,
+            r#"{"max_total_ffmpeg_threads":1}"#, r#"{"max_total_ffmpeg_threads":257}"#,
+        ] {
+            assert!(serde_json::from_str::<PlaybackConfig>(value).unwrap().validate().is_err());
         }
     }
 }

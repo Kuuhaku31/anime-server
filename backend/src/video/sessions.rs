@@ -1,4 +1,4 @@
-//! 管理客户端播放会话和缓存租约.
+//! 管理不透明播放会话并协调活动缓存租约.
 
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::{Duration, Instant}};
 
@@ -7,8 +7,9 @@ use serde::Serialize;
 use tokio::{sync::Mutex, time::interval};
 use tracing::warn;
 
-use super::{cache::{random_id, CacheEntry, CacheManager, CacheState}, ffmpeg::{self, EncodeSpec}};
+use super::{cache::{random_id, ActiveCache, CacheManager}, ffmpeg::EncodeSpec, metadata::MediaInfo};
 
+/// 对外只暴露不透明会话和状态快照, 不返回播放配置或 variant-key.
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionStatus {
     pub session_id: String,
@@ -16,16 +17,37 @@ pub struct SessionStatus {
     pub mime_type: &'static str,
     pub start_time: f64,
     pub duration: f64,
-    pub state: CacheState,
+    pub position: f64,
+    pub complete: bool,
+    pub generating: bool,
+    pub stopping: bool,
     pub ready: bool,
     pub buffered_until: f64,
+    pub encoding_threads: usize,
     pub error: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct Selection {
+    pub audio: Option<i32>,
+    pub subtitle: Option<i32>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PlaybackStart {
+    #[serde(flatten)]
+    pub session: SessionStatus,
+    pub media: MediaInfo,
+    pub selection: Selection,
+}
+
+// 会话只记录缓存键和存活时间, 目标位置及媒体状态由活动元素统一维护.
 struct Session {
-    cache: Arc<CacheEntry>,
-    duration: f64,
-    touched: Instant,
+    variant_key: String,
+    // 创建阶段给予额外宽限, 但被中断的 HTTP 请求不能永久占住会话名额.
+    created: Instant,
+    // None 表示创建预留阶段, 第一次有效访问后才启用普通心跳超时.
+    touched: Option<Instant>,
 }
 
 #[derive(Clone)]
@@ -40,28 +62,53 @@ impl SessionManager {
         Self { sessions: Arc::new(Mutex::new(HashMap::new())), cache, idle_seconds }
     }
 
-    pub async fn create(&self, spec: EncodeSpec) -> Result<SessionStatus> {
-        let mut sessions = self.sessions.lock().await;
-        ensure!(!self.cache.stopping(), "server is shutting down");
-        ensure!(sessions.len() < 32, "too many playback sessions; stop an existing stream");
+    /// 先预留会话名额再等待缓存加载, 防止并发创建绕过数量上限.
+    pub async fn create(&self, spec: EncodeSpec) -> Result<PlaybackStart> {
         let id = random_id()?;
-        let duration = spec.duration;
-        let cache = self.cache.acquire(spec).await?;
-        sessions.insert(id.clone(), Session { cache, duration, touched: Instant::now() });
-        drop(sessions);
-        self.status(&id).await
+        let key = spec.config.key()?;
+        let media = spec.info.clone();
+        let selection = Selection { audio: spec.config.audio_stream, subtitle: spec.config.subtitle_stream };
+        {
+            let mut sessions = self.sessions.lock().await;
+            ensure!(!self.cache.stopping(), "server is shutting down");
+            ensure!(sessions.len() < 32, "too many playback sessions; stop an existing stream");
+            sessions.insert(id.clone(), Session { variant_key: key.clone(), created: Instant::now(), touched: None });
+        }
+        // 等待旧写入者回收时不持有会话表锁, 其他客户端仍能立即释放租约.
+        let result = async {
+            self.cache.acquire(spec, &id).await?.wait_loaded().await?;
+            self.status(&id).await
+        }.await;
+        match result {
+            Ok(session) => Ok(PlaybackStart { session, media, selection }),
+            Err(error) => {
+                self.sessions.lock().await.remove(&id);
+                if let Err(cleanup) = self.cache.release(&key, &id).await {
+                    return Err(error.context(format!("session cleanup failed: {cleanup:#}")));
+                }
+                Err(error)
+            },
+        }
+    }
+
+    // 状态, 媒体和显式心跳请求都经此续期, 客户端不能自行提供缓存键.
+    async fn key(&self, id: &str) -> Result<String> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions.get_mut(id).context("playback session not found or expired")?;
+        session.touched = Some(Instant::now());
+        Ok(session.variant_key.clone())
     }
 
     pub async fn status(&self, id: &str) -> Result<SessionStatus> {
-        let mut sessions = self.sessions.lock().await;
-        let session = sessions.get_mut(id).context("playback session not found or expired")?;
-        session.touched = Instant::now();
-        let status = session.cache.status().await;
+        let key = self.key(id).await?;
+        let cache = self.cache.get(&key).await?;
+        let status = cache.status(id).await?;
         Ok(SessionStatus {
-            session_id: id.to_string(), url: format!("/playback/{id}/index.m3u8"),
-            mime_type: "application/vnd.apple.mpegurl", start_time: 0.0,
-            duration: session.duration, state: status.state, ready: status.ready(),
-            buffered_until: status.buffered_until.min(session.duration), error: status.error,
+            session_id: id.to_string(), url: format!("/playback/{id}/index.m3u8?revision={}", status.revision),
+            mime_type: "application/vnd.apple.mpegurl", start_time: 0.0, duration: cache.spec.duration,
+            position: status.target, complete: status.complete, generating: status.generating,
+            stopping: status.stopping, ready: status.ready, buffered_until: status.buffered_until,
+            encoding_threads: status.encoding_threads, error: status.error,
         })
     }
 
@@ -70,27 +117,26 @@ impl SessionManager {
         Ok(())
     }
 
-    pub async fn media_path(&self, id: &str, name: &str) -> Result<(PathBuf, &'static str, Arc<CacheEntry>)> {
-        ensure!(ffmpeg::media_filename(name), "playback asset not found");
-        let cache = {
-            let mut sessions = self.sessions.lock().await;
-            let session = sessions.get_mut(id).context("playback session not found or expired")?;
-            session.touched = Instant::now();
-            session.cache.clone()
-        };
-        ensure!(cache.status().await.ready(), "playback output is not ready");
-        let path = cache.directory.join(name);
-        let file = tokio::fs::symlink_metadata(&path).await.context("cached media file is missing")?;
-        ensure!(file.is_file() && file.len() > 0, "unsafe or empty cached media file");
+    pub async fn target(&self, id: &str, target: f64) -> Result<SessionStatus> {
+        let key = self.key(id).await?;
+        self.cache.target(&key, id, target).await?;
+        self.status(id).await
+    }
+
+    pub async fn media_path(&self, id: &str, name: &str) -> Result<(PathBuf, &'static str, Arc<ActiveCache>)> {
+        let key = self.key(id).await?;
+        let (path, cache) = self.cache.media_path(&key, id, name).await?;
         let mime = if name.ends_with(".m3u8") { "application/vnd.apple.mpegurl" }
             else if name.ends_with(".m4s") { "video/iso.segment" } else { "video/mp4" };
-        // Pin the entry until ServeFile has opened the file, even if DELETE races with this request.
+        // 只在文件打开期间持有额外 Arc, 即使最后一份租约被删除也不会被 LRU 抢先删除.
         Ok((path, mime, cache))
     }
 
+    /// 先移除会话再释放租约, 重复释放和并发过期清理只会有一方实际扣除租约.
     pub async fn release(&self, id: &str) -> Result<()> {
-        self.sessions.lock().await.remove(id);
-        self.cache.maintain().await
+        let session = self.sessions.lock().await.remove(id);
+        if let Some(session) = session { self.cache.release(&session.variant_key, id).await?; }
+        Ok(())
     }
 
     pub fn spawn_expiration(&self) {
@@ -107,9 +153,26 @@ impl SessionManager {
         });
     }
 
+    // 锁内批量摘除过期会话, 锁外逐一清理, 单个失败不能阻断其余租约释放.
     async fn expire(&self) -> Result<()> {
-        self.sessions.lock().await.retain(|_, session| session.touched.elapsed().as_secs() < self.idle_seconds);
-        self.cache.maintain().await
+        let expired = {
+            let mut sessions = self.sessions.lock().await;
+            let ids: Vec<_> = sessions.iter().filter(|(_, session)| match session.touched {
+                Some(touched) => touched.elapsed().as_secs() >= self.idle_seconds,
+                None => session.created.elapsed().as_secs() >= self.idle_seconds.max(120),
+            })
+                .map(|(id, _)| id.clone()).collect();
+            ids.into_iter().filter_map(|id| sessions.remove(&id).map(|session| (id, session))).collect::<Vec<_>>()
+        };
+        let mut errors = Vec::new();
+        for (id, session) in expired {
+            if let Err(error) = self.cache.release(&session.variant_key, &id).await {
+                errors.push(format!("session {id}: {error:#}"));
+            }
+        }
+        if let Err(error) = self.cache.maintain().await { errors.push(format!("{error:#}")); }
+        ensure!(errors.is_empty(), "session expiration failed: {}", errors.join("; "));
+        Ok(())
     }
 
     pub async fn shutdown(&self) -> Result<()> {
@@ -124,32 +187,61 @@ mod tests {
     use crate::{config::PlaybackConfig, video::{ffmpeg::fixture, process::Processes}};
 
     #[tokio::test]
-    async fn sessions_share_generation_and_expiry_only_releases_leases() {
-        let root = std::env::temp_dir().join(format!("anime-leases-{}", random_id().unwrap()));
-        let processes = Processes::new(1);
-        let permit = processes.slots.acquire().await.unwrap();
-        let cache = CacheManager::new(root.clone(), PlaybackConfig::default(), processes.clone()).await.unwrap();
-        let manager = SessionManager::new(cache, 60);
-        let mut ids = Vec::new();
-        for _ in 0..2 {
-            let (info, request) = fixture();
-            let spec = EncodeSpec::new(&"a".repeat(32), "video.mkv".into(), info, request, 1).unwrap();
-            ids.push(manager.create(spec).await.unwrap().session_id);
-        }
-        assert_ne!(ids[0], ids[1]);
+    async fn an_abandoned_creation_reservation_expires_after_its_grace_period() {
+        let root = std::env::temp_dir().join(format!("anime-pending-lease-{}", random_id().unwrap()));
+        let cache = CacheManager::new(root.clone(), PlaybackConfig::default(), Processes::new(2, 16)).await.unwrap();
+        let manager = SessionManager::new(cache, 20);
         {
-            let sessions = manager.sessions.lock().await;
-            assert!(Arc::ptr_eq(&sessions[&ids[0]].cache, &sessions[&ids[1]].cache));
+            let mut sessions = manager.sessions.lock().await;
+            for (id, seconds) in [("loading", 30), ("abandoned", 121)] {
+                sessions.insert(id.to_string(), Session {
+                    variant_key: "a".repeat(32), touched: None,
+                    created: Instant::now() - Duration::from_secs(seconds),
+                });
+            }
         }
-        manager.release(&ids[0]).await.unwrap();
-        assert!(manager.status(&ids[0]).await.is_err());
-        manager.sessions.lock().await.get_mut(&ids[1]).unwrap().touched = Instant::now() - Duration::from_secs(61);
         manager.expire().await.unwrap();
-        assert!(manager.status(&ids[1]).await.is_err());
-        assert!(tokio::fs::read_dir(root.join("playback")).await.unwrap().next_entry().await.unwrap().is_some());
+        let sessions = manager.sessions.lock().await;
+        assert!(sessions.contains_key("loading"));
+        assert!(!sessions.contains_key("abandoned"));
+        drop(sessions);
+        manager.shutdown().await.unwrap();
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_sessions_share_one_entry_and_last_expiry_cancels_queued_work() {
+        // 先占满媒体名额, 让最后释放发生在排队阶段, 不能意外启动编码.
+        let root = std::env::temp_dir().join(format!("anime-active-leases-{}", random_id().unwrap()));
+        let processes = Processes::new(2, 16);
+        let permit = processes.slots.acquire_many(2).await.unwrap();
+        let cache = CacheManager::new(root.clone(), PlaybackConfig::default(), processes.clone()).await.unwrap();
+        let manager = SessionManager::new(cache.clone(), 60);
+        let (info, request) = fixture();
+        let spec = EncodeSpec::new(&"a".repeat(32), "video.mkv".into(), info, request, None).unwrap();
+        let key = spec.config.key().unwrap();
+        let (first, second) = tokio::join!(manager.create(spec.clone()), manager.create(spec));
+        let first = first.unwrap().session.session_id;
+        let second = second.unwrap().session.session_id;
+        assert_ne!(first, second);
+        let output = cache.get(&key).await.unwrap();
+        assert!(Arc::ptr_eq(&output, &cache.get(&key).await.unwrap()));
+        manager.release(&first).await.unwrap();
+        manager.release(&first).await.unwrap();
+        assert!(manager.status(&first).await.is_err());
+        assert!(manager.status(&second).await.unwrap().generating);
+        manager.target(&second, 7.375).await.unwrap();
+        assert_eq!(manager.status(&second).await.unwrap().position, 7.375);
+        manager.sessions.lock().await.get_mut(&second).unwrap().touched = Some(Instant::now() - Duration::from_secs(61));
+        manager.expire().await.unwrap();
+        assert!(manager.status(&second).await.is_err());
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while cache.get(&key).await.is_ok() { tokio::time::sleep(Duration::from_millis(5)).await; }
+        }).await.unwrap();
+        assert!(manager.media_path(&second, "init.mp4").await.is_err());
         manager.shutdown().await.unwrap();
         drop(permit);
-        assert!(tokio::fs::read_dir(root.join("playback")).await.unwrap().next_entry().await.unwrap().is_none());
+        drop(output);
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
 }

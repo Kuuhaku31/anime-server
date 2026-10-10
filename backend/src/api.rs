@@ -86,6 +86,7 @@ async fn get_file(
         .into_response()
 }
 
+// 当前识别仅写入演示剧集 ID, 不调用真实 DandanPlay 服务.
 async fn identify_file(
     State(state): State<AppState>,
     Path(pre16mib_md5): Path<String>,
@@ -162,6 +163,7 @@ async fn scan(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
+/// 根据数据库路径尝试可用副本, 规范化后仍须位于媒体根目录, 包括符号链接目标.
 pub async fn media_path(state: &AppState, id: &str) -> anyhow::Result<PathBuf> {
     anyhow::ensure!(id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()), "invalid file ID");
     let root = tokio::fs::canonicalize(VIDEO_ROOT).await?;

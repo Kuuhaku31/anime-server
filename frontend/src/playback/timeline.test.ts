@@ -1,3 +1,4 @@
+// 验证时间换算和缓存半开区间, 特别覆盖末端相等与非有限数值.
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { absoluteTime, rangeReady, formatTime } from "./timeline.ts";
@@ -9,14 +10,17 @@ test("fractional HLS source offsets preserve the original timeline", () => {
   assert.equal(absoluteTime(1.25, 7.375, 20), 8.625);
 });
 
-test("cache ranges require a margin until complete and allow seeking near the end", () => {
-  assert.equal(rangeReady(7.375, 8, 20, false), true);
-  assert.equal(rangeReady(7.875, 8, 20, false), false);
-  assert.equal(rangeReady(15, 8, 20, false), false);
-  assert.equal(rangeReady(19.9, 20, 20, true), true);
-  assert.equal(rangeReady(20, 20, 20, true), false);
-  assert.equal(rangeReady(Number.NaN, 20, 20, true), false);
-  assert.equal(rangeReady(-1, 20, 20, true), false);
+test("a covered target starts immediately and the exact end still waits", () => {
+  // 生成范围按半开区间判断, 不因 complete 与否增加额外余量.
+  assert.equal(rangeReady(7.375, 8), true);
+  assert.equal(rangeReady(7.999, 8), true);
+  assert.equal(rangeReady(8, 8), false);
+  assert.equal(rangeReady(15, 8), false);
+  assert.equal(rangeReady(19.9, 20), true);
+  assert.equal(rangeReady(20, 20), false);
+  assert.equal(rangeReady(Number.NaN, 20), false);
+  assert.equal(rangeReady(1, Number.NaN), false);
+  assert.equal(rangeReady(-1, 20), false);
 });
 
 test("time labels support episodes longer than an hour", () => {

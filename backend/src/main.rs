@@ -1,6 +1,5 @@
-
-// backend/src/main.rs
 //! 启动 Web 服务并组装应用依赖.
+// backend/src/main.rs
 
 use std::{net::SocketAddr, path::Path, sync::Arc};
 
@@ -41,6 +40,9 @@ pub struct AppState {
 #[tokio::main]
 async fn main() -> Result<()> {
 
+    println!("Anime Server v{} starting...", env!("CARGO_PKG_VERSION"));
+
+    // 容器探针只检查已有 HTTP 服务, 不重新初始化数据库或争抢缓存独占锁.
     if std::env::args().any(|arg| arg == "--healthcheck") {
         return video::health::http_check();
     }
@@ -70,7 +72,8 @@ async fn main() -> Result<()> {
         .execute(&pool)
         .await?;
 
-    let processes = Processes::new(config.playback.max_processes);
+    // 探测, 资源准备, 编码和解码校验共用进程预算, 防止不同模块各自突破全局上限.
+    let processes = Processes::new(config.playback.max_processes, config.playback.max_total_ffmpeg_threads);
     let cache = CacheManager::new(CACHE_DIR.into(), config.playback.clone(), processes.clone()).await?;
     let playback = SessionManager::new(cache, config.playback.idle_timeout_seconds);
     let metadata = MetadataCache::new(processes);
@@ -84,6 +87,7 @@ async fn main() -> Result<()> {
     tasks::scanner::spawn(state.clone());
     state.playback.spawn_expiration();
 
+    // API 和前端静态文件由同一端口提供, 浏览器通过同源相对 URL 访问服务.
     let app = api::router(state)
         .route("/health", get(|| async { Json(serde_json::json!({"status": "ok"})) }))
         .fallback_service(ServeDir::new("/app/web").append_index_html_on_directories(true))
@@ -101,6 +105,7 @@ async fn main() -> Result<()> {
             },
             _ = terminate.recv() => {},
         }
+        // 等待分片边界落盘并回收子进程, 不依赖容器强制终止来结束转码.
         if let Err(error) = playback.shutdown().await {
             tracing::error!("playback shutdown failed: {error:#}");
         }

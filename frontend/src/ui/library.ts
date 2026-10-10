@@ -1,3 +1,4 @@
+// 展示媒体列表并把点播动作交给播放控制器.
 import { request } from "../api/anime-server.ts";
 import type { VideoFile } from "../state/player-state.ts";
 import { element } from "./controls.ts";
@@ -10,6 +11,7 @@ export class Library {
 
   constructor(open: (file: VideoFile) => void, fail: (error: unknown) => void) {
     this.open = open;
+    // 列表重绘会替换全部行, 容器事件委托避免重复绑定每个按钮.
     this.container.addEventListener("click", (event) => {
       const target = event.target;
       if (!(target instanceof HTMLButtonElement)) return;
@@ -40,6 +42,7 @@ export class Library {
       const info = document.createElement("div");
       info.className = "file-info";
       const name = document.createElement("strong");
+      // 文件名来自媒体目录, 只作为文本展示, 不拼接到 HTML 中.
       name.textContent = file.name;
       name.title = file.name;
       const detail = document.createElement("span");
@@ -63,6 +66,7 @@ export class Library {
     if (!rows.length) this.container.textContent = "No videos found. Check the media mount and scan again.";
   }
 
+  // 播放状态频繁变化时仅更新高亮, 不重新创建文件列表 DOM.
   select(id: string | null): void {
     if (id === this.active) return;
     this.active = id;

@@ -1,11 +1,12 @@
+// 统一原视频时间轴和已生成范围的边界计算.
 export function absoluteTime(mediaTime: number, start: number, duration: number): number {
   if (!Number.isFinite(mediaTime)) return start;
   return Math.min(duration, Math.max(0, start + mediaTime));
 }
 
-export function rangeReady(position: number, bufferedUntil: number, duration: number, complete: boolean): boolean {
-  return Number.isFinite(position) && position >= 0 && position < bufferedUntil
-    && (complete || bufferedUntil >= Math.min(duration, position + 0.5));
+export function rangeReady(position: number, bufferedUntil: number): boolean {
+  // 末端时间点尚无媒体样本, 只要严格进入已发布范围就不再额外等待.
+  return Number.isFinite(position) && Number.isFinite(bufferedUntil) && position >= 0 && position < bufferedUntil;
 }
 
 export function formatTime(seconds: number): string {

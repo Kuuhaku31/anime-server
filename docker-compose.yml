@@ -3,6 +3,8 @@ services:
     build: .
     image: anime-server:dev
     container_name: anime-server
+    # 为当前分片完成和子进程回收保留时间, 超过 30 秒由服务端强制停止.
+    stop_grace_period: 40s
     ports:
       - "${PORT}:8080"
     volumes:

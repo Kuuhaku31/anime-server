@@ -34,6 +34,7 @@ impl Track {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Attachment {
     pub stream_index: i32,
+    // 附件流内部的相对编号, 用于 -dump_attachment:t, 不同于全局 stream_index.
     pub ordinal: usize,
     pub font_extension: Option<String>,
 }
@@ -77,6 +78,7 @@ struct ProbeStream {
     disposition: HashMap<String, i32>,
 }
 
+/// 按文件指纹复用探测成功或失败结果, 显式 Retry probe 才绕过旧结果.
 #[derive(Clone)]
 pub struct MetadataCache {
     entries: Arc<Mutex<HashMap<String, Result<MediaInfo, String>>>>,
@@ -119,7 +121,7 @@ fn normalize(probe: Probe) -> Result<MediaInfo> {
     ensure!(duration.is_finite() && duration > 0.0, "media duration must be finite and positive");
     let start_time = probe.format.start_time.as_deref().unwrap_or("0").parse::<f64>()?;
     ensure!(start_time.is_finite(), "invalid media start time");
-    // Matroska's duration is an end timestamp, including a positive source offset.
+    // Matroska 的 duration 是包含正起点偏移的结束时间, 必须减去偏移才得到实际播放时长.
     let duration = if probe.format.format_name.split(',').any(|name| name == "matroska" || name == "webm") {
         duration - start_time.max(0.0)
     } else { duration };
@@ -130,6 +132,7 @@ fn normalize(probe: Probe) -> Result<MediaInfo> {
         attachments: Vec::new(),
     };
     for stream in probe.streams {
+        // 封面附件可能伪装成视频流, 不参与默认视频轨选择.
         if stream.disposition.get("attached_pic") == Some(&1) { continue; }
         if stream.codec_type.as_deref() == Some("attachment") {
             info.attachments.push(Attachment {
@@ -160,6 +163,7 @@ fn normalize(probe: Probe) -> Result<MediaInfo> {
     Ok(info)
 }
 
+// 只推导允许的字体扩展名, 不把容器附件中的原始文件名用作输出路径.
 fn font_extension(name: &str, mime: Option<&str>) -> Option<String> {
     let extension = Path::new(name).extension().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
     if matches!(extension.as_str(), "ttf" | "otf" | "ttc" | "woff" | "woff2") {
