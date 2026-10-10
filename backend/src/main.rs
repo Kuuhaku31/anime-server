@@ -20,10 +20,7 @@ mod video;
 mod utils;
 mod constants;
 
-use config::{
-    AppConfig, DATABASE_PATH, DATA_DIR, DDP_ANI_CACHE_DIR, DDP_DANMAKU_CACHE_DIR,
-    CACHE_DIR,
-};
+use config::AppConfig;
 use video::{cache::CacheManager, sessions::SessionManager, metadata::MetadataCache, process::Processes};
 
 use tokio::time::{sleep, Duration};
@@ -44,7 +41,7 @@ pub struct AppState {
 #[tokio::main]
 async fn main() -> Result<()> {
 
-    info!("Anime Server v{} starting...", env!("CARGO_PKG_VERSION"));
+    println!("Anime Server v{} starting...", env!("CARGO_PKG_VERSION"));
 
     // 容器探针只检查已有 HTTP 服务, 不重新初始化数据库或争抢缓存独占锁.
     if std::env::args().any(|arg| arg == "--healthcheck") { return utils::http_check(); }
@@ -56,14 +53,14 @@ async fn main() -> Result<()> {
     let config = AppConfig::load(Path::new(&config_path))?;
 
     // 创建数据目录和缓存目录, 并检查 FFmpeg 等工具是否可用
-    std::fs::create_dir_all(DATA_DIR)?;
-    std::fs::create_dir_all(DDP_ANI_CACHE_DIR)?;
-    std::fs::create_dir_all(DDP_DANMAKU_CACHE_DIR)?;
+    std::fs::create_dir_all(constants::DATA_DIR)?;
+    std::fs::create_dir_all(constants::DDP_ANI_CACHE_DIR)?;
+    std::fs::create_dir_all(constants::DDP_DANMAKU_CACHE_DIR)?;
     utils::check_tools().await?;
 
     // 初始化数据库连接池, 并执行初始化 SQL 脚本, 创建必要的表和索引
     let database_options = SqliteConnectOptions::new()
-    .filename(DATABASE_PATH)
+    .filename(constants::DATABASE_PATH)
     .create_if_missing(true)
     .foreign_keys(true);
     let pool = SqlitePoolOptions::new()
@@ -76,7 +73,7 @@ async fn main() -> Result<()> {
 
     // 探测, 资源准备, 编码和解码校验共用进程预算, 防止不同模块各自突破全局上限.
     let processes = Processes::new(config.playback.max_processes, config.playback.max_total_ffmpeg_threads);
-    let cache = CacheManager::new(CACHE_DIR.into(), config.playback.clone(), processes.clone()).await?;
+    let cache = CacheManager::new(constants::CACHE_DIR.into(), config.playback.clone(), processes.clone()).await?;
     let playback = SessionManager::new(cache, config.playback.idle_timeout_seconds);
     let metadata = MetadataCache::new(processes);
     let state = AppState {

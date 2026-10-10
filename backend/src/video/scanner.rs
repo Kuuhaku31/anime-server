@@ -9,7 +9,7 @@ use walkdir::WalkDir;
 
 use crate::{
     AppState,
-    config::VIDEO_ROOT,
+    constants::VIDEO_ROOT,
     db::{models::ScannedFile, repository},
     constants::{EXTENSIONS, HASH_LIMIT},
 };

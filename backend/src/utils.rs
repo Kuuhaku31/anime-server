@@ -5,8 +5,8 @@
 use anyhow::{ensure, Result};
 use tokio::process::Command;
 
-use crate::config::FALLBACK_FONT;
 use crate::video::process::checked_output;
+use crate::constants::FALLBACK_FONT;
 
 
 // 确认 http 服务存活
@@ -21,8 +21,6 @@ pub fn http_check() -> Result<()> {
     ensure!(&status == b"HTTP/1.1 200", "HTTP health check failed");
     Ok(())
 }
-
-
 
 /// 启动时验证固定输出的全部依赖, 缺少编码器, 滤镜或字体就拒绝启动, 不降级输出.
 pub async fn check_tools() -> Result<()> {

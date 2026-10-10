@@ -146,6 +146,7 @@ Compose 为正常关闭预留 40 秒, 覆盖 30 秒分片停止期限和清理�
 
 | 文档                                       | 内容                                             |
 | ------------------------------------------ | ------------------------------------------------ |
-| [development.md](documents/development.md) | 开发, 调试, 编译, 部署, 播放接口, 验证和故障排查 |
+| [development.md](documents/development.md) | 开发, 调试, 编译, 部署, 验证和故障排查 |
+| [api.md](documents/api.md)                 | 全部 HTTP API, 请求响应示例和错误码 |
 | [database.md](documents/database.md)       | 数据库结构, 文件标识和进度持久化                 |
 | [playback-cache.md](plan/playback-cache.md) | 活动缓存, 顺序续接和线程分配约定                 |

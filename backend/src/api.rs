@@ -1,4 +1,7 @@
 //! 定义业务 API 路由和处理函数.
+//! 提供文件查询、观看进度、媒体扫描和播放 API 路由.
+
+use std::path::PathBuf;
 
 use axum::{
     extract::{Json, Path, State},
@@ -8,85 +11,69 @@ use axum::{
     Router,
 };
 use serde_json::json;
-use std::path::PathBuf;
 
-use crate::db::models::ProgressInput;
-use crate::{config::VIDEO_ROOT, db::repository, AppState};
+use crate::{
+    constants::VIDEO_ROOT,
+    db::{models::ProgressInput, repository},
+    video::scanner,
+    AppState,
+};
 
 mod playback;
 
+/// 构建业务 API 路由.
 pub fn router(state: AppState) -> Router {
     Router::new()
-        .route("/api/files", get(list_files))
-        .route("/api/files/{pre16mib_md5}", get(get_file))
-        .route(
-            "/api/files/{pre16mib_md5}/identify",
-            post(identify_file),
-        )
-        .route(
-            "/api/files/{pre16mib_md5}/progress",
-            get(get_progress).put(save_progress),
-        )
-        .route("/api/config", get(get_config))
-        .route("/api/scan", post(scan))
-        .merge(playback::router())
-        .with_state(state)
+    .route("/api/files", get(list_files))
+    .route("/api/files/{pre16mib_md5}", get(get_file))
+    .route("/api/files/{pre16mib_md5}/identify", post(identify_file))
+    .route("/api/files/{pre16mib_md5}/progress", get(get_progress).put(save_progress),)
+    .route("/api/config", get(get_config))
+    .route("/api/scan", post(scan))
+    .merge(playback::router())
+    .with_state(state)
 }
 
+/// 获取 Web 前端配置.
 async fn get_config(State(state): State<AppState>) -> impl IntoResponse {
     (StatusCode::OK, Json(state.config.web.clone()))
 }
 
+/// 获取全部视频记录.
 async fn list_files(State(state): State<AppState>) -> impl IntoResponse {
     match repository::list_videos(&state.db).await {
         Ok(items) => (StatusCode::OK, Json(items)).into_response(),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": error.to_string()})),
-        )
-            .into_response(),
+        Err(error) => internal_error(error),
     }
 }
 
+/// 获取视频记录及其所有存储路径.
 async fn get_file(
     State(state): State<AppState>,
     Path(pre16mib_md5): Path<String>,
 ) -> impl IntoResponse {
     let video = match repository::get_video(&state.db, &pre16mib_md5).await {
         Ok(Some(video)) => video,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "not found"})),
-            )
-                .into_response();
-        }
-        Err(error) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": error.to_string()})),
-            )
-                .into_response();
-        }
+        Ok(None) => return not_found(),
+        Err(error) => return internal_error(error),
     };
+
     let paths = match repository::get_paths(&state.db, &pre16mib_md5).await {
         Ok(paths) => paths,
-        Err(error) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": error.to_string()})),
-            )
-                .into_response();
-        }
+        Err(error) => return internal_error(error),
     };
+
     (
         StatusCode::OK,
-        Json(json!({"video": video, "paths": paths})),
+        Json(json!({
+            "video": video,
+            "paths": paths,
+        })),
     )
         .into_response()
 }
 
-// 当前识别仅写入演示剧集 ID, 不调用真实 DandanPlay 服务.
+/// 当前识别仅写入演示剧集 ID, 不调用真实 DandanPlay 服务.
 async fn identify_file(
     State(state): State<AppState>,
     Path(pre16mib_md5): Path<String>,
@@ -94,89 +81,109 @@ async fn identify_file(
     match repository::set_mock_identification(&state.db, &pre16mib_md5).await {
         Ok(()) => (
             StatusCode::OK,
-            Json(json!({"ok": true, "mode": "mock", "ddp_epi_id": 1})),
+            Json(json!({
+                "ok": true,
+                "mode": "mock",
+                "ddp_epi_id": 1,
+            })),
         )
             .into_response(),
-        Err(sqlx::Error::RowNotFound) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "not found"})),
-        )
-            .into_response(),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": error.to_string()})),
-        )
-            .into_response(),
+        Err(sqlx::Error::RowNotFound) => not_found(),
+        Err(error) => internal_error(error),
     }
 }
 
+/// 获取视频观看进度.
 async fn get_progress(
     State(state): State<AppState>,
     Path(pre16mib_md5): Path<String>,
 ) -> impl IntoResponse {
     match repository::get_progress(&state.db, &pre16mib_md5).await {
-        Ok(Some(value)) => (StatusCode::OK, Json(value)).into_response(),
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "not found"})),
-        )
-            .into_response(),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": error.to_string()})),
-        )
-            .into_response(),
+        Ok(Some(progress)) => (StatusCode::OK, Json(progress)).into_response(),
+        Ok(None) => not_found(),
+        Err(error) => internal_error(error),
     }
 }
 
+/// 保存视频观看进度.
 async fn save_progress(
     State(state): State<AppState>,
     Path(pre16mib_md5): Path<String>,
     Json(input): Json<ProgressInput>,
 ) -> impl IntoResponse {
     if !input.position.is_finite() || input.position < 0.0 {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "position must be finite and non-negative"}))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "position must be finite and non-negative"
+            })),
+        )
+            .into_response();
     }
+
     match repository::save_progress(&state.db, &pre16mib_md5, input.position).await {
         Ok(()) => (StatusCode::NO_CONTENT, "").into_response(),
-        Err(sqlx::Error::RowNotFound) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "not found"})),
-        )
-            .into_response(),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": error.to_string()})),
-        )
-            .into_response(),
+        Err(sqlx::Error::RowNotFound) => not_found(),
+        Err(error) => internal_error(error),
     }
 }
 
+/// 执行一次媒体目录扫描.
 async fn scan(State(state): State<AppState>) -> impl IntoResponse {
-    match crate::video::scanner::scan_once(&state).await {
-        Ok(count) => (StatusCode::OK, Json(json!({"ok": true, "scanned": count}))).into_response(),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": error.to_string()})),
+    match scanner::scan_once(&state).await {
+        Ok(count) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "scanned": count,
+            })),
         )
             .into_response(),
+        Err(error) => internal_error(error),
     }
 }
 
-/// 根据数据库路径尝试可用副本, 规范化后仍须位于媒体根目录, 包括符号链接目标.
-pub async fn media_path(state: &AppState, id: &str) -> anyhow::Result<PathBuf> {
-    anyhow::ensure!(id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()), "invalid file ID");
+/// 根据数据库路径查找可用媒体文件副本.
+///
+/// 规范化路径并检查符号链接目标, 确保最终文件仍位于媒体根目录内.
+async fn media_path(state: &AppState, id: &str) -> anyhow::Result<PathBuf> {
+
+    anyhow::ensure!(
+        id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "invalid file ID"
+    );
+
     let root = tokio::fs::canonicalize(VIDEO_ROOT).await?;
     let paths = repository::get_paths(&state.db, id).await?;
+
     for entry in paths {
         let candidate = root.join(entry.relative_path());
+
         let resolved = match tokio::fs::canonicalize(&candidate).await {
             Ok(path) => path,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error.into()),
         };
-        anyhow::ensure!(resolved.starts_with(&root), "media path resolves outside media directory");
-        if tokio::fs::metadata(&resolved).await?.is_file() { return Ok(resolved); }
+
+        anyhow::ensure!(
+            resolved.starts_with(&root),
+            "media path resolves outside media directory"
+        );
+
+        if tokio::fs::metadata(&resolved).await?.is_file() {
+            return Ok(resolved);
+        }
     }
-    anyhow::bail!("no available media path for file");
+
+    anyhow::bail!("no available media path for file")
+}
+
+/// 构造 404 响应.
+fn not_found() -> axum::response::Response {
+    (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response()
+}
+
+/// 构造 500 响应.
+fn internal_error(error: impl std::fmt::Display) -> axum::response::Response {
+    (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": error.to_string()}))).into_response()
 }

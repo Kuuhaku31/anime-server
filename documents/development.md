@@ -111,15 +111,15 @@ docker compose port anime-server 8080
 }
 ```
 
-| 播放配置                  | 说明                                                                       |
-| ------------------------- | -------------------------------------------------------------------------- |
-| `cache_max_bytes`         | 缓存容量字节数, 正整数 `u64`, 默认 `10737418240`, 即 10 GiB                 |
-| `max_processes`           | 全部媒体进程上限, 范围 `2..16`, 默认 2. 编码器最多占用 `max_processes - 1`, 为解码校验保留名额 |
-| `ffmpeg_threads`          | 编码器启动需要的基础线程数, 默认 2, 必须不大于单变体上限                   |
-| `max_variant_threads`    | 单个编码器线程上限, 默认 8, 最大 32                                       |
-| `max_total_ffmpeg_threads` | 全部 H.264 编码器的加权线程预算, 默认 16, 范围为基础线程数到 256           |
-| `idle_timeout_seconds`    | 无保活请求后的会话过期时间, 范围 `20..3600` 秒                             |
-| `startup_timeout_seconds` | 字幕准备及首段生成各阶段的超时, 范围 `10..600` 秒                          |
+| 播放配置                   | 说明                                                                                           |
+| -------------------------- | ---------------------------------------------------------------------------------------------- |
+| `cache_max_bytes`          | 缓存容量字节数, 正整数 `u64`, 默认 `10737418240`, 即 10 GiB                                    |
+| `max_processes`            | 全部媒体进程上限, 范围 `2..16`, 默认 2. 编码器最多占用 `max_processes - 1`, 为解码校验保留名额 |
+| `ffmpeg_threads`           | 编码器启动需要的基础线程数, 默认 2, 必须不大于单变体上限                                       |
+| `max_variant_threads`      | 单个编码器线程上限, 默认 8, 最大 32                                                            |
+| `max_total_ffmpeg_threads` | 全部 H.264 编码器的加权线程预算, 默认 16, 范围为基础线程数到 256                               |
+| `idle_timeout_seconds`     | 无保活请求后的会话过期时间, 范围 `20..3600` 秒                                                 |
+| `startup_timeout_seconds`  | 字幕准备及首段生成各阶段的超时, 范围 `10..600` 秒                                              |
 
 缺少 `playback` 时使用上述默认值, 未知的播放配置字段会报错.
 修改应用配置后重启容器. DandanPlay 当前未实现真实 API 调用.
@@ -207,15 +207,15 @@ docker compose down
 
 所有输入都使用同一种输出, 包括本来可以在浏览器直接播放的 MP4:
 
-| 项目         | 固定规则                                                 |
-| ------------ | -------------------------------------------------------- |
-| 视频         | libx264, High, 8-bit `yuv420p`, CRF 23, veryfast         |
+| 项目         | 固定规则                                                                               |
+| ------------ | -------------------------------------------------------------------------------------- |
+| 视频         | libx264, High, 8-bit `yuv420p`, CRF 23, veryfast                                       |
 | 分辨率与帧率 | 保持比例, 不放大小视频, 最高 1920x1080; 按源声明帧率与 60 的较小值进行有理数恒帧率采样 |
-| HDR          | 转为 BT.709 SDR                                          |
-| 音频         | 选定一轨, AAC-LC, 双声道, 48 kHz, 192 kbps; 可选择无音轨 |
-| 字幕         | 选定一轨服务端烧录, 或关闭字幕                           |
-| 传输         | fMP4 HLS, 目标分段长度 4 秒, event playlist              |
-| 浏览器       | Safari 原生 HLS, 其他支持 MSE 的浏览器使用 HLS.js        |
+| HDR          | 转为 BT.709 SDR                                                                        |
+| 音频         | 选定一轨, AAC-LC, 双声道, 48 kHz, 192 kbps; 可选择无音轨                               |
+| 字幕         | 选定一轨服务端烧录, 或关闭字幕                                                         |
+| 传输         | fMP4 HLS, 目标分段长度 4 秒, event playlist                                            |
+| 浏览器       | Safari 原生 HLS, 其他支持 MSE 的浏览器使用 HLS.js                                      |
 
 传输适配在加载前选定. Chromium 即使声明可能支持原生 HLS, 也优先使用 HLS.js,
 避免将仍在生成的 fMP4 event playlist 交给不完整的原生实现.
@@ -250,105 +250,9 @@ VFR 输入按同一恒帧率规则采样, 必要的重复或丢帧来自固定�
 不会请求另一种格式, 也不会自动重建播放会话.
 用户点击 Retry 才重新请求同样的输出. 普通网络分片重试不改变格式.
 
-## 播放 API
+## HTTP API
 
-默认播放只提交文件 ID, 不需要先读取轨道或历史进度:
-
-```bash
-curl -X POST http://localhost:56080/api/files/FILE_ID/playback
-```
-
-服务端查询文件和 `watch_pos`, 选择第一条视频轨, 默认音轨或第一条音轨,
-以及默认或强制字幕. 没有对应轨道时关闭音轨或字幕.
-距结尾不足 2 秒的历史进度从 0 开始. 响应同时返回媒体信息及实际选择.
-
-换轨可以使用响应中的真实流索引, 并提交当前绝对播放位置:
-
-```bash
-curl -X POST http://localhost:56080/api/files/FILE_ID/playback \
-  -H 'Content-Type: application/json' \
-  -d '{"audio_stream_index":1,"subtitle_stream_index":3,"position":125.5}'
-```
-
-响应:
-
-```json
-{
-  "session_id": "SESSION_ID",
-  "url": "/playback/SESSION_ID/index.m3u8?revision=2",
-  "mime_type": "application/vnd.apple.mpegurl",
-  "start_time": 0.0,
-  "duration": 1400.0,
-  "position": 125.5,
-  "complete": false,
-  "generating": true,
-  "stopping": false,
-  "ready": false,
-  "buffered_until": 0.0,
-  "encoding_threads": 8,
-  "error": null,
-  "media": {
-    "duration": 1400.0,
-    "video_tracks": [],
-    "audio_tracks": [],
-    "subtitle_tracks": []
-  },
-  "selection": {
-    "audio": 1,
-    "subtitle": 3
-  }
-}
-```
-
-`audio_stream_index: null` 表示无音轨, `subtitle_stream_index: null` 表示关闭字幕.
-省略轨道字段则使用服务端默认选择, 和显式 `null` 不同.
-客户端不能指定视频索引, 缓存键, 路径或编码配置版本, 未知请求字段会被拒绝.
-`position` 必须有限, 非负且小于视频时长; 省略或 `null` 表示读取数据库进度.
-位置只影响会话目标和下次启动时的线程申请, 不进入播放配置或缓存键.
-示例省略了轨道数组内容. `status` 返回相同的状态字段, 不重复返回 `media` 和 `selection`.
-
-等待期间拖动进度条只更新当前会话:
-
-```bash
-curl -X POST http://localhost:56080/api/playback/SESSION_ID/target \
-  -H 'Content-Type: application/json' -d '{"position":300.5}'
-```
-
-| 方法          | 路径                                | 说明                                   |
-| ------------- | ----------------------------------- | -------------------------------------- |
-| `GET`         | `/health`                           | 服务存活                               |
-| `GET`         | `/api/config`                       | Web 配置                               |
-| `GET`         | `/api/files`                        | 文件列表                               |
-| `GET`         | `/api/files/{id}`                   | 文件详情及路径, 不返回原始媒体播放地址 |
-| `POST`        | `/api/files/{id}/identify`          | mock 识别                              |
-| `GET` / `PUT` | `/api/files/{id}/progress`          | 获取或保存原始视频进度                 |
-| `POST`        | `/api/scan`                         | 扫描视频目录                           |
-| `GET`         | `/api/files/{id}/streams`           | 进程内缓存的轨道信息                   |
-| `POST`        | `/api/files/{id}/probe`             | 强制重新探测                           |
-| `POST`        | `/api/files/{id}/playback`          | 服务端构造播放配置并创建租约           |
-| `GET`         | `/api/playback/{session}/status`    | 获取状态, 同时保活                     |
-| `POST`        | `/api/playback/{session}/target`    | 更新目标位置, 返回状态, 不创建新任务   |
-| `POST`        | `/api/playback/{session}/heartbeat` | 显式保活                               |
-| `DELETE`      | `/api/playback/{session}`           | 立即释放租约, 最后一个触发后台停止, 可重复调用 |
-| `GET`         | `/playback/{session}/{asset}`       | 只读取 manifest, init 和编号媒体分片   |
-
-缓存只有 `complete: true` 和 `false` 两种状态. `generating`, `stopping`,
-`encoding_threads` 和 `error` 独立描述任务活动, 不再返回状态枚举.
-`generating` 也包括排队, 准备和最终清理, 实际编码器未运行时 `encoding_threads` 为 0.
-首次激活先登记唯一活动元素再校验磁盘, 创建响应等待加载结果, 不把完整缓存误报为新空缓存.
-尚未返回 ID 的创建预留使用 `max(idle_timeout_seconds, 120)` 秒宽限,
-防止等待清理时提前过期, 也避免被中断的创建请求永久占用名额.
-
-前端准备阶段轮询状态,
-播放阶段每 10 秒查询状态保活; 媒体请求也延长会话有效期.
-`buffered_until` 是从时间 0 开始已经生成的范围终点, 不是浏览器本地缓冲长度.
-`ready: true` 只表示至少一个分片已通过验证. 目标必须满足 `target < buffered_until`;
-相等仍需等待. 已发布前缀可以在后续生成失败后继续播放, 未覆盖目标则明确报错,
-需要用户 Retry, 不自动启动新编码器.
-最后一个租约释放或过期后, 停止任务并从活动集合移除, 磁盘缓存保留到 LRU 淘汰.
-
-非法请求返回 `400`, 无法探测的文件返回 `422`, 不存在或过期的会话返回 `404`.
-异步字幕准备或编码失败由状态响应的 `error` 返回.
+全部路由, 请求与响应示例, 会话生命周期和错误码见 [HTTP API 文档](api.md).
 
 ## 数据与资源管理
 
@@ -489,12 +393,12 @@ python3 backend/tests/playback_smoke.py \
 | Docker socket 权限不足 | 使用具备 Docker 权限的用户; 修改用户组后重新登录, 或按宿主机策略使用 sudo                   |
 | 视频列表为空           | 检查 `/media` 挂载和读取权限, 然后点击 Scan videos                                          |
 | 长时间等待名额         | 检查进程名额和全局线程预算; 默认仅一个编码器, 需要两个时将 `max_processes` 设为 3           |
-| 恢复位置等待很久       | 新缓存从 0 连续生成, 等待生成范围覆盖目标; 可以拖回已生成位置                                |
-| 首段或续接启动很慢     | 检查 CPU, 字幕和字体; 首次配置从 0 编码, 续接仍需读取音频及字幕历史                          |
+| 恢复位置等待很久       | 新缓存从 0 连续生成, 等待生成范围覆盖目标; 可以拖回已生成位置                               |
+| 首段或续接启动很慢     | 检查 CPU, 字幕和字体; 首次配置从 0 编码, 续接仍需读取音频及字幕历史                         |
 | 字幕没有字形           | 检查内嵌字体和镜像的 Noto CJK 字体; 查看播放器返回的 FFmpeg 错误                            |
 | 探测失败被记住         | 点击 Retry probe, 或调用 `/probe`; 错误不会跨进程持久保存                                   |
 | 会话不存在或过期       | 页面后台休眠可能停止保活; 手动点击 Play 或 Retry 创建同格式的新会话                         |
 | 解码或 HLS 解析失败    | 查看播放器错误及容器日志. 不会自动请求其他编码或封装                                        |
 | 缓存目录被占用         | 检查是否有另一实例挂载相同 `CACHE_DIR`, 为测试实例使用独立目录                              |
-| 缓存超过配置大小       | 活动目录及媒体打开引用受保护, 等待最后租约释放和后台停止; 容量上限不是硬配额                  |
-| 磁盘已满               | 停止服务后清理 `/cache` 中指定的变体或增加空间, 不要删除数据库                               |
+| 缓存超过配置大小       | 活动目录及媒体打开引用受保护, 等待最后租约释放和后台停止; 容量上限不是硬配额                |
+| 磁盘已满               | 停止服务后清理 `/cache` 中指定的变体或增加空间, 不要删除数据库                              |
