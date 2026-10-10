@@ -1,5 +1,6 @@
-//! 启动 Web 服务并组装应用依赖.
+
 // backend/src/main.rs
+//! 启动 Web 服务并组装应用依赖.
 
 use std::{net::SocketAddr, path::Path, sync::Arc};
 
@@ -9,21 +10,24 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
     SqlitePool,
 };
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, signal::unix::SignalKind};
 use tower_http::{services::ServeDir, trace::TraceLayer};
-use tracing::info;
 
 mod api;
 mod config;
 mod db;
-mod tasks;
 mod video;
+mod utils;
+mod constants;
 
 use config::{
     AppConfig, DATABASE_PATH, DATA_DIR, DDP_ANI_CACHE_DIR, DDP_DANMAKU_CACHE_DIR,
     CACHE_DIR,
 };
 use video::{cache::CacheManager, sessions::SessionManager, metadata::MetadataCache, process::Processes};
+
+use tokio::time::{sleep, Duration};
+use tracing::{info, warn};
 
 
 #[derive(Clone)]
@@ -40,37 +44,35 @@ pub struct AppState {
 #[tokio::main]
 async fn main() -> Result<()> {
 
-    println!("Anime Server v{} starting...", env!("CARGO_PKG_VERSION"));
+    info!("Anime Server v{} starting...", env!("CARGO_PKG_VERSION"));
 
     // 容器探针只检查已有 HTTP 服务, 不重新初始化数据库或争抢缓存独占锁.
-    if std::env::args().any(|arg| arg == "--healthcheck") {
-        return video::health::http_check();
-    }
-    tracing_subscriber::fmt()
-        .with_env_filter("anime_server=info,tower_http=info")
-        .init();
+    if std::env::args().any(|arg| arg == "--healthcheck") { return utils::http_check(); }
+    // 初始化 Rust 程序的日志系统, 设置日志过滤规则, 并将日志输出到终端
+    tracing_subscriber::fmt().with_env_filter("anime_server=info,tower_http=info").init();
 
-    let config_path =
-        std::env::var("ANIME_SERVER_CONFIG").unwrap_or_else(|_| "/config/config.json".to_string());
+    // 加载配置
+    let config_path = std::env::var("ANIME_SERVER_CONFIG").unwrap_or_else(|_| "/config/config.json".to_string());
     let config = AppConfig::load(Path::new(&config_path))?;
 
+    // 创建数据目录和缓存目录, 并检查 FFmpeg 等工具是否可用
     std::fs::create_dir_all(DATA_DIR)?;
     std::fs::create_dir_all(DDP_ANI_CACHE_DIR)?;
     std::fs::create_dir_all(DDP_DANMAKU_CACHE_DIR)?;
-    video::health::check_tools().await?;
+    utils::check_tools().await?;
 
+    // 初始化数据库连接池, 并执行初始化 SQL 脚本, 创建必要的表和索引
     let database_options = SqliteConnectOptions::new()
-        .filename(DATABASE_PATH)
-        .create_if_missing(true)
-        .foreign_keys(true);
+    .filename(DATABASE_PATH)
+    .create_if_missing(true)
+    .foreign_keys(true);
     let pool = SqlitePoolOptions::new()
-        .max_connections(5)
-        .connect_with(database_options)
-        .await?;
-
+    .max_connections(5)
+    .connect_with(database_options)
+    .await?;
     sqlx::raw_sql(include_str!("../sql/init.sql"))
-        .execute(&pool)
-        .await?;
+    .execute(&pool)
+    .await?;
 
     // 探测, 资源准备, 编码和解码校验共用进程预算, 防止不同模块各自突破全局上限.
     let processes = Processes::new(config.playback.max_processes, config.playback.max_total_ffmpeg_threads);
@@ -84,31 +86,48 @@ async fn main() -> Result<()> {
         scan_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
 
-    tasks::scanner::spawn(state.clone());
-    state.playback.spawn_expiration();
+    // 启动后台扫描任务, 定期扫描视频目录并更新数据库和元数据缓存.
+    let s = state.clone();
+    tokio::spawn(async move {
+        loop {
+            match crate::video::scanner::scan_once(&s).await {
+                Ok(count) => info!("video scan completed: {} files", count),
+                Err(e) => warn!("video scan failed: {}", e),
+            }
+            sleep(Duration::from_secs(s.config.scan_interval_seconds)).await;
+        }
+    });
+    state.playback.spawn_expiration(); // 启动一个后台异步任务, 定期回收失去联系的播放会话并维护磁盘缓存
 
     // API 和前端静态文件由同一端口提供, 浏览器通过同源相对 URL 访问服务.
     let app = api::router(state)
-        .route("/health", get(|| async { Json(serde_json::json!({"status": "ok"})) }))
-        .fallback_service(ServeDir::new("/app/web").append_index_html_on_directories(true))
-        .layer(TraceLayer::new_for_http());
-
+    .route("/health", get(|| async { Json(serde_json::json!({"status": "ok"})) }))
+    .fallback_service(ServeDir::new("/app/web").append_index_html_on_directories(true))
+    .layer(TraceLayer::new_for_http());
     let addr: SocketAddr = "0.0.0.0:8080".parse()?;
     let listener = TcpListener::bind(addr).await?;
+
     info!("Anime Server listening on http://{}", addr);
+
+    // 启动 HTTP 服务, 并在收到 SIGTERM 或 Ctrl+C 信号时优雅关闭, 等待子进程退出.
     axum::serve(listener, app).with_graceful_shutdown(async move {
-        let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("cannot install SIGTERM handler");
+
+        // 安装 SIGTERM 信号处理器
+        let mut terminate = tokio::signal::unix::signal(SignalKind::terminate()).expect("cannot install SIGTERM handler");
+
+        // 等待 SIGTERM 或 Ctrl+C 信号
         tokio::select! {
             result = tokio::signal::ctrl_c() => {
                 if let Err(error) = result { tracing::error!("signal handler failed: {error}"); }
             },
             _ = terminate.recv() => {},
         }
+
         // 等待分片边界落盘并回收子进程, 不依赖容器强制终止来结束转码.
         if let Err(error) = playback.shutdown().await {
             tracing::error!("playback shutdown failed: {error:#}");
         }
     }).await?;
+
     Ok(())
 }

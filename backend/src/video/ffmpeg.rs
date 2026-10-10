@@ -419,6 +419,11 @@ pub async fn recover(directory: &Path, processes: &Processes, cancel: &mut watch
     Ok(media)
 }
 
+
+// ========================================================================== //
+// ========================================================================== //
+// ========================================================================== //
+
 #[cfg(test)]
 pub fn fixture() -> (MediaInfo, PlaybackRequest) {
     let info = serde_json::from_value(serde_json::json!({

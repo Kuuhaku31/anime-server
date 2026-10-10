@@ -27,12 +27,15 @@ pub fn check_cancel(cancel: &watch::Receiver<bool>) -> Result<()> {
     Ok(())
 }
 
-/// 进程总数, 并行编码数和编码线程预算分开限流, 不能用线程许可替代进程名额.
+
+/// 媒体任务的共享资源限流器, 用来控制 FFmpeg 和 ffprobe 的并发量,
+/// 防止多个播放配置同时生成缓存时耗尽资源.
+/// 它不是操作系统进程列表, 也不直接管理所有子进程句柄.
 #[derive(Clone)]
 pub struct Processes {
-    pub slots: Arc<Semaphore>,
-    pub encoders: Arc<Semaphore>,
-    threads: Arc<Semaphore>,
+    pub slots: Arc<Semaphore>, // 媒体子进程总数
+    pub encoders: Arc<Semaphore>, // 并行编码任务数, 不能用线程许可替代进程名额
+    threads: Arc<Semaphore>, // 编码线程预算, 不能用进程名额替代线程许可
 }
 
 impl Processes {
