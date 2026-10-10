@@ -2,7 +2,7 @@
 // backend/src/video/scanner.rs
 //! 扫描媒体目录并同步文件索引.
 
-use std::{fs::File, io::Read, path::Path};
+use std::{collections::HashMap, fs::File, io::Read, path::{Path, PathBuf}};
 use anyhow::{Context, Result};
 use md5::{Digest, Md5};
 use walkdir::WalkDir;
@@ -10,7 +10,7 @@ use walkdir::WalkDir;
 use crate::{
     AppState,
     constants::VIDEO_ROOT,
-    db::{models::ScannedFile, repository},
+    db::{models::{FilePath, ScannedFile}, repository},
     constants::{EXTENSIONS, HASH_LIMIT},
 };
 
@@ -21,16 +21,13 @@ pub async fn scan_once(state: &AppState) -> Result<u64> {
     // 锁的有效期取决于 _scan 的作用域
     let _scan = state.scan_lock.lock().await; // 锁住扫描任务, 防止同时进行多个扫描任务
 
-    // 在阻塞线程池收集文件
-    // 遍历和文件哈希使用同步 I/O, 放到阻塞线程池以免拖住 HTTP 请求和播放心跳
-    //
-    // TODO: 先获取数据库所有文件地址, 然后当前目录所有文件列表比对,
-    // 扫描插入新文件, 删除数据库中不存在实际文件的记录,
-    // 同时存在于数据库和目录的文件默认没有发生变化,
-    // 避免每次扫描都重新计算所有文件的哈希
-    let files = tokio::task::spawn_blocking(collect_files).await??;
-    repository::sync_scanned_files(&state.db, &files).await?;
-    Ok(files.len() as u64)
+    // 锁覆盖路径读取, 目录比对和提交, 防止两个扫描使用同一份过期快照.
+    let known = repository::list_paths(&state.db).await?;
+    let root = PathBuf::from(VIDEO_ROOT);
+    // 同步目录遍历和新文件哈希放到阻塞线程池, 完整收集失败时不提交任何变更.
+    let changes = tokio::task::spawn_blocking(move || collect_files(&root, known)).await??;
+    repository::sync_scanned_files(&state.db, &changes.added, &changes.removed).await?;
+    Ok(changes.count)
 }
 
 
@@ -38,24 +35,35 @@ pub async fn scan_once(state: &AppState) -> Result<u64> {
 // ========================================================================== //
 // ========================================================================== //
 
-/// 遍历媒体目录, 筛选视频并读取文件前缀计算 MD5
-fn collect_files() -> Result<Vec<ScannedFile>> {
+// count 仍是所有现存视频路径数, 而不是本轮新增数量或去重后的文件数量.
+struct ScanChanges {
+    added: Vec<ScannedFile>,
+    removed: Vec<FilePath>,
+    count: u64,
+}
 
-    let root = Path::new(VIDEO_ROOT);
+/// 遍历目录并消耗已知路径表, 只对新地址读取前缀 MD5, 剩余地址即失效路径.
+fn collect_files(root: &Path, known: Vec<FilePath>) -> Result<ScanChanges> {
     if !root.exists() { anyhow::bail!("media directory is missing"); }
 
-    let mut files = Vec::new();
+    let mut known: HashMap<_, _> = known.into_iter()
+        .map(|file| (root.join(file.relative_path()), file)).collect();
+    let mut added = Vec::new();
+    let mut count = 0;
     for entry in WalkDir::new(root) {
         let entry = entry.context("failed to read media directory entry")?;
         let absolute_path = entry.path();
         if !entry.file_type().is_file() || !is_video(absolute_path) {
             continue;
         }
-        let f = scan_file(root, absolute_path)?;
-        files.push(f);
+        count += 1;
+        // 地址相同即认为未变, 即使内容或大小改变也不重算哈希, 符合增量扫描契约.
+        if known.remove(absolute_path).is_none() {
+            added.push(scan_file(root, absolute_path)?);
+        }
     }
 
-    Ok(files)
+    Ok(ScanChanges { added, removed: known.into_values().collect(), count })
 }
 
 
@@ -121,4 +129,95 @@ fn is_video(path: &Path) -> bool {
         .any(|extension| value.eq_ignore_ascii_case(extension))
     })
     .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    #[tokio::test]
+    async fn incremental_scans_reuse_paths_and_preserve_progress_after_removal() {
+        // 隔离媒体和内存数据库, 验证新增, 原地修改, 删除及改名后的业务记录复用.
+        let root = std::env::temp_dir().join(format!("anime-scan-{}", crate::video::cache::random_id().unwrap()));
+        std::fs::create_dir_all(root.join("series")).unwrap();
+        std::fs::write(root.join("first.mkv"), b"original").unwrap();
+        std::fs::write(root.join("series/copy.MKV"), b"original").unwrap();
+        std::fs::write(root.join("ignored.txt"), b"not video").unwrap();
+        let pool = SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        sqlx::raw_sql(include_str!("../../sql/init.sql")).execute(&pool).await.unwrap();
+
+        let first = collect_files(&root, repository::list_paths(&pool).await.unwrap()).unwrap();
+        assert_eq!(first.count, 2);
+        assert_eq!(first.added.len(), 2);
+        let id = first.added[0].pre16mib_md5.clone();
+        repository::sync_scanned_files(&pool, &first.added, &first.removed).await.unwrap();
+        repository::save_progress(&pool, &id, 12.5).await.unwrap();
+        repository::set_mock_identification(&pool, &id).await.unwrap();
+        let rowid: i64 = sqlx::query_scalar("SELECT rowid FROM file_path WHERE path = ''")
+            .fetch_one(&pool).await.unwrap();
+
+        // 已知路径即使内容和大小变化仍跳过哈希, 数据库路径也不删除重插.
+        std::fs::write(root.join("first.mkv"), b"changed content with a different size").unwrap();
+        let unchanged = collect_files(&root, repository::list_paths(&pool).await.unwrap()).unwrap();
+        assert_eq!(unchanged.count, 2);
+        assert!(unchanged.added.is_empty());
+        assert!(unchanged.removed.is_empty());
+        repository::sync_scanned_files(&pool, &unchanged.added, &unchanged.removed).await.unwrap();
+        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT rowid FROM file_path WHERE path = ''")
+            .fetch_one(&pool).await.unwrap(), rowid);
+        assert_eq!(repository::get_video(&pool, &id).await.unwrap().unwrap().size, 8);
+
+        std::fs::remove_file(root.join("first.mkv")).unwrap();
+        std::fs::rename(root.join("series/copy.MKV"), root.join("renamed.mp4")).unwrap();
+        std::fs::write(root.join("new.mkv"), b"new video").unwrap();
+        let moved = collect_files(&root, repository::list_paths(&pool).await.unwrap()).unwrap();
+        assert_eq!(moved.count, 2);
+        assert_eq!(moved.added.len(), 2);
+        assert_eq!(moved.removed.len(), 2);
+        repository::sync_scanned_files(&pool, &moved.added, &moved.removed).await.unwrap();
+        let video = repository::get_video(&pool, &id).await.unwrap().unwrap();
+        assert_eq!(video.name, "renamed.mp4");
+        assert_eq!(video.watch_pos, Some(12.5));
+        assert_eq!(video.ddp_epi_id, Some(1));
+
+        std::fs::remove_file(root.join("renamed.mp4")).unwrap();
+        let removed = collect_files(&root, repository::list_paths(&pool).await.unwrap()).unwrap();
+        assert_eq!(removed.count, 1);
+        assert!(removed.added.is_empty());
+        repository::sync_scanned_files(&pool, &removed.added, &removed.removed).await.unwrap();
+        assert!(repository::get_paths(&pool, &id).await.unwrap().is_empty());
+        assert_eq!(repository::get_progress(&pool, &id).await.unwrap().unwrap().watch_pos, Some(12.5));
+
+        // 最后一个副本消失后恢复同内容文件, 仍复用原观看进度和识别信息.
+        std::fs::write(root.join("restored.mkv"), b"original").unwrap();
+        let restored = collect_files(&root, repository::list_paths(&pool).await.unwrap()).unwrap();
+        repository::sync_scanned_files(&pool, &restored.added, &restored.removed).await.unwrap();
+        assert_eq!(repository::get_video(&pool, &id).await.unwrap().unwrap().watch_pos, Some(12.5));
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(collect_files(&root, repository::list_paths(&pool).await.unwrap()).is_err());
+        assert_eq!(repository::list_paths(&pool).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn failed_incremental_transaction_does_not_delete_existing_paths() {
+        // 故意重复插入同一地址触发约束错误, 此前的删除和新文件插入必须一起回滚.
+        let pool = SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        sqlx::raw_sql(include_str!("../../sql/init.sql")).execute(&pool).await.unwrap();
+        let existing = ScannedFile {
+            pre16mib_md5: "a".repeat(32), size: 1, path: String::new(),
+            name_no_ext: "old".to_string(), extension: "mkv".to_string(),
+        };
+        repository::sync_scanned_files(&pool, &[existing], &[]).await.unwrap();
+        let removed = repository::list_paths(&pool).await.unwrap();
+        let added = (0..2).map(|_| ScannedFile {
+            pre16mib_md5: "b".repeat(32), size: 2, path: String::new(),
+            name_no_ext: "new".to_string(), extension: "mkv".to_string(),
+        }).collect::<Vec<_>>();
+        assert!(repository::sync_scanned_files(&pool, &added, &removed).await.is_err());
+        let paths = repository::list_paths(&pool).await.unwrap();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].name_no_ext, "old");
+        assert!(repository::get_progress(&pool, &"b".repeat(32)).await.unwrap().is_none());
+    }
 }

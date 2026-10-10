@@ -54,15 +54,28 @@ pub async fn get_paths(
     .await
 }
 
-/// 在一次事务中替换路径快照但保留 file 业务记录, 避免移动或暂时离线丢失观看进度.
+/// 扫描前读取全部路径, 已存在的地址可直接复用而不读取文件内容.
+pub async fn list_paths(pool: &SqlitePool) -> Result<Vec<FilePath>, sqlx::Error> {
+    sqlx::query_as::<_, FilePath>(
+        "SELECT path, name_no_ext, extension, pre16mib_md5 FROM file_path",
+    ).fetch_all(pool).await
+}
+
+/// 在事务中只插入新路径并删除失效路径, 保留没有现存副本的 file 业务记录.
 pub async fn sync_scanned_files(
     pool: &SqlitePool,
     files: &[ScannedFile],
+    removed: &[FilePath],
 ) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
-    sqlx::query("DELETE FROM file_path")
-        .execute(&mut *tx)
-        .await?;
+    for file in removed {
+        sqlx::query("DELETE FROM file_path WHERE path = ? AND name_no_ext = ? AND extension = ?")
+            .bind(&file.path)
+            .bind(&file.name_no_ext)
+            .bind(&file.extension)
+            .execute(&mut *tx)
+            .await?;
+    }
 
     for file in files {
         sqlx::query(
