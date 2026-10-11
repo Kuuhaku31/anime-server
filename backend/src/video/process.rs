@@ -9,6 +9,7 @@ use tokio::{
     sync::{watch, OwnedSemaphorePermit, Semaphore},
     time::timeout,
 };
+use tracing::info;
 
 // 正常停止有独立错误类型, 不能顺带吞掉同一时刻发生的磁盘或清理错误.
 #[derive(Debug)]
@@ -84,14 +85,24 @@ impl Processes {
 
 pub async fn checked_output(command: &mut Command, seconds: u64) -> Result<Vec<u8>> {
     let (_sender, mut cancel) = watch::channel(false);
-    checked_output_cancellable(command, seconds, &mut cancel).await
+    match checked_output_cancellable(command, seconds, &mut cancel).await {
+        Ok(output) => Ok(output),
+        Err(error) => {
+            info!("media command failed: {:?}: {:#}", command, error);
+            Err(error)
+        },
+    }
 }
 
+
+/// 通用的异步子进程执行器, 用它运行 ffmpeg, ffprobe 等命令.
+/// 等待命令结束, 负责限时等待, 处理取消信号, 收集输出和诊断信息, 并在退出前回收子进程.
 pub async fn checked_output_cancellable(
     command: &mut Command,
     seconds: u64,
     cancel: &mut watch::Receiver<bool>,
 ) -> Result<Vec<u8>> {
+    info!("运行媒体命令: {:?}", command);
     command
         .kill_on_drop(true)
         .stdin(Stdio::null())

@@ -3,6 +3,7 @@
 //! 启动 Web 服务并组装应用依赖.
 
 use std::{net::SocketAddr, path::Path, sync::Arc};
+use tracing::error;
 
 use anyhow::Result;
 use axum::{routing::get, Json};
@@ -41,7 +42,7 @@ pub struct AppState {
 #[tokio::main]
 async fn main() -> Result<()> {
 
-    println!("Anime Server v{} starting...", env!("CARGO_PKG_VERSION"));
+    println!("Anime Server v{} Starting...", env!("CARGO_PKG_VERSION"));
 
     // 容器探针只检查已有 HTTP 服务, 不重新初始化数据库或争抢缓存独占锁.
     if std::env::args().any(|arg| arg == "--healthcheck") { return utils::http_check(); }
@@ -57,7 +58,13 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(constants::DATA_DIR)?;
     std::fs::create_dir_all(constants::DDP_ANI_CACHE_DIR)?;
     std::fs::create_dir_all(constants::DDP_DANMAKU_CACHE_DIR)?;
-    utils::check_tools().await?;
+    match utils::check_tools().await {
+        Ok(_) => (),
+        Err(e) => {
+            error!("tools check failed: {:#}", e);
+            error!("ffmpeg and ffprobe are required for media processing, please install them and ensure they are in the PATH");
+        },
+    }
     info!("tools check passed, ffmpeg and ffprobe are available");
 
     // 初始化数据库连接池, 并执行初始化 SQL 脚本, 创建必要的表和索引
@@ -104,6 +111,8 @@ async fn main() -> Result<()> {
     // API 和前端静态文件由同一端口提供, 浏览器通过同源相对 URL 访问服务.
     let app = api::router(state)
     .route("/health", get(|| async { Json(serde_json::json!({"status": "ok"})) }))
+
+    // 前端静态文件服务: /app/web
     .fallback_service(ServeDir::new("/app/web").append_index_html_on_directories(true))
     .layer(TraceLayer::new_for_http());
     let addr: SocketAddr = "0.0.0.0:8080".parse()?;

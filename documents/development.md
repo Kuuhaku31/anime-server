@@ -402,3 +402,39 @@ python3 backend/tests/playback_smoke.py \
 | 缓存目录被占用         | 检查是否有另一实例挂载相同 `CACHE_DIR`, 为测试实例使用独立目录                              |
 | 缓存超过配置大小       | 活动目录及媒体打开引用受保护, 等待最后租约释放和后台停止; 容量上限不是硬配额                |
 | 磁盘已满               | 停止服务后清理 `/cache` 中指定的变体或增加空间, 不要删除数据库                              |
+
+
+## 容器运行时目录结构
+
+```
+/
+├── app/
+│   ├── anime-server           # Rust 后端可执行文件
+│   └── web/                   # npm run build 输出的 frontend/dist
+│       ├── index.html
+│       ├── assets/
+│       │   ├── *.js
+│       │   └── *.css
+│       └── licenses/
+│           └── hls.txt
+├── config/                    # 宿主机 CONFIG_DIR, 只读挂载
+│   └── config.json
+├── media/                     # 宿主机 MEDIA_DIR, 只读挂载
+│   └── ...
+├── data/                      # 宿主机 DATA_DIR, 读写挂载
+│   ├── main.db
+│   ├── ddp-ani/
+│   └── ddp-danmaku/
+├── cache/                     # 宿主机 CACHE_DIR, 读写挂载
+│   ├── playback/
+│   │   └── <variant-key>/
+│   │       ├── complete       # 仅完整缓存存在此标记
+│   │       ├── index.m3u8
+│   │       ├── init.mp4
+│   │       └── segment_*.m4s
+│   ├── subtitles/             # 转码期间的临时字幕文件
+│   └── fonts/                 # 转码期间提取的字体附件
+└── usr/
+    ├── bin/                   # Debian 和 FFmpeg 等运行工具
+    └── share/fonts/           # 中文回退字体
+```
