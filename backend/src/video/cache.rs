@@ -17,7 +17,7 @@ use super::{assets::{self, RenderAssets}, ffmpeg::{self, CachedMedia, EncodeSpec
     fragment::{self, Init, Tail}, process::{cancelled, check_cancel, read_tail, Cancelled, Processes}};
 
 // 编码或续接规则改变兼容性时必须升级, 避免新任务复用旧契约的缓存.
-pub const ENCODER_PROFILE: &str = "h264-high-yuv420p-aac-fmp4-v2";
+pub(super) const ENCODER_PROFILE: &str = "h264-high-yuv420p-aac-fmp4-v2";
 static REVISION: AtomicU64 = AtomicU64::new(1);
 
 // 进程实际退出时立即归还预算, 不把后续磁盘提交算成正在编码.
@@ -25,33 +25,33 @@ type EncoderBudget = Option<(OwnedSemaphorePermit, OwnedSemaphorePermit, OwnedSe
 
 /// 缓存身份只由源文件指纹, 全局流索引和编码契约决定, 不包含路径或播放位置.
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
-pub struct PlaybackVariantConfig {
-    pub src_file_pre16mib_md5: String,
-    pub video_stream: i32,
-    pub audio_stream: Option<i32>,
-    pub subtitle_stream: Option<i32>,
-    pub encoder_profile: String,
+pub(crate) struct PlaybackVariantConfig {
+    pub(crate) src_file_pre16mib_md5: String,
+    pub(crate) video_stream: i32,
+    pub(crate) audio_stream: Option<i32>,
+    pub(crate) subtitle_stream: Option<i32>,
+    pub(crate) encoder_profile: String,
 }
 
 impl PlaybackVariantConfig {
     // 字段声明顺序和显式 null 都参与哈希, 不能排序字段或省略空音轨与字幕.
-    pub fn key(&self) -> Result<String> {
+    pub(crate) fn key(&self) -> Result<String> {
         Ok(format!("{:x}", Md5::digest(serde_json::to_vec(self)?)))
     }
 }
 
 /// complete 只描述媒体是否完整, generating 还包括排队和收尾, 两者可以同时为真.
 #[derive(Clone)]
-pub struct CacheStatus {
-    pub complete: bool,
-    pub generating: bool,
-    pub stopping: bool,
-    pub ready: bool,
-    pub buffered_until: f64,
-    pub encoding_threads: usize,
-    pub revision: u64,
-    pub target: f64,
-    pub error: Option<String>,
+pub(super) struct CacheStatus {
+    pub(super) complete: bool,
+    pub(super) generating: bool,
+    pub(super) stopping: bool,
+    pub(super) ready: bool,
+    pub(super) buffered_until: f64,
+    pub(super) encoding_threads: usize,
+    pub(super) revision: u64,
+    pub(super) target: f64,
+    pub(super) error: Option<String>,
 }
 
 struct ActiveState {
@@ -75,16 +75,16 @@ struct ActiveState {
 }
 
 /// 同一配置的全部会话共享此元素, 只有其生成任务能发布正式分片.
-pub struct ActiveCache {
-    pub key: String,
-    pub directory: PathBuf,
-    pub spec: EncodeSpec,
+pub(crate) struct ActiveCache {
+    key: String,
+    directory: PathBuf,
+    pub(super) spec: EncodeSpec,
     state: Mutex<ActiveState>,
     changed: Notify,
 }
 
 impl ActiveCache {
-    pub async fn wait_loaded(&self) -> Result<()> {
+    pub(super) async fn wait_loaded(&self) -> Result<()> {
         // 创建响应必须反映磁盘的真实完成状态, 等待期间不占用全局活动集合锁.
         loop {
             // 先注册通知再检查条件, 避免恢复完成通知落在检查与等待之间.
@@ -100,7 +100,7 @@ impl ActiveCache {
         }
     }
 
-    pub async fn status(&self, id: &str) -> Result<CacheStatus> {
+    pub(super) async fn status(&self, id: &str) -> Result<CacheStatus> {
         let mut state = self.state.lock().await;
         let target = *state.clients.get(id).context("playback cache lease is no longer active")?;
         state.last_used = SystemTime::now();
@@ -139,12 +139,12 @@ struct CacheInner {
 }
 
 #[derive(Clone)]
-pub struct CacheManager {
+pub(crate) struct CacheManager {
     inner: Arc<CacheInner>,
 }
 
 impl CacheManager {
-    pub async fn new(root: PathBuf, config: PlaybackConfig, processes: Processes) -> Result<Self> {
+    pub(crate) async fn new(root: PathBuf, config: PlaybackConfig, processes: Processes) -> Result<Self> {
 
         info!("开始初始化缓存管理器, 检查配置和磁盘目录...");
 
@@ -180,10 +180,10 @@ impl CacheManager {
         Ok(manager)
     }
 
-    pub fn stopping(&self) -> bool { *self.inner.stop.borrow() }
+    pub(super) fn stopping(&self) -> bool { *self.inner.stop.borrow() }
 
     // 查找或创建共享缓存
-    pub async fn acquire(&self, spec: EncodeSpec, id: &str) -> Result<Arc<ActiveCache>> {
+    pub(super) async fn acquire(&self, spec: EncodeSpec, id: &str) -> Result<Arc<ActiveCache>> {
         let key = spec.config.key()?;
         loop {
             let mut entries = self.inner.entries.lock().await;
@@ -248,12 +248,12 @@ impl CacheManager {
     }
 
     /// 只查活动集合, 不能靠磁盘目录存在绕过会话租约访问缓存.
-    pub async fn get(&self, key: &str) -> Result<Arc<ActiveCache>> {
+    pub(super) async fn get(&self, key: &str) -> Result<Arc<ActiveCache>> {
         self.inner.entries.lock().await.get(key).cloned().context("playback cache is no longer active")
     }
 
     /// 更新等待目标但不重建缓存, 运行中的编码进程也不会因此热调线程.
-    pub async fn target(&self, key: &str, id: &str, target: f64) -> Result<()> {
+    pub(super) async fn target(&self, key: &str, id: &str, target: f64) -> Result<()> {
         let output = self.get(key).await?;
         ensure!(target.is_finite() && target >= 0.0 && target < output.spec.duration, "position must be within the video duration");
         let mut state = output.state.lock().await;
@@ -263,7 +263,7 @@ impl CacheManager {
     }
 
     /// 仅释放仍存在的租约, 重复 DELETE 或过期清理不能重复触发最后客户端停止.
-    pub async fn release(&self, key: &str, id: &str) -> Result<()> {
+    pub(super) async fn release(&self, key: &str, id: &str) -> Result<()> {
         let mut entries = self.inner.entries.lock().await;
         let Some(output) = entries.get(key).cloned() else { return Ok(()); };
         let mut state = output.state.lock().await;
@@ -285,7 +285,7 @@ impl CacheManager {
     }
 
     /// 只开放正式清单中的已发布资源, 私有工作目录和未验证尾部不能被读取.
-    pub async fn media_path(&self, key: &str, id: &str, name: &str) -> Result<(PathBuf, Arc<ActiveCache>)> {
+    pub(super) async fn media_path(&self, key: &str, id: &str, name: &str) -> Result<(PathBuf, Arc<ActiveCache>)> {
         ensure!(ffmpeg::media_filename(name), "playback asset not found");
         let output = self.get(key).await?;
         let mut state = output.state.lock().await;
@@ -566,7 +566,7 @@ impl CacheManager {
     }
 
     /// 按磁盘访问时间淘汰非活动缓存, 正在打开媒体文件的旧引用仍受保护.
-    pub async fn maintain(&self) -> Result<()> {
+    pub(super) async fn maintain(&self) -> Result<()> {
         if let Ok(mut workers) = self.inner.workers.try_lock() {
             while let Some(result) = workers.try_join_next() {
                 if let Err(error) = result { warn!("cache worker failed: {error}"); }
@@ -598,7 +598,7 @@ impl CacheManager {
     }
 
     /// 先拒绝新租约并请求边界停止, 等全部写入者退出后才关闭媒体进程许可.
-    pub async fn shutdown(&self) -> Result<()> {
+    pub(crate) async fn shutdown(&self) -> Result<()> {
         self.inner.stop.send_replace(true);
         {
             let entries = self.inner.entries.lock().await;
@@ -669,11 +669,11 @@ fn disk_usage(root: &Path) -> Result<(u64, Vec<DiskCandidate>)> {
     Ok((total, candidates))
 }
 
-pub fn is_key(value: &str) -> bool {
+pub(crate) fn is_key(value: &str) -> bool {
     value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-pub fn random_id() -> Result<String> {
+pub(crate) fn random_id() -> Result<String> {
     let mut bytes = [0_u8; 16];
     File::open("/dev/urandom")?.read_exact(&mut bytes)?;
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())

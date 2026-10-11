@@ -1,5 +1,3 @@
-
-// backend/src/utils.rs
 //! 工具函数和辅助模块.
 
 use std::fs::File;
@@ -17,7 +15,7 @@ use md5::Digest;
 
 
 // 确认 http 服务存活
-pub fn http_check() -> Result<()> {
+pub(crate) fn http_check() -> Result<()> {
     use std::io::{Read, Write};
     let mut stream = std::net::TcpStream::connect_timeout(
         &"127.0.0.1:8080".parse()?, std::time::Duration::from_secs(2))?;
@@ -30,7 +28,7 @@ pub fn http_check() -> Result<()> {
 }
 
 /// 启动时验证固定输出的全部依赖, 缺少编码器, 滤镜或字体就拒绝启动, 不降级输出.
-pub async fn check_tools() -> Result<()> {
+pub(crate) async fn check_tools() -> Result<()> {
 
     checked_output(Command::new("ffprobe").arg("-version"), 10).await?;
 
@@ -65,7 +63,7 @@ pub(crate) fn check_md5(input: &str) -> Result<String, String> {
 
 /// 检查字符串是否符合预期的文件名 SHA256 哈希格式, 自动转换为小写十六进制字符.
 #[allow(dead_code)]
-pub(crate) fn check_sha256(input: &str) -> Result<String, String> {
+fn check_sha256(input: &str) -> Result<String, String> {
 
     if !(input.len() == 64 && input.bytes().all(|byte| byte.is_ascii_hexdigit())) {
         return Err(format!("invalid SHA256 hash: {}", input));

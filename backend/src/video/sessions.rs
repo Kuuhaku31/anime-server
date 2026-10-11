@@ -11,34 +11,34 @@ use super::{cache::{random_id, ActiveCache, CacheManager}, ffmpeg::EncodeSpec, m
 
 /// 对外只暴露不透明会话和状态快照, 不返回播放配置或 variant-key.
 #[derive(Debug, Clone, Serialize)]
-pub struct SessionStatus {
-    pub session_id: String,
-    pub url: String,
-    pub mime_type: &'static str,
-    pub start_time: f64,
-    pub duration: f64,
-    pub position: f64,
-    pub complete: bool,
-    pub generating: bool,
-    pub stopping: bool,
-    pub ready: bool,
-    pub buffered_until: f64,
-    pub encoding_threads: usize,
-    pub error: Option<String>,
+pub(crate) struct SessionStatus {
+    session_id: String,
+    url: String,
+    mime_type: &'static str,
+    start_time: f64,
+    pub(crate) duration: f64,
+    position: f64,
+    complete: bool,
+    generating: bool,
+    stopping: bool,
+    ready: bool,
+    buffered_until: f64,
+    encoding_threads: usize,
+    error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
-pub struct Selection {
-    pub audio: Option<i32>,
-    pub subtitle: Option<i32>,
+struct Selection {
+    audio: Option<i32>,
+    subtitle: Option<i32>,
 }
 
 #[derive(Debug, Serialize)]
-pub struct PlaybackStart {
+pub(crate) struct PlaybackStart {
     #[serde(flatten)]
-    pub session: SessionStatus,
-    pub media: MediaInfo,
-    pub selection: Selection,
+    session: SessionStatus,
+    media: MediaInfo,
+    selection: Selection,
 }
 
 // 会话只记录缓存键和存活时间, 目标位置及媒体状态由活动元素统一维护.
@@ -51,19 +51,19 @@ struct Session {
 }
 
 #[derive(Clone)]
-pub struct SessionManager {
+pub(crate) struct SessionManager {
     sessions: Arc<Mutex<HashMap<String, Session>>>,
     cache: CacheManager,
     idle_seconds: u64,
 }
 
 impl SessionManager {
-    pub fn new(cache: CacheManager, idle_seconds: u64) -> Self {
+    pub(crate) fn new(cache: CacheManager, idle_seconds: u64) -> Self {
         Self { sessions: Arc::new(Mutex::new(HashMap::new())), cache, idle_seconds }
     }
 
     /// 先预留会话名额再等待缓存加载, 防止并发创建绕过数量上限.
-    pub async fn create(&self, spec: EncodeSpec) -> Result<PlaybackStart> {
+    pub(crate) async fn create(&self, spec: EncodeSpec) -> Result<PlaybackStart> {
         let id = random_id()?;
         let key = spec.config.key()?;
         let media = spec.info.clone();
@@ -99,7 +99,7 @@ impl SessionManager {
         Ok(session.variant_key.clone())
     }
 
-    pub async fn status(&self, id: &str) -> Result<SessionStatus> {
+    pub(crate) async fn status(&self, id: &str) -> Result<SessionStatus> {
         let key = self.key(id).await?;
         let cache = self.cache.get(&key).await?;
         let status = cache.status(id).await?;
@@ -112,18 +112,18 @@ impl SessionManager {
         })
     }
 
-    pub async fn heartbeat(&self, id: &str) -> Result<()> {
+    pub(crate) async fn heartbeat(&self, id: &str) -> Result<()> {
         self.status(id).await?;
         Ok(())
     }
 
-    pub async fn target(&self, id: &str, target: f64) -> Result<SessionStatus> {
+    pub(crate) async fn target(&self, id: &str, target: f64) -> Result<SessionStatus> {
         let key = self.key(id).await?;
         self.cache.target(&key, id, target).await?;
         self.status(id).await
     }
 
-    pub async fn media_path(&self, id: &str, name: &str) -> Result<(PathBuf, &'static str, Arc<ActiveCache>)> {
+    pub(crate) async fn media_path(&self, id: &str, name: &str) -> Result<(PathBuf, &'static str, Arc<ActiveCache>)> {
         let key = self.key(id).await?;
         let (path, cache) = self.cache.media_path(&key, id, name).await?;
         let mime = if name.ends_with(".m3u8") { "application/vnd.apple.mpegurl" }
@@ -133,13 +133,13 @@ impl SessionManager {
     }
 
     /// 先移除会话再释放租约, 重复释放和并发过期清理只会有一方实际扣除租约.
-    pub async fn release(&self, id: &str) -> Result<()> {
+    pub(crate) async fn release(&self, id: &str) -> Result<()> {
         let session = self.sessions.lock().await.remove(id);
         if let Some(session) = session { self.cache.release(&session.variant_key, id).await?; }
         Ok(())
     }
 
-    pub fn spawn_expiration(&self) {
+    pub(crate) fn spawn_expiration(&self) {
         let manager = self.clone();
         tokio::spawn(async move {
             let mut tick = interval(Duration::from_secs(5));
@@ -175,7 +175,7 @@ impl SessionManager {
         Ok(())
     }
 
-    pub async fn shutdown(&self) -> Result<()> {
+    pub(crate) async fn shutdown(&self) -> Result<()> {
         self.sessions.lock().await.clear();
         self.cache.shutdown().await
     }

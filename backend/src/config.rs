@@ -7,31 +7,32 @@ use std::{fs, path::Path};
 
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct AppConfig {
+pub(crate) struct AppConfig {
     #[serde(default)]
-    pub web: WebConfig,
+    pub(crate) web: WebConfig,
     #[serde(default = "default_scan_interval")]
-    pub scan_interval_seconds: u64,
+    pub(crate) scan_interval_seconds: u64,
     #[serde(default)]
-    pub dandanplay: DandanPlayConfig,
+    #[allow(dead_code)]
+    dandanplay: DandanPlayConfig,
     #[serde(default)]
-    pub playback: PlaybackConfig,
+    pub(crate) playback: PlaybackConfig,
 }
 
 /// 只控制资源调度和租约生命周期, 不参与播放配置的缓存身份计算.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct PlaybackConfig {
+pub(crate) struct PlaybackConfig {
     // 按目录实际字节数统计, 活动缓存受保护时允许暂时超过此淘汰目标.
-    pub cache_max_bytes: u64,
+    pub(crate) cache_max_bytes: u64,
     // 总进程名额包含探测和校验, 至少预留一个名额避免编码等待校验时死锁.
-    pub max_processes: usize,
+    pub(crate) max_processes: usize,
     // 先获得基础线程预算才启动, 目标未覆盖时最多申请到单个任务上限.
-    pub ffmpeg_threads: usize,
-    pub max_variant_threads: usize,
-    pub max_total_ffmpeg_threads: usize,
-    pub idle_timeout_seconds: u64,
-    pub startup_timeout_seconds: u64,
+    pub(crate) ffmpeg_threads: usize,
+    pub(crate) max_variant_threads: usize,
+    pub(crate) max_total_ffmpeg_threads: usize,
+    pub(crate) idle_timeout_seconds: u64,
+    pub(crate) startup_timeout_seconds: u64,
 }
 
 impl Default for PlaybackConfig {
@@ -51,7 +52,7 @@ impl Default for PlaybackConfig {
 impl PlaybackConfig {
 
     /// 校验播放配置的合法性, 主要是线程预算和缓存容量.
-    pub fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         ensure!(self.cache_max_bytes > 0, "cache_max_bytes must be positive");
         ensure!(
             (2..=16).contains(&self.max_processes),
@@ -115,9 +116,9 @@ mod tests {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct WebConfig {
+pub(crate) struct WebConfig {
     #[serde(default = "default_dark_mode")]
-    pub default_dark_mode: bool,
+    default_dark_mode: bool,
 }
 
 impl Default for WebConfig {
@@ -129,11 +130,12 @@ impl Default for WebConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
-pub struct DandanPlayConfig {
+#[allow(dead_code)]
+struct DandanPlayConfig {
     #[serde(default)]
-    pub enabled: bool,
+    enabled: bool,
     #[serde(default)]
-    pub api_base: String,
+    api_base: String,
 }
 
 fn default_dark_mode() -> bool {
@@ -145,7 +147,7 @@ fn default_scan_interval() -> u64 {
 }
 
 impl AppConfig {
-    pub fn load(path: &Path) -> Result<Self> {
+    pub(crate) fn load(path: &Path) -> Result<Self> {
         let content = fs::read_to_string(path)?;
         let config: Self = serde_json::from_str(&content)?;
         config.playback.validate()?;

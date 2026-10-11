@@ -9,15 +9,15 @@ use crate::{constants::HASH_LIMIT, utils};
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
 pub(crate) struct VideoFile {
-    pub pre16mib_md5: String,
+    pub(crate) pre16mib_md5: String,
     pub(crate) name: String,
     pub(crate) size: i64,
     pub(crate) audio_stream_index: Option<i32>,
     pub(crate) subtitle_stream_index: Option<i32>,
     pub(crate) ddp_epi_id: Option<i64>,
-    pub(crate) danmaku_offset: f64,
+    danmaku_offset: f64,
     pub(crate) watch_pos: Option<f64>,
-    pub(crate) watched_datetime: Option<String>,
+    watched_datetime: Option<String>,
     pub(crate) path: String,
 }
 
@@ -30,9 +30,9 @@ pub(crate) struct ProgressInput {
 /// 进度按文件指纹保存原视频绝对秒数, 跨路径副本和不同播放配置复用.
 #[derive(Debug, Serialize, sqlx::FromRow)]
 pub(crate) struct WatchProgress {
-    pub(crate) pre16mib_md5: String,
+    pre16mib_md5: String,
     pub(crate) watch_pos: Option<f64>,
-    pub(crate) watched_datetime: Option<String>,
+    watched_datetime: Option<String>,
     pub(crate) audio_stream_index: Option<i32>,
     pub(crate) subtitle_stream_index: Option<i32>,
 }

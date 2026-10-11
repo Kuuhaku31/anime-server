@@ -13,7 +13,7 @@ use tracing::info;
 
 // 正常停止有独立错误类型, 不能顺带吞掉同一时刻发生的磁盘或清理错误.
 #[derive(Debug)]
-pub struct Cancelled;
+pub(super) struct Cancelled;
 
 impl std::fmt::Display for Cancelled {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -23,7 +23,7 @@ impl std::fmt::Display for Cancelled {
 
 impl std::error::Error for Cancelled {}
 
-pub fn check_cancel(cancel: &watch::Receiver<bool>) -> Result<()> {
+pub(super) fn check_cancel(cancel: &watch::Receiver<bool>) -> Result<()> {
     if *cancel.borrow() { return Err(Cancelled.into()); }
     Ok(())
 }
@@ -33,14 +33,14 @@ pub fn check_cancel(cancel: &watch::Receiver<bool>) -> Result<()> {
 /// 防止多个播放配置同时生成缓存时耗尽资源.
 /// 它不是操作系统进程列表, 也不直接管理所有子进程句柄.
 #[derive(Clone)]
-pub struct Processes {
-    pub slots: Arc<Semaphore>, // 媒体子进程总数
-    pub encoders: Arc<Semaphore>, // 并行编码任务数, 不能用线程许可替代进程名额
+pub(crate) struct Processes {
+    pub(super) slots: Arc<Semaphore>, // 媒体子进程总数
+    pub(super) encoders: Arc<Semaphore>, // 并行编码任务数, 不能用线程许可替代进程名额
     threads: Arc<Semaphore>, // 编码线程预算, 不能用进程名额替代线程许可
 }
 
 impl Processes {
-    pub fn new(total: usize, thread_budget: usize) -> Self {
+    pub(crate) fn new(total: usize, thread_budget: usize) -> Self {
         Self {
             slots: Arc::new(Semaphore::new(total)),
             // 至少空出一个媒体名额, 避免编码进程全部等待各自的解码校验.
@@ -49,7 +49,7 @@ impl Processes {
         }
     }
 
-    pub async fn encoding_threads(&self, base: usize, desired: usize,
+    pub(super) async fn encoding_threads(&self, base: usize, desired: usize,
         cancel: &mut watch::Receiver<bool>) -> Result<OwnedSemaphorePermit> {
         anyhow::ensure!(base > 0 && desired >= base && desired <= 32, "invalid encoder thread request");
         // 一次取得基础预算, 再非阻塞补充许可, 不持有不足以启动的部分基础预算.
@@ -63,7 +63,7 @@ impl Processes {
     }
 
     /// 只拿当前空闲的额外预算, 不为追求最大线程数阻塞或抢占其他编码任务.
-    pub fn extend_encoding_threads(&self, permit: &mut OwnedSemaphorePermit, desired: usize) -> Result<()> {
+    pub(super) fn extend_encoding_threads(&self, permit: &mut OwnedSemaphorePermit, desired: usize) -> Result<()> {
         anyhow::ensure!(desired >= permit.num_permits() && desired <= 32, "invalid encoder thread target");
         for _ in permit.num_permits()..desired {
             match self.threads.clone().try_acquire_owned() {
@@ -75,7 +75,7 @@ impl Processes {
         Ok(())
     }
 
-    pub async fn output(&self, command: &mut Command, seconds: u64) -> Result<Vec<u8>> {
+    pub(super) async fn output(&self, command: &mut Command, seconds: u64) -> Result<Vec<u8>> {
         let _permit = timeout(Duration::from_secs(seconds), self.slots.acquire())
             .await
             .context("timed out waiting for a media process slot")??;
@@ -83,7 +83,7 @@ impl Processes {
     }
 }
 
-pub async fn checked_output(command: &mut Command, seconds: u64) -> Result<Vec<u8>> {
+pub(crate) async fn checked_output(command: &mut Command, seconds: u64) -> Result<Vec<u8>> {
     let (_sender, mut cancel) = watch::channel(false);
     match checked_output_cancellable(command, seconds, &mut cancel).await {
         Ok(output) => Ok(output),
@@ -97,7 +97,7 @@ pub async fn checked_output(command: &mut Command, seconds: u64) -> Result<Vec<u
 
 /// 通用的异步子进程执行器, 用它运行 ffmpeg, ffprobe 等命令.
 /// 等待命令结束, 负责限时等待, 处理取消信号, 收集输出和诊断信息, 并在退出前回收子进程.
-pub async fn checked_output_cancellable(
+pub(super) async fn checked_output_cancellable(
     command: &mut Command,
     seconds: u64,
     cancel: &mut watch::Receiver<bool>,
@@ -139,14 +139,14 @@ pub async fn checked_output_cancellable(
 }
 
 /// 发送端消失也视为取消, 避免所有者退出后子任务永久等待.
-pub async fn cancelled(receiver: &mut watch::Receiver<bool>) {
+pub(super) async fn cancelled(receiver: &mut watch::Receiver<bool>) {
     while !*receiver.borrow_and_update() {
         if receiver.changed().await.is_err() { break; }
     }
 }
 
 /// 持续排空 stderr 但只保留末尾诊断, 防止长时间转码累积无界日志内存.
-pub async fn read_tail(mut reader: impl AsyncRead + Unpin) -> Result<String> {
+pub(super) async fn read_tail(mut reader: impl AsyncRead + Unpin) -> Result<String> {
     let mut tail = Vec::new();
     let mut buffer = [0_u8; 2048];
     loop {

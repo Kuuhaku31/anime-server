@@ -8,14 +8,14 @@ use tokio::{process::Command, sync::watch};
 use super::{cache::{is_key, random_id}, ffmpeg::EncodeSpec, process::checked_output_cancellable};
 
 /// 资源只属于本次字幕渲染任务, 不进入持久播放配置或缓存身份.
-pub struct RenderAssets {
+pub(super) struct RenderAssets {
     id: String,
     subtitle: PathBuf,
     fonts: PathBuf,
 }
 
 impl RenderAssets {
-    pub async fn allocate(root: &Path) -> Result<Self> {
+    pub(super) async fn allocate(root: &Path) -> Result<Self> {
         let id = random_id()?;
         let subtitle = root.join("subtitles").join(format!("{id}.ass"));
         let fonts = root.join("fonts").join(&id);
@@ -27,12 +27,12 @@ impl RenderAssets {
         Ok(Self { id, subtitle, fonts })
     }
 
-    pub fn filter(&self) -> String {
+    pub(super) fn filter(&self) -> String {
         // FFmpeg 在 variant 的私有工作目录运行, 路径只包含服务端生成的十六进制名称.
         format!("subtitles=filename='../../../subtitles/{}.ass':fontsdir='../../../fonts/{}'", self.id, self.id)
     }
 
-    pub async fn prepare(&self, spec: &EncodeSpec, seconds: u64, cancel: &mut watch::Receiver<bool>) -> Result<()> {
+    pub(super) async fn prepare(&self, spec: &EncodeSpec, seconds: u64, cancel: &mut watch::Receiver<bool>) -> Result<()> {
         let track = spec.subtitle.as_ref().context("text subtitle is missing")?;
         let started = Instant::now();
         // 保留原始字幕时间抽取为 ASS, 续接后仍能烧录在边界之前已开始的字幕.
@@ -67,7 +67,7 @@ impl RenderAssets {
         Ok(())
     }
 
-    pub async fn cleanup(self) -> Result<()> {
+    pub(super) async fn cleanup(self) -> Result<()> {
         let (subtitle, fonts) = tokio::join!(
             tokio::fs::remove_file(self.subtitle),
             tokio::fs::remove_dir_all(self.fonts),
@@ -80,7 +80,7 @@ impl RenderAssets {
 }
 
 /// 只清理符合本程序随机命名规则的遗留资源, 不处理目录中的其他文件.
-pub async fn clean_startup(root: &Path) -> Result<()> {
+pub(super) async fn clean_startup(root: &Path) -> Result<()> {
     for directory in ["subtitles", "fonts"] {
         let mut entries = tokio::fs::read_dir(root.join(directory)).await?;
         while let Some(entry) = entries.next_entry().await? {

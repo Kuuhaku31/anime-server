@@ -10,45 +10,43 @@ use tracing::warn;
 use super::process::Processes;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Track {
-    pub stream_index: i32,
-    pub codec_name: String,
-    pub language: Option<String>,
-    pub title: Option<String>,
-    pub is_default: bool,
-    pub is_forced: bool,
+pub(super) struct Track {
+    pub(super) stream_index: i32,
+    codec_name: String,
+    language: Option<String>,
+    title: Option<String>,
+    pub(super) is_default: bool,
+    pub(super) is_forced: bool,
     #[serde(skip_serializing)]
-    pub color_transfer: Option<String>,
+    color_transfer: Option<String>,
 }
 
 impl Track {
-    pub fn is_bitmap(&self) -> bool {
+    pub(super) fn is_bitmap(&self) -> bool {
         matches!(self.codec_name.as_str(), "hdmv_pgs_subtitle" | "dvd_subtitle" | "dvb_subtitle" | "xsub")
     }
 
-    pub fn is_hdr(&self) -> bool {
+    pub(super) fn is_hdr(&self) -> bool {
         matches!(self.color_transfer.as_deref(), Some("smpte2084" | "arib-std-b67"))
     }
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct Attachment {
-    pub stream_index: i32,
-    // 附件流内部的相对编号, 用于 -dump_attachment:t, 不同于全局 stream_index.
-    pub ordinal: usize,
-    pub font_extension: Option<String>,
+pub(super) struct Attachment {
+    pub(super) ordinal: usize,
+    pub(super) font_extension: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MediaInfo {
-    pub duration: f64,
+pub(crate) struct MediaInfo {
+    pub(crate) duration: f64,
     #[serde(skip_serializing)]
-    pub start_time: f64,
-    pub video_tracks: Vec<Track>,
-    pub audio_tracks: Vec<Track>,
-    pub subtitle_tracks: Vec<Track>,
+    pub(super) start_time: f64,
+    pub(super) video_tracks: Vec<Track>,
+    pub(super) audio_tracks: Vec<Track>,
+    pub(super) subtitle_tracks: Vec<Track>,
     #[serde(skip_serializing)]
-    pub attachments: Vec<Attachment>,
+    pub(super) attachments: Vec<Attachment>,
 }
 
 #[derive(Deserialize)]
@@ -80,17 +78,17 @@ struct ProbeStream {
 
 /// 按文件指纹复用探测成功或失败结果, 显式 Retry probe 才绕过旧结果.
 #[derive(Clone)]
-pub struct MetadataCache {
+pub(crate) struct MetadataCache {
     entries: Arc<Mutex<HashMap<String, Result<MediaInfo, String>>>>,
     processes: Processes,
 }
 
 impl MetadataCache {
-    pub fn new(processes: Processes) -> Self {
+    pub(crate) fn new(processes: Processes) -> Self {
         Self { entries: Arc::new(Mutex::new(HashMap::new())), processes }
     }
 
-    pub async fn get(&self, id: &str, path: &Path, retry: bool) -> Result<MediaInfo> {
+    pub(crate) async fn get(&self, id: &str, path: &Path, retry: bool) -> Result<MediaInfo> {
         if !retry {
             let entries = self.entries.lock().await;
             if let Some(entry) = entries.get(id) {
@@ -136,7 +134,7 @@ fn normalize(probe: Probe) -> Result<MediaInfo> {
         if stream.disposition.get("attached_pic") == Some(&1) { continue; }
         if stream.codec_type.as_deref() == Some("attachment") {
             info.attachments.push(Attachment {
-                stream_index: stream.index, ordinal: info.attachments.len(),
+                ordinal: info.attachments.len(),
                 font_extension: font_extension(
                     stream.tags.get("filename").map(String::as_str).unwrap_or(""),
                     stream.tags.get("mimetype").map(String::as_str)),

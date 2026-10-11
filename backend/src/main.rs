@@ -1,5 +1,3 @@
-
-// backend/src/main.rs
 //! 启动 Web 服务并组装应用依赖.
 
 use std::{net::SocketAddr, path::Path, sync::Arc};
@@ -33,12 +31,12 @@ use crate::models::ScanChanges;
 
 #[derive(Clone)]
 /// 应用状态
-pub struct AppState {
-    pub db: SqlitePool, // 数据库连接池
-    pub config: Arc<AppConfig>, // 应用配置
-    pub metadata: MetadataCache, // 元数据缓存
-    pub playback: SessionManager, // 播放会话管理
-    pub scan_lock: Arc<tokio::sync::Mutex<()>>, // 扫描锁, 防止同时进行多个扫描任务
+struct AppState {
+    db: SqlitePool, // 根模块私有字段仍可供其子模块访问.
+    config: Arc<AppConfig>, // 应用配置
+    metadata: MetadataCache, // 元数据缓存
+    playback: SessionManager, // 播放会话管理
+    scan_lock: Arc<tokio::sync::Mutex<()>>, // 扫描锁, 防止同时进行多个扫描任务
 }
 
 

@@ -14,19 +14,19 @@ use super::{assets::RenderAssets, cache::{is_key, PlaybackVariantConfig, ENCODER
 /// 客户端只表达选轨和位置意图, 完整播放配置由服务端构造.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PlaybackRequest {
+pub(crate) struct PlaybackRequest {
 
     // 缺省表示服务端选轨, 显式 null 表示关闭, 两者不能混为一谈.
     #[serde(default, deserialize_with = "track_choice")]
-    pub audio_stream_index: Option<Option<i32>>,
+    pub(crate) audio_stream_index: Option<Option<i32>>,
     #[serde(default, deserialize_with = "track_choice")]
-    pub subtitle_stream_index: Option<Option<i32>>,
-    pub position: Option<f64>,
+    pub(crate) subtitle_stream_index: Option<Option<i32>>,
+    position: Option<f64>,
 }
 
 impl PlaybackRequest {
     /// 仅将缺省字段补为数据库偏好, 显式 null 仍表示本次关闭对应轨道.
-    pub fn with_preferences(mut self, audio: Option<i32>, subtitle: Option<i32>) -> Self {
+    pub(crate) fn with_preferences(mut self, audio: Option<i32>, subtitle: Option<i32>) -> Self {
         if self.audio_stream_index.is_none() { self.audio_stream_index = Some(audio); }
         if self.subtitle_stream_index.is_none() { self.subtitle_stream_index = Some(subtitle); }
         self
@@ -39,20 +39,20 @@ fn track_choice<'de, D: Deserializer<'de>>(deserializer: D) -> std::result::Resu
 
 /// 单次任务的执行参数, 只有 config 参与缓存身份计算, 其余字段用于媒体处理和调度.
 #[derive(Clone)]
-pub struct EncodeSpec {
-    pub config: PlaybackVariantConfig,
-    pub source: PathBuf,
-    pub duration: f64,
+pub(crate) struct EncodeSpec {
+    pub(crate) config: PlaybackVariantConfig,
+    pub(super) source: PathBuf,
+    pub(super) duration: f64,
     // 容器时间轴原点可能为负数, 视频, 音频和字幕都要按同一原点归零.
-    pub source_start: f64,
-    pub info: MediaInfo,
-    pub subtitle: Option<Track>,
-    pub hdr: bool,
-    pub target: f64,
+    source_start: f64,
+    pub(super) info: MediaInfo,
+    pub(super) subtitle: Option<Track>,
+    hdr: bool,
+    pub(super) target: f64,
 }
 
 impl EncodeSpec {
-    pub fn new(id: &str, source: PathBuf, info: MediaInfo, request: PlaybackRequest,
+    pub(crate) fn new(id: &str, source: PathBuf, info: MediaInfo, request: PlaybackRequest,
         saved_position: Option<f64>) -> Result<Self> {
         ensure!(is_key(id), "invalid source file ID");
         let saved = saved_position.unwrap_or(0.0);
@@ -88,7 +88,7 @@ fn select(tracks: &[Track], index: Option<i32>, kind: &str) -> Result<Option<Tra
 }
 
 /// 只向私有工作目录生成 HLS, 正式缓存由 CacheManager 校验后原子追加.
-pub fn command(spec: &EncodeSpec, directory: &Path, assets: Option<&RenderAssets>,
+pub(super) fn command(spec: &EncodeSpec, directory: &Path, assets: Option<&RenderAssets>,
     resume: Tail, threads: usize) -> Result<Command> {
     let mut command = Command::new("ffmpeg");
     command.current_dir(directory).kill_on_drop(true)
@@ -157,7 +157,7 @@ fn video_timing(spec: &EncodeSpec, resume: Tail) -> String {
         (spec.source_start * 90_000.0).round() as i64, resume.video, resume.video)
 }
 
-pub async fn has_video_after(spec: &EncodeSpec, resume: Tail, processes: &Processes,
+pub(super) async fn has_video_after(spec: &EncodeSpec, resume: Tail, processes: &Processes,
     cancel: &mut watch::Receiver<bool>) -> Result<bool> {
     let _permit = tokio::select! {
         biased;
@@ -178,14 +178,14 @@ pub async fn has_video_after(spec: &EncodeSpec, resume: Tail, processes: &Proces
 }
 
 #[derive(Clone, Debug)]
-pub struct Playlist {
-    pub segments: Vec<String>,
-    pub durations: Vec<f64>,
-    pub duration: f64,
-    pub complete: bool,
+pub(super) struct Playlist {
+    pub(super) segments: Vec<String>,
+    durations: Vec<f64>,
+    duration: f64,
+    pub(super) complete: bool,
 }
 
-pub async fn read_playlist(directory: &Path) -> Result<Option<Playlist>> {
+pub(super) async fn read_playlist(directory: &Path) -> Result<Option<Playlist>> {
     let path = directory.join("index.m3u8");
     let content = match regular_bytes(&path, 16 * 1024 * 1024).await {
         Ok(content) => content,
@@ -228,9 +228,9 @@ fn parse_playlist(content: &str) -> Result<Playlist> {
     Ok(playlist)
 }
 
-pub fn segment_name(index: usize) -> String { format!("segment_{index:06}.m4s") }
+pub(super) fn segment_name(index: usize) -> String { format!("segment_{index:06}.m4s") }
 
-pub fn media_filename(name: &str) -> bool {
+pub(super) fn media_filename(name: &str) -> bool {
     name == "index.m3u8" || name == "init.mp4"
         || name.strip_prefix("segment_").and_then(|name| name.strip_suffix(".m4s"))
             .is_some_and(|number| number.len() == 6 && number.bytes().all(|byte| byte.is_ascii_digit()))
@@ -238,16 +238,16 @@ pub fn media_filename(name: &str) -> bool {
 
 /// 只保存已验证的连续前缀, 缓存末端来自样本时间轴, 而不是源视频的估算时长.
 #[derive(Clone, Default)]
-pub struct CachedMedia {
-    pub init: Option<Init>,
-    pub segments: Vec<Fragment>,
-    pub complete: bool,
+pub(super) struct CachedMedia {
+    pub(super) init: Option<Init>,
+    pub(super) segments: Vec<Fragment>,
+    pub(super) complete: bool,
 }
 
 impl CachedMedia {
-    pub fn tail(&self) -> Tail { self.segments.last().map(|segment| segment.end).unwrap_or_default() }
+    pub(super) fn tail(&self) -> Tail { self.segments.last().map(|segment| segment.end).unwrap_or_default() }
 
-    pub fn playlist(&self) -> Result<String> {
+    pub(super) fn playlist(&self) -> Result<String> {
         let mut text = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:5\n#EXT-X-MEDIA-SEQUENCE:0\n\
             #EXT-X-PLAYLIST-TYPE:EVENT\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-MAP:URI=\"init.mp4\"\n".to_string();
         for (index, segment) in self.segments.iter().enumerate() {
@@ -260,7 +260,7 @@ impl CachedMedia {
     }
 }
 
-pub async fn regular_bytes(path: &Path, limit: u64) -> Result<Vec<u8>> {
+pub(super) async fn regular_bytes(path: &Path, limit: u64) -> Result<Vec<u8>> {
     let metadata = tokio::fs::symlink_metadata(path).await?;
     ensure!(metadata.is_file() && metadata.len() > 0 && metadata.len() <= limit,
         "unsafe, empty or oversized HLS file: {}", path.display());
@@ -271,7 +271,7 @@ fn missing(error: &anyhow::Error) -> bool {
     error.downcast_ref::<std::io::Error>().is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
 }
 
-pub async fn remove_file(path: &Path) -> Result<()> {
+pub(super) async fn remove_file(path: &Path) -> Result<()> {
     match tokio::fs::remove_file(path).await {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -279,7 +279,7 @@ pub async fn remove_file(path: &Path) -> Result<()> {
     }
 }
 
-pub async fn atomic_file(directory: &Path, name: &str, content: &[u8]) -> Result<()> {
+pub(super) async fn atomic_file(directory: &Path, name: &str, content: &[u8]) -> Result<()> {
     // 文件数据和目录项按顺序落盘, 重启只会看到旧版本或完整的新版本.
     let temporary = directory.join(format!("{name}.tmp"));
     let mut file = tokio::fs::File::create(&temporary).await?;
@@ -290,13 +290,13 @@ pub async fn atomic_file(directory: &Path, name: &str, content: &[u8]) -> Result
     sync_directory(directory).await
 }
 
-pub async fn sync_directory(directory: &Path) -> Result<()> {
+pub(super) async fn sync_directory(directory: &Path) -> Result<()> {
     let directory = directory.to_owned();
     tokio::task::spawn_blocking(move || std::fs::File::open(directory)?.sync_all()).await??;
     Ok(())
 }
 
-pub async fn write_playlist(directory: &Path, media: &CachedMedia) -> Result<()> {
+pub(super) async fn write_playlist(directory: &Path, media: &CachedMedia) -> Result<()> {
     if !media.segments.is_empty() {
         atomic_file(directory, "index.m3u8", media.playlist()?.as_bytes()).await?;
     }
@@ -304,7 +304,7 @@ pub async fn write_playlist(directory: &Path, media: &CachedMedia) -> Result<()>
 }
 
 /// 首片额外探测编码参数, 每片都与指定 init 拼接后真实解码全部音视频样本.
-pub async fn validate_segment(directory: &Path, init: &str, segment: &str, audio: bool,
+pub(super) async fn validate_segment(directory: &Path, init: &str, segment: &str, audio: bool,
     probe: bool, processes: &Processes, cancel: &mut watch::Receiver<bool>) -> Result<()> {
     let _permit = tokio::select! {
         biased;
@@ -346,7 +346,7 @@ pub async fn validate_segment(directory: &Path, init: &str, segment: &str, audio
 }
 
 /// 从 0 恢复最长有效前缀, 修复清单并删除损坏尾部, 不在恢复期间启动续接编码.
-pub async fn recover(directory: &Path, processes: &Processes, cancel: &mut watch::Receiver<bool>) -> Result<CachedMedia> {
+pub(super) async fn recover(directory: &Path, processes: &Processes, cancel: &mut watch::Receiver<bool>) -> Result<CachedMedia> {
     // 读取磁盘的 I/O 错误直接上报, 不能因权限等问题把已有缓存当作空目录清理.
     let original = match read_playlist(directory).await {
         Ok(playlist) => playlist,
@@ -435,7 +435,7 @@ pub async fn recover(directory: &Path, processes: &Processes, cancel: &mut watch
 // ========================================================================== //
 
 #[cfg(test)]
-pub fn fixture() -> (MediaInfo, PlaybackRequest) {
+pub(crate) fn fixture() -> (MediaInfo, PlaybackRequest) {
     let info = serde_json::from_value(serde_json::json!({
         "duration": 20.0, "start_time": 0.0,
         "video_tracks": [{"stream_index": 0, "codec_name": "h264", "is_default": true, "is_forced": false}],

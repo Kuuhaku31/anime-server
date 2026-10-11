@@ -15,6 +15,10 @@
 声明各自同名目录下的子模块, 不使用 `mod.rs`.
 数据库初始化文件是 `backend/sql/init.sql`.
 
+Rust 类型, 字段, 函数和模块默认私有. 仅供 `video` 内部共享的接口使用
+`pub(super)`, 必须跨模块使用的接口最高为 `pub(crate)`, 不使用无限制的 `pub`.
+Serde 序列化和反序列化不依赖字段公开, 不为接口响应字段额外扩大可见性.
+
 前端入口是 `frontend/src/main.ts`, 构建结果位于 `frontend/dist/`.
 后端从容器内 `/app/web` 提供静态文件, 前后端使用同源 HTTP 接口通信.
 

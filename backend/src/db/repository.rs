@@ -24,7 +24,7 @@ const VIDEO_SELECT: &str = r#"
 
 
 /// 获取全部视频记录, 按完整地址排序, 文件名仅用于显示.
-pub async fn get_video_files(p: &SqlitePool) -> Result<Vec<VideoFile>, sqlx::Error> {
+pub(crate) async fn get_video_files(p: &SqlitePool) -> Result<Vec<VideoFile>, sqlx::Error> {
     let query = format!("{VIDEO_SELECT} ORDER BY fp.path");
     let mut files = sqlx::query_as::<_, VideoFile>(&query).fetch_all(p).await?;
     for file in &mut files { set_display_name(file)?; }
@@ -32,7 +32,7 @@ pub async fn get_video_files(p: &SqlitePool) -> Result<Vec<VideoFile>, sqlx::Err
 }
 
 /// 获取指定文件指纹的数据库记录.
-pub async fn get_video_by_id(p: &SqlitePool, id: &str) -> Result<Option<VideoFile>, sqlx::Error> {
+pub(crate) async fn get_video_by_id(p: &SqlitePool, id: &str) -> Result<Option<VideoFile>, sqlx::Error> {
     let query = format!("{VIDEO_SELECT} WHERE f.pre16mib_md5 = ? ORDER BY fp.path LIMIT 1");
     let mut file = sqlx::query_as::<_, VideoFile>(&query).bind(id).fetch_optional(p).await?;
     if let Some(file) = &mut file { set_display_name(file)?; }
@@ -46,14 +46,14 @@ fn set_display_name(file: &mut VideoFile) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
-pub async fn get_video_paths_by_id(p: &SqlitePool, id: &str) -> Result<Vec<PathBuf>, sqlx::Error> {
+pub(crate) async fn get_video_paths_by_id(p: &SqlitePool, id: &str) -> Result<Vec<PathBuf>, sqlx::Error> {
     sqlx::query_scalar::<_, String>("SELECT path FROM file_path WHERE pre16mib_md5 = ? ORDER BY path")
         .bind(id).fetch_all(p).await
         .map(|paths| paths.into_iter().map(PathBuf::from).collect())
 }
 
 /// 返回文件地址表所有完整文件地址及其对应的文件大小
-pub async fn get_paths_and_size(pool: &SqlitePool) -> Result<HashMap<PathBuf, u64>, sqlx::Error> {
+pub(crate) async fn get_paths_and_size(pool: &SqlitePool) -> Result<HashMap<PathBuf, u64>, sqlx::Error> {
     let records = sqlx::query_as::<_, (String, u64)>(
         "SELECT fp.path, f.size FROM file_path AS fp JOIN file AS f ON f.pre16mib_md5 = fp.pre16mib_md5",
     ).fetch_all(pool).await?;
@@ -72,7 +72,7 @@ pub(crate) async fn delete_paths(pool: &SqlitePool, paths: &Vec<PathBuf>) -> Res
 }
 
 /// 只更新请求中显式提供的轨道偏好, 未提供的字段保持数据库原值.
-pub async fn save_track_preferences(
+pub(crate) async fn save_track_preferences(
     pool: &SqlitePool,
     pre16mib_md5: &str,
     audio: Option<Option<i32>>,
@@ -93,7 +93,7 @@ pub async fn save_track_preferences(
     Ok(())
 }
 
-pub async fn set_mock_identification(
+pub(crate) async fn set_mock_identification(
     pool: &SqlitePool,
     pre16mib_md5: &str,
 ) -> Result<(), sqlx::Error> {
@@ -107,7 +107,7 @@ pub async fn set_mock_identification(
     Ok(())
 }
 
-pub async fn get_progress(
+pub(crate) async fn get_progress(
     pool: &SqlitePool,
     pre16mib_md5: &str,
 ) -> Result<Option<WatchProgress>, sqlx::Error> {
@@ -119,7 +119,7 @@ pub async fn get_progress(
     .await
 }
 
-pub async fn save_progress(
+pub(crate) async fn save_progress(
     pool: &SqlitePool,
     pre16mib_md5: &str,
     position: f64,

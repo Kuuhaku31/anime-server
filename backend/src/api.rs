@@ -1,5 +1,3 @@
-
-// backend/src/api.rs
 //! 定义业务 API 路由和处理函数.
 //! 提供文件查询, 观看进度, 媒体扫描和播放 API 路由.
 
@@ -21,7 +19,7 @@ use crate::{
 mod playback;
 
 /// 构建业务 API 路由.
-pub fn router(state: AppState) -> Router {
+pub(crate) fn router(state: AppState) -> Router {
     Router::new()
     .route("/api/files", get(list_files))
     .route("/api/files/{pre16mib_md5}", get(get_file))
