@@ -1,6 +1,6 @@
 //! 封装 SQLite 数据访问操作.
 
-use crate::db::models::{FilePath, ScannedFile, VideoFile, WatchProgress};
+use crate::models::{FilePath, ScannedFile, VideoFile, WatchProgress};
 use sqlx::SqlitePool;
 
 // 同一指纹对应多个路径时仅展示排序后的第一条, 避免列表重复并保持展示结果稳定.

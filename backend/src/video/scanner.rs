@@ -9,9 +9,10 @@ use tracing::warn;
 use walkdir::WalkDir;
 
 use crate::{
+    models::{FilePath, ScannedFile},
     AppState,
     constants::VIDEO_ROOT,
-    db::{models::{FilePath, ScannedFile}, repository},
+    db::repository,
     video::metadata::MediaInfo,
     constants::{EXTENSIONS, HASH_LIMIT},
 };

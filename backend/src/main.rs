@@ -20,6 +20,7 @@ mod db;
 mod video;
 mod utils;
 mod constants;
+mod models;
 
 use config::AppConfig;
 use video::{cache::CacheManager, sessions::SessionManager, metadata::MetadataCache, process::Processes};

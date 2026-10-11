@@ -13,7 +13,8 @@ use axum::{
 use serde_json::json;
 
 use crate::{
-    db::{models::ProgressInput, repository},
+    models::ProgressInput,
+    db::{repository},
     video::scanner,
     AppState,
 };
