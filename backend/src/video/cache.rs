@@ -713,6 +713,8 @@ mod tests {
     async fn startup_does_not_activate_disk_entries_and_lru_includes_partial_caches() {
         // 不完整和完整目录都参与 LRU, 未知文件和目录保持不动.
         let root = std::env::temp_dir().join(format!("anime-active-lru-{}", random_id().unwrap()));
+        // 测试负责创建缓存挂载目录, 管理器要求根目录已经存在.
+        tokio::fs::create_dir(&root).await.unwrap();
         let config = PlaybackConfig { cache_max_bytes: 80, ..PlaybackConfig::default() };
         let manager = CacheManager::new(root.clone(), config, Processes::new(2, 16)).await.unwrap();
         for (name, age) in [('a', 1), ('b', 2)] {
@@ -736,6 +738,8 @@ mod tests {
         // 仅模拟已经发布的文件, 区分活动租约保护和退出集合后的文件打开保护.
         use tokio::io::AsyncReadExt;
         let root = std::env::temp_dir().join(format!("anime-media-pin-{}", random_id().unwrap()));
+        // 测试负责创建缓存挂载目录, 管理器要求根目录已经存在.
+        tokio::fs::create_dir(&root).await.unwrap();
         let config = PlaybackConfig { cache_max_bytes: 1, ..PlaybackConfig::default() };
         let manager = CacheManager::new(root.clone(), config, Processes::new(2, 16)).await.unwrap();
         let (info, request) = ffmpeg::fixture();
@@ -786,6 +790,8 @@ mod tests {
     async fn stop_is_revocable_but_a_finalizing_writer_must_exit_before_reactivation() {
         // 占满进程名额, 让测试只控制租约和停止边界, 不依赖真实编码速度.
         let root = std::env::temp_dir().join(format!("anime-reactivate-{}", random_id().unwrap()));
+        // 测试负责创建缓存挂载目录, 管理器要求根目录已经存在.
+        tokio::fs::create_dir(&root).await.unwrap();
         let processes = Processes::new(2, 16);
         let held = processes.slots.acquire_many(2).await.unwrap();
         let manager = CacheManager::new(root.clone(), PlaybackConfig::default(), processes.clone()).await.unwrap();
@@ -831,6 +837,8 @@ mod tests {
     async fn activation_io_failure_does_not_leave_an_unleased_active_entry() {
         // 用普通文件阻断目录创建, 同时触发恢复失败和最后释放时的 mtime 写入失败.
         let root = std::env::temp_dir().join(format!("anime-activation-failure-{}", random_id().unwrap()));
+        // 测试负责创建缓存挂载目录, 管理器要求根目录已经存在.
+        tokio::fs::create_dir(&root).await.unwrap();
         let manager = CacheManager::new(root.clone(), PlaybackConfig::default(), Processes::new(2, 16)).await.unwrap();
         let playback = root.join("playback");
         tokio::fs::remove_dir(&playback).await.unwrap();
@@ -851,6 +859,8 @@ mod tests {
     async fn publication_monitor_never_waits_for_the_future_it_is_polling() {
         // 模拟提交持锁等待磁盘, 防止监控分支与同一 select 中的提交 future 自锁.
         let root = std::env::temp_dir().join(format!("anime-publication-{}", random_id().unwrap()));
+        // 测试负责创建缓存挂载目录, 管理器要求根目录已经存在.
+        tokio::fs::create_dir(&root).await.unwrap();
         let processes = Processes::new(2, 16);
         let held = processes.slots.acquire_many(2).await.unwrap();
         let manager = CacheManager::new(root.clone(), PlaybackConfig::default(), processes.clone()).await.unwrap();

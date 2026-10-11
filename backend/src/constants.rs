@@ -2,6 +2,8 @@
 // backend/src/constants.rs
 //! 定义应用程序中使用的常量和配置参数.
 
+use std::path::Path;
+
 pub const EXTENSIONS: &[&str] = &["mp4", "mkv", "webm", "mov", "avi", "m4v"];
 pub const HASH_LIMIT: u64 = 16 * 1024 * 1024;
 
@@ -14,3 +16,6 @@ pub const DDP_ANI_CACHE_DIR: &str = "/data/ddp-ani";
 pub const DDP_DANMAKU_CACHE_DIR: &str = "/data/ddp-danmaku";
 pub const CACHE_DIR: &str = "/cache";
 pub const FALLBACK_FONT: &str = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc";
+
+
+pub(crate) fn video_root_path() -> &'static Path { Path::new(VIDEO_ROOT) }

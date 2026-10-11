@@ -189,6 +189,8 @@ mod tests {
     #[tokio::test]
     async fn an_abandoned_creation_reservation_expires_after_its_grace_period() {
         let root = std::env::temp_dir().join(format!("anime-pending-lease-{}", random_id().unwrap()));
+        // 测试负责创建缓存挂载目录, 管理器要求根目录已经存在.
+        tokio::fs::create_dir(&root).await.unwrap();
         let cache = CacheManager::new(root.clone(), PlaybackConfig::default(), Processes::new(2, 16)).await.unwrap();
         let manager = SessionManager::new(cache, 20);
         {
@@ -213,6 +215,8 @@ mod tests {
     async fn concurrent_sessions_share_one_entry_and_last_expiry_cancels_queued_work() {
         // 先占满媒体名额, 让最后释放发生在排队阶段, 不能意外启动编码.
         let root = std::env::temp_dir().join(format!("anime-active-leases-{}", random_id().unwrap()));
+        // 测试负责创建缓存挂载目录, 管理器要求根目录已经存在.
+        tokio::fs::create_dir(&root).await.unwrap();
         let processes = Processes::new(2, 16);
         let permit = processes.slots.acquire_many(2).await.unwrap();
         let cache = CacheManager::new(root.clone(), PlaybackConfig::default(), processes.clone()).await.unwrap();

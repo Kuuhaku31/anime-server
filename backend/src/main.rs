@@ -28,6 +28,8 @@ use video::{cache::CacheManager, sessions::SessionManager, metadata::MetadataCac
 use tokio::time::{sleep, Duration};
 use tracing::{info, warn};
 
+use crate::{models::ScanChanges, video::scanner};
+use crate::db::repository as db_repository;
 
 #[derive(Clone)]
 /// 应用状态
@@ -99,8 +101,10 @@ async fn main() -> Result<()> {
     let s = state.clone();
     tokio::spawn(async move {
         loop {
-            match crate::video::scanner::scan_once(&s).await {
-                Ok(count) => info!("video scan completed: {} files", count),
+            match scan_once(&s).await {
+                Ok(ScanChanges { added, removed, count }) => 
+                info!("video scan completed: {} files, {} added, {} removed", 
+                count, added.len(), removed.len()),
                 Err(e) => warn!("video scan failed: {}", e),
             }
             sleep(Duration::from_secs(s.config.scan_interval_seconds)).await;
@@ -144,4 +148,23 @@ async fn main() -> Result<()> {
     info!("Anime Server exited gracefully");
 
     Ok(())
+}
+
+
+pub(crate) async fn scan_once(state: &AppState) -> Result<ScanChanges, String> {
+
+    // 获取数据库中已知的路径列表
+    let paths_in_db = db::repository::get_paths(&state.db).await
+    .map_err(|e| format!("failed to read paths from database: {e}"))?;
+
+    // 据此扫描视频目录, 返回新增和删除的文件列表
+    let changes = scanner::scan_once(&state.scan_lock, paths_in_db).await?;
+
+    // 写入失败必须返回扫描错误, 避免旧路径未更新却向客户端报告成功.
+    db_repository::update(&state.db, &changes).await
+        .map_err(|e| format!("failed to update scanned files in database: {e}"))?;
+
+    info!("scan_once: {} files scanned, {} added, {} removed", changes.count, changes.added.len(), changes.removed.len());
+
+    Ok(changes)
 }

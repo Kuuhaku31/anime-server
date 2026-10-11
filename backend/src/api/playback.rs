@@ -271,9 +271,7 @@ async fn metadata(
         .await.map_err(|e| e.to_string())?;
 
         // 遍历路径
-        for entry in paths {
-
-            let f = root.join(entry.relative_path());
+        for f in paths {
 
             let resolved = match tokio::fs::canonicalize(&f).await {
                 Ok(path) => path,

@@ -2,11 +2,18 @@
 // backend/src/utils.rs
 //! 工具函数和辅助模块.
 
+use std::fs::File;
+use std::path::Path;
+
 use anyhow::{ensure, Result};
+use md5::Md5;
 use tokio::process::Command;
 
 use crate::video::process::checked_output;
 use crate::constants::FALLBACK_FONT;
+
+use std::io::Read;
+use md5::Digest;
 
 
 // 确认 http 服务存活
@@ -65,4 +72,28 @@ pub(crate) fn check_sha256(input: &str) -> Result<String, String> {
     }
 
     Ok(input.to_ascii_lowercase())
+}
+
+
+// 输入文件路径和大小限制, 计算文件从头开始指定范围的 MD5 哈希前缀.
+pub(crate) fn md5_hash_prefix(path: &Path, limit: u64) -> Result<String, String> {
+
+    let mut file = File::open(path).map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
+    let mut hasher = Md5::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    let mut remaining = limit;
+
+    while remaining > 0 {
+        let read_limit = usize::try_from(remaining.min(buffer.len() as u64)).map_err(|e| e.to_string())?;
+        let bytes_read = file
+            .read(&mut buffer[..read_limit])
+            .map_err(|e| format!("failed to read {}: {}", path.display(), e))?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+        remaining -= bytes_read as u64;
+    }
+
+    Ok(format!("{:x}", hasher.finalize()))
 }

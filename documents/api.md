@@ -54,13 +54,13 @@
     "danmaku_offset": 0.0,
     "watch_pos": 125.5,
     "watched_datetime": "2026-10-10T07:00:00.000Z",
-    "path": "series",
+    "path": "/media/series",
     "name_no_ext": "episode",
     "extension": "mkv"
   },
   "paths": [
     {
-      "path": "series",
+      "path": "/media/series",
       "name_no_ext": "episode",
       "extension": "mkv",
       "pre16mib_md5": "35af6d912b6dffadc112df2ca94bbe2f"
@@ -69,7 +69,8 @@
 }
 ```
 
-`paths` 包含该指纹的全部数据库路径, `path` 相对于媒体根目录.
+`paths` 包含该指纹的全部数据库路径, `path` 是容器内文件所在目录的绝对地址,
+不包含文件名. 拼接 `name_no_ext.extension` 后得到完整文件地址.
 详情接口不检查每个副本当前是否仍存在, 也不返回原始媒体播放 URL.
 播放前会重新查找可用副本并验证规范化路径仍位于媒体根目录.
 

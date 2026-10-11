@@ -15,7 +15,6 @@ use serde_json::json;
 use crate::{
     models::ProgressInput,
     db::{repository},
-    video::scanner,
     AppState,
 };
 
@@ -130,12 +129,12 @@ async fn save_progress(
 
 /// 执行一次媒体目录扫描.
 async fn scan(State(state): State<AppState>) -> impl IntoResponse {
-    match scanner::scan_once(&state).await {
-        Ok(count) => (
+    match crate::scan_once(&state).await {
+        Ok(change) => (
             StatusCode::OK,
             Json(json!({
                 "ok": true,
-                "scanned": count,
+                "scanned": change.count,
             })),
         )
             .into_response(),
