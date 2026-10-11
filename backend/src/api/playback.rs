@@ -267,7 +267,7 @@ async fn metadata(
 
         let root = tokio::fs::canonicalize(VIDEO_ROOT)
         .await.map_err(|e| e.to_string())?;
-        let paths = repository::get_paths(&state.db, &id)
+        let paths = repository::get_video_paths_by_id(&state.db, &id)
         .await.map_err(|e| e.to_string())?;
 
         // 遍历路径

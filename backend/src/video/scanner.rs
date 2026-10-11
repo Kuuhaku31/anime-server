@@ -206,7 +206,7 @@ mod tests {
         repository::sync_scanned_files(&pool, &first.added, &first.removed).await.unwrap();
         repository::save_progress(&pool, &id, 12.5).await.unwrap();
         repository::set_mock_identification(&pool, &id).await.unwrap();
-        let initial = repository::get_video(&pool, &id).await.unwrap().unwrap();
+        let initial = repository::get_video_by_id(&pool, &id).await.unwrap().unwrap();
         assert_eq!(initial.audio_stream_index, Some(1));
         assert_eq!(initial.subtitle_stream_index, Some(2));
         let rowid: i64 = sqlx::query_scalar("SELECT rowid FROM file_path WHERE path = ''")
@@ -221,7 +221,7 @@ mod tests {
         repository::sync_scanned_files(&pool, &unchanged.added, &unchanged.removed).await.unwrap();
         assert_eq!(sqlx::query_scalar::<_, i64>("SELECT rowid FROM file_path WHERE path = ''")
             .fetch_one(&pool).await.unwrap(), rowid);
-        assert_eq!(repository::get_video(&pool, &id).await.unwrap().unwrap().size, 8);
+        assert_eq!(repository::get_video_by_id(&pool, &id).await.unwrap().unwrap().size, 8);
 
         std::fs::remove_file(root.join("first.mkv")).unwrap();
         std::fs::rename(root.join("series/copy.MKV"), root.join("renamed.mp4")).unwrap();
@@ -231,7 +231,7 @@ mod tests {
         assert_eq!(moved.added.len(), 2);
         assert_eq!(moved.removed.len(), 2);
         repository::sync_scanned_files(&pool, &moved.added, &moved.removed).await.unwrap();
-        let video = repository::get_video(&pool, &id).await.unwrap().unwrap();
+        let video = repository::get_video_by_id(&pool, &id).await.unwrap().unwrap();
         assert_eq!(video.name, "renamed.mp4");
         assert_eq!(video.watch_pos, Some(12.5));
         assert_eq!(video.ddp_epi_id, Some(1));
@@ -243,14 +243,14 @@ mod tests {
         assert_eq!(removed.count, 1);
         assert!(removed.added.is_empty());
         repository::sync_scanned_files(&pool, &removed.added, &removed.removed).await.unwrap();
-        assert!(repository::get_paths(&pool, &id).await.unwrap().is_empty());
+        assert!(repository::get_video_paths_by_id(&pool, &id).await.unwrap().is_empty());
         assert_eq!(repository::get_progress(&pool, &id).await.unwrap().unwrap().watch_pos, Some(12.5));
 
         // 最后一个副本消失后恢复同内容文件, 仍复用原观看进度和识别信息.
         std::fs::write(root.join("restored.mkv"), b"original").unwrap();
         let restored = collect_files(&root, repository::list_paths(&pool).await.unwrap()).unwrap();
         repository::sync_scanned_files(&pool, &restored.added, &restored.removed).await.unwrap();
-        let restored = repository::get_video(&pool, &id).await.unwrap().unwrap();
+        let restored = repository::get_video_by_id(&pool, &id).await.unwrap().unwrap();
         assert_eq!(restored.watch_pos, Some(12.5));
         assert_eq!(restored.audio_stream_index, Some(1));
         assert_eq!(restored.subtitle_stream_index, Some(2));

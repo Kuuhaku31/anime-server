@@ -41,7 +41,7 @@ async fn get_config(State(state): State<AppState>) -> impl IntoResponse {
 
 /// 获取全部视频记录.
 async fn list_files(State(state): State<AppState>) -> impl IntoResponse {
-    match repository::list_videos(&state.db).await {
+    match repository::get_videos(&state.db).await {
         Ok(items) => (StatusCode::OK, Json(items)).into_response(),
         Err(error) => internal_error(error),
     }
@@ -52,13 +52,13 @@ async fn get_file(
     State(state): State<AppState>,
     Path(pre16mib_md5): Path<String>,
 ) -> impl IntoResponse {
-    let video = match repository::get_video(&state.db, &pre16mib_md5).await {
+    let video = match repository::get_video_by_id(&state.db, &pre16mib_md5).await {
         Ok(Some(video)) => video,
         Ok(None) => return not_found(),
         Err(error) => return internal_error(error),
     };
 
-    let paths = match repository::get_paths(&state.db, &pre16mib_md5).await {
+    let paths = match repository::get_video_paths_by_id(&state.db, &pre16mib_md5).await {
         Ok(paths) => paths,
         Err(error) => return internal_error(error),
     };

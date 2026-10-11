@@ -28,30 +28,28 @@ const VIDEO_SELECT: &str = r#"
     )
 "#;
 
-pub async fn list_videos(pool: &SqlitePool) -> Result<Vec<VideoFile>, sqlx::Error> {
+
+/// 获取全部视频记录, 按路径, 文件名和扩展名排序.
+pub async fn get_videos(p: &SqlitePool) -> Result<Vec<VideoFile>, sqlx::Error> {
     let query = format!("{VIDEO_SELECT} ORDER BY fp.name_no_ext, fp.extension, fp.path");
-    sqlx::query_as::<_, VideoFile>(&query).fetch_all(pool).await
+    sqlx::query_as::<_, VideoFile>(&query).fetch_all(p).await
 }
 
-pub async fn get_video(
-    pool: &SqlitePool,
-    pre16mib_md5: &str,
-) -> Result<Option<VideoFile>, sqlx::Error> {
+/// 获取指定文件指纹的数据库记录.
+pub async fn get_video_by_id(p: &SqlitePool, id: &str) -> Result<Option<VideoFile>, sqlx::Error> {
     let query = format!("{VIDEO_SELECT} WHERE f.pre16mib_md5 = ?");
     sqlx::query_as::<_, VideoFile>(&query)
-        .bind(pre16mib_md5)
-        .fetch_optional(pool)
-        .await
+    .bind(id).fetch_optional(p).await
 }
 
-pub async fn get_paths(pool: &SqlitePool, pre16mib_md5: &str) -> Result<Vec<FilePath>, sqlx::Error> {
+pub async fn get_video_paths_by_id(p: &SqlitePool, id: &str) -> Result<Vec<FilePath>, sqlx::Error> {
 
     sqlx::query_as::<_, FilePath>
 
 ("SELECT path, name_no_ext, extension, pre16mib_md5 FROM file_path WHERE pre16mib_md5 = ? ORDER BY path, name_no_ext, extension")
 
-    .bind(pre16mib_md5)
-    .fetch_all(pool)
+    .bind(id)
+    .fetch_all(p)
     .await
 }
 
