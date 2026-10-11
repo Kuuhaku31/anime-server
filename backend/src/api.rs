@@ -13,7 +13,7 @@ use serde_json::json;
 use tracing::info;
 
 use crate::{
-    AppState, db::repository, models::ProgressInput, scanner,
+    AppState, db, models::ProgressInput, scanner,
 };
 
 mod playback;
@@ -39,7 +39,7 @@ async fn get_config(State(state): State<AppState>) -> impl IntoResponse {
 
 /// 获取全部视频记录.
 async fn list_files(State(state): State<AppState>) -> impl IntoResponse {
-    match repository::get_video_files(&state.db).await {
+    match db::get_video_files(&state.db).await {
         Ok(items) => (StatusCode::OK, Json(items)).into_response(),
         Err(error) => internal_error(error),
     }
@@ -50,13 +50,13 @@ async fn get_file(
     State(state): State<AppState>,
     Path(pre16mib_md5): Path<String>,
 ) -> impl IntoResponse {
-    let video = match repository::get_video_by_id(&state.db, &pre16mib_md5).await {
+    let video = match db::get_video_by_id(&state.db, &pre16mib_md5).await {
         Ok(Some(video)) => video,
         Ok(None) => return not_found(),
         Err(error) => return internal_error(error),
     };
 
-    let paths = match repository::get_video_paths_by_id(&state.db, &pre16mib_md5).await {
+    let paths = match db::get_video_paths_by_id(&state.db, &pre16mib_md5).await {
         Ok(paths) => paths,
         Err(error) => return internal_error(error),
     };
@@ -76,7 +76,7 @@ async fn identify_file(
     State(state): State<AppState>,
     Path(pre16mib_md5): Path<String>,
 ) -> impl IntoResponse {
-    match repository::set_mock_identification(&state.db, &pre16mib_md5).await {
+    match db::set_mock_identification(&state.db, &pre16mib_md5).await {
         Ok(()) => (
             StatusCode::OK,
             Json(json!({
@@ -96,7 +96,7 @@ async fn get_progress(
     State(state): State<AppState>,
     Path(pre16mib_md5): Path<String>,
 ) -> impl IntoResponse {
-    match repository::get_progress(&state.db, &pre16mib_md5).await {
+    match db::get_progress(&state.db, &pre16mib_md5).await {
         Ok(Some(progress)) => (StatusCode::OK, Json(progress)).into_response(),
         Ok(None) => not_found(),
         Err(error) => internal_error(error),
@@ -119,7 +119,7 @@ async fn save_progress(
             .into_response();
     }
 
-    match repository::save_progress(&state.db, &pre16mib_md5, input.position).await {
+    match db::save_progress(&state.db, &pre16mib_md5, input.position).await {
         Ok(()) => (StatusCode::NO_CONTENT, "").into_response(),
         Err(sqlx::Error::RowNotFound) => not_found(),
         Err(error) => internal_error(error),

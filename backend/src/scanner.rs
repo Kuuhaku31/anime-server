@@ -8,7 +8,7 @@ use tracing::info;
 use walkdir::WalkDir;
 
 use crate::{
-    AppState, constants::{self, EXTENSIONS}, db::repository, models::{ScanChanges, ScannedFile},
+    AppState, constants::{self, EXTENSIONS}, db, models::{ScanChanges, ScannedFile},
 };
 
 
@@ -30,7 +30,7 @@ pub(crate) async fn scan_root(state: &AppState) -> Result<ScanChanges, String> {
     let _scan = state.scan_lock.lock().await;
     info!("扫描媒体目录开始: {}", constants::video_root_path().display());
 
-    let path_and_size_in_db = repository::get_paths_and_size(&state.db).await
+    let path_and_size_in_db = db::get_paths_and_size(&state.db).await
     .map_err(|error| format!("failed to read paths and sizes from database: {error}"))?;
     let root = tokio::fs::canonicalize(constants::video_root_path()).await
     .map_err(|error| format!("cannot resolve media directory: {error}"))?;
@@ -60,7 +60,7 @@ pub(crate) async fn scan_root(state: &AppState) -> Result<ScanChanges, String> {
             },
         };
 
-        match repository::upsert_file(&state.db, &file).await {
+        match db::upsert_file(&state.db, &file).await {
             Ok(()) => added += 1,
             Err(error) => tracing::error!(path = %file.path().display(), "failed to update scanned file: {error}"),
         }
@@ -76,7 +76,7 @@ pub(crate) async fn scan_root(state: &AppState) -> Result<ScanChanges, String> {
         .cloned()
         .collect();
     if !need_delete.is_empty() {
-        repository::delete_paths(&state.db, &need_delete).await.map_err(|error| error.to_string())?;
+        db::delete_paths(&state.db, &need_delete).await.map_err(|error| error.to_string())?;
         removed = need_delete.len() as u64;
     }
 
@@ -120,10 +120,10 @@ pub(crate) async fn scan_file(state: &AppState, path: &Path) -> Result<Option<Sc
     // 如果扫描结果为 Some, 则将扫描结果写入数据库, 覆盖原有路径关联.
     if let Some(f) = file.as_ref() {
         info!("服务端完成单文件扫描请求: {:?}, hash: {:?}", path, f.pre16mib_md5());
-        repository::upsert_file(&state.db, f).await.map_err(|error| error.to_string())?;
+        db::upsert_file(&state.db, f).await.map_err(|error| error.to_string())?;
     } else {
         info!("服务端完成单文件扫描请求: {:?}, 文件不存在或不在媒体目录内", path);
-        repository::delete_path(&state.db, path).await.map_err(|error| error.to_string())?;
+        db::delete_path(&state.db, path).await.map_err(|error| error.to_string())?;
     };
 
     Ok(file)
@@ -157,13 +157,13 @@ mod tests {
         let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1)
             .connect("sqlite::memory:").await.unwrap();
         sqlx::raw_sql(include_str!("../sql/init.sql")).execute(&pool).await.unwrap();
-        crate::db::repository::upsert_file(&pool, &first).await.unwrap();
+        db::upsert_file(&pool, &first).await.unwrap();
         let old_id = first.pre16mib_md5().to_owned();
-        crate::db::repository::save_progress(&pool, &old_id, 12.5).await.unwrap();
+        db::save_progress(&pool, &old_id, 12.5).await.unwrap();
         // 另一个内容相同的副本不应被该地址的强制扫描删除.
         let sibling = root.join("copy.mkv");
         std::fs::write(&sibling, b"first").unwrap();
-        crate::db::repository::upsert_file(&pool, &ScannedFile::new(&sibling).unwrap()).await.unwrap();
+        db::upsert_file(&pool, &ScannedFile::new(&sibling).unwrap()).await.unwrap();
         #[cfg(unix)]
         {
             // 文件构造保留符号链接原地址, 不替换为目标地址.
@@ -178,17 +178,17 @@ mod tests {
         let second = ScannedFile::new(&path).unwrap();
         assert_ne!(first.pre16mib_md5(), second.pre16mib_md5());
         assert_eq!(second.size(), 14);
-        crate::db::repository::upsert_file(&pool, &second).await.unwrap();
-        assert_eq!(crate::db::repository::get_video_paths_by_id(&pool, &old_id).await.unwrap(), vec![sibling.clone()]);
-        assert_eq!(crate::db::repository::get_progress(&pool, &old_id).await.unwrap().unwrap().watch_pos, Some(12.5));
+        db::upsert_file(&pool, &second).await.unwrap();
+        assert_eq!(db::get_video_paths_by_id(&pool, &old_id).await.unwrap(), vec![sibling.clone()]);
+        assert_eq!(db::get_progress(&pool, &old_id).await.unwrap().unwrap().watch_pos, Some(12.5));
         let new_id = second.pre16mib_md5();
-        assert_eq!(crate::db::repository::get_video_paths_by_id(&pool, new_id).await.unwrap(), vec![path.clone()]);
+        assert_eq!(db::get_video_paths_by_id(&pool, new_id).await.unwrap(), vec![path.clone()]);
         std::fs::remove_file(&path).unwrap();
         // 文件已消失时构造失败, 独立删除数据库地址仍保留业务记录.
         assert!(ScannedFile::new(&path).is_err());
-        crate::db::repository::delete_path(&pool, &path).await.unwrap();
-        assert_eq!(crate::db::repository::get_paths_and_size(&pool).await.unwrap().into_keys().collect::<Vec<_>>(), vec![sibling.clone()]);
-        assert!(crate::db::repository::get_progress(&pool, new_id).await.unwrap().is_some());
+        db::delete_path(&pool, &path).await.unwrap();
+        assert_eq!(db::get_paths_and_size(&pool).await.unwrap().into_keys().collect::<Vec<_>>(), vec![sibling.clone()]);
+        assert!(db::get_progress(&pool, new_id).await.unwrap().is_some());
         std::fs::remove_file(sibling).unwrap();
         std::fs::remove_dir(&root).unwrap();
     }
@@ -255,7 +255,7 @@ mod tests {
                 assert!(error.starts_with("invalid media file path:"));
             }
         }
-        assert!(repository::get_paths_and_size(&state.db).await.unwrap().is_empty());
+        assert!(db::get_paths_and_size(&state.db).await.unwrap().is_empty());
         // 关闭数据库确保全目录入口在读取路径时失败, 不遍历或更新真实媒体.
         state.db.close().await;
         assert!(scan_root(&state).await.err().unwrap().starts_with("failed to read paths and sizes from database:"));

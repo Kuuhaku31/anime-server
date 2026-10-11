@@ -16,7 +16,7 @@ use tower_http::services::ServeFile;
 use tracing::warn;
 
 use crate::{
-    AppState, constants::VIDEO_ROOT, db::repository, utils, video::{
+    AppState, constants::VIDEO_ROOT, db, utils, video::{
         ffmpeg::{EncodeSpec, PlaybackRequest},
         metadata::MediaInfo,
         sessions::{PlaybackStart, SessionStatus},
@@ -109,7 +109,7 @@ async fn play(
 
     let (source, info) = metadata(&state, &id, false).await?;
 
-    let progress = repository::get_progress(&state.db, &id)
+    let progress = db::get_progress(&state.db, &id)
         .await
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::missing("file not found"))?;
@@ -121,7 +121,7 @@ async fn play(
     let spec = EncodeSpec::new(&id, source, info, request, progress.watch_pos).map_err(ApiError::bad)?;
 
     // 只保存本次请求显式提交的选择, null 也表示将对应偏好设为关闭.
-    repository::save_track_preferences(
+    db::save_track_preferences(
         &state.db, &id, audio_preference, subtitle_preference,
     ).await.map_err(ApiError::internal)?;
 
@@ -265,7 +265,7 @@ async fn metadata(
 
         let root = tokio::fs::canonicalize(VIDEO_ROOT)
         .await.map_err(|e| e.to_string())?;
-        let paths = repository::get_video_paths_by_id(&state.db, &id)
+        let paths = db::get_video_paths_by_id(&state.db, &id)
         .await.map_err(|e| e.to_string())?;
 
         // 遍历路径

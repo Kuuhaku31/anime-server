@@ -5,10 +5,7 @@ use tracing::error;
 
 use anyhow::Result;
 use axum::{routing::get, Json};
-use sqlx::{
-    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
-    SqlitePool,
-};
+use sqlx::SqlitePool;
 use tokio::{net::TcpListener, signal::unix::SignalKind};
 use tower_http::{services::ServeDir, trace::TraceLayer};
 
@@ -68,19 +65,6 @@ async fn main() -> Result<()> {
     }
     info!("tools check passed, ffmpeg and ffprobe are available");
 
-    // 初始化数据库连接池, 并执行初始化 SQL 脚本, 创建必要的表和索引
-    let database_options = SqliteConnectOptions::new()
-    .filename(constants::DATABASE_PATH)
-    .create_if_missing(true)
-    .foreign_keys(true);
-    let pool = SqlitePoolOptions::new()
-    .max_connections(5)
-    .connect_with(database_options)
-    .await?;
-    sqlx::raw_sql(include_str!("../sql/init.sql"))
-    .execute(&pool)
-    .await?;
-    info!("database initialized at {}", constants::DATABASE_PATH);
 
     // 探测, 资源准备, 编码和解码校验共用进程预算, 防止不同模块各自突破全局上限.
     let processes = Processes::new(config.playback.max_processes, config.playback.max_total_ffmpeg_threads);
@@ -89,7 +73,7 @@ async fn main() -> Result<()> {
     let playback = SessionManager::new(cache, config.playback.idle_timeout_seconds);
     let metadata = MetadataCache::new(processes);
     let state = AppState {
-        db: pool,
+        db: db::initialize_database().await?,
         config: Arc::new(config),
         metadata, playback: playback.clone(),
         scan_lock: Arc::new(tokio::sync::Mutex::new(())),
