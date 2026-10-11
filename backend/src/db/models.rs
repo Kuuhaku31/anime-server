@@ -8,6 +8,8 @@ pub struct VideoFile {
     pub pre16mib_md5: String,
     pub name: String,
     pub size: i64,
+    pub audio_stream_index: Option<i32>,
+    pub subtitle_stream_index: Option<i32>,
     pub ddp_epi_id: Option<i64>,
     pub danmaku_offset: f64,
     pub watch_pos: Option<f64>,
@@ -41,6 +43,8 @@ impl FilePath {
 pub struct ScannedFile {
     pub pre16mib_md5: String,
     pub size: i64,
+    pub audio_stream_index: Option<i32>,
+    pub subtitle_stream_index: Option<i32>,
     pub path: String,
     pub name_no_ext: String,
     pub extension: String,
@@ -57,4 +61,6 @@ pub struct WatchProgress {
     pub pre16mib_md5: String,
     pub watch_pos: Option<f64>,
     pub watched_datetime: Option<String>,
+    pub audio_stream_index: Option<i32>,
+    pub subtitle_stream_index: Option<i32>,
 }

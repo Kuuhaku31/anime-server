@@ -43,3 +43,26 @@ pub async fn check_tools() -> Result<()> {
     ensure!(std::path::Path::new(FALLBACK_FONT).is_file(), "CJK fallback font is missing");
     Ok(())
 }
+
+
+/// 检查字符串是否符合预期的文件名 MD5 哈希格式, 自动转换为小写十六进制字符.
+#[allow(dead_code)]
+pub(crate) fn check_md5(input: &str) -> Result<String, String> {
+
+    if !(input.len() == 32 && input.bytes().all(|byte| byte.is_ascii_hexdigit())) {
+        return Err(format!("invalid MD5 hash: {}", input));
+    }
+
+    Ok(input.to_ascii_lowercase())
+}
+
+/// 检查字符串是否符合预期的文件名 SHA256 哈希格式, 自动转换为小写十六进制字符.
+#[allow(dead_code)]
+pub(crate) fn check_sha256(input: &str) -> Result<String, String> {
+
+    if !(input.len() == 64 && input.bytes().all(|byte| byte.is_ascii_hexdigit())) {
+        return Err(format!("invalid SHA256 hash: {}", input));
+    }
+
+    Ok(input.to_ascii_lowercase())
+}

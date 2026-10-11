@@ -15,12 +15,22 @@ use super::{assets::RenderAssets, cache::{is_key, PlaybackVariantConfig, ENCODER
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlaybackRequest {
+
     // 缺省表示服务端选轨, 显式 null 表示关闭, 两者不能混为一谈.
     #[serde(default, deserialize_with = "track_choice")]
     pub audio_stream_index: Option<Option<i32>>,
     #[serde(default, deserialize_with = "track_choice")]
     pub subtitle_stream_index: Option<Option<i32>>,
     pub position: Option<f64>,
+}
+
+impl PlaybackRequest {
+    /// 仅将缺省字段补为数据库偏好, 显式 null 仍表示本次关闭对应轨道.
+    pub fn with_preferences(mut self, audio: Option<i32>, subtitle: Option<i32>) -> Self {
+        if self.audio_stream_index.is_none() { self.audio_stream_index = Some(audio); }
+        if self.subtitle_stream_index.is_none() { self.subtitle_stream_index = Some(subtitle); }
+        self
+    }
 }
 
 fn track_choice<'de, D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Option<Option<i32>>, D::Error> {
@@ -453,6 +463,28 @@ mod tests {
         assert_eq!(changed.config.audio_stream, None);
         assert_eq!(changed.config.subtitle_stream, Some(2));
         assert_eq!(EncodeSpec::new(&"a".repeat(32), "video".into(), info, PlaybackRequest::default(), Some(19.0)).unwrap().target, 0.0);
+    }
+
+    #[test]
+    fn saved_tracks_fill_only_omitted_fields() {
+        let omitted: PlaybackRequest = serde_json::from_str("{}").unwrap();
+        let resolved = omitted.with_preferences(Some(4), Some(7));
+        assert_eq!(resolved.audio_stream_index, Some(Some(4)));
+        assert_eq!(resolved.subtitle_stream_index, Some(Some(7)));
+
+        let (info, _) = fixture();
+        let chosen = PlaybackRequest::default().with_preferences(Some(1), Some(2));
+        let spec = EncodeSpec::new(&"a".repeat(32), "video".into(), info.clone(), chosen, None).unwrap();
+        assert_eq!(spec.config.audio_stream, Some(1));
+        assert_eq!(spec.config.subtitle_stream, Some(2));
+
+        let explicit: PlaybackRequest = serde_json::from_str(r#"{"audio_stream_index":null}"#).unwrap();
+        let resolved = explicit.with_preferences(Some(4), Some(2));
+        assert_eq!(resolved.audio_stream_index, Some(None));
+        assert_eq!(resolved.subtitle_stream_index, Some(Some(2)));
+        let spec = EncodeSpec::new(&"a".repeat(32), "video".into(), info, resolved, None).unwrap();
+        assert_eq!(spec.config.audio_stream, None);
+        assert_eq!(spec.config.subtitle_stream, Some(2));
     }
 
     #[test]

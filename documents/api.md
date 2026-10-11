@@ -35,6 +35,7 @@
 ## 文件查询与识别
 
 `GET /api/files` 返回 `200` 和视频记录数组. 每条记录包含 `pre16mib_md5`, `name`, `size`,
+`audio_stream_index`, `subtitle_stream_index`,
 `ddp_epi_id`, `danmaku_offset`, `watch_pos`, `watched_datetime`, `path`, `name_no_ext`, `extension`.
 大小单位为字节, 观看位置和弹幕偏移单位为秒. 尚无业务数据的可空字段返回 `null`.
 同一指纹存在多个副本时, 按路径, 文件名和扩展名排序选择第一条展示, 不重复列出所有副本.
@@ -47,6 +48,8 @@
     "pre16mib_md5": "35af6d912b6dffadc112df2ca94bbe2f",
     "name": "episode.mkv",
     "size": 104857600,
+    "audio_stream_index": 1,
+    "subtitle_stream_index": null,
     "ddp_epi_id": null,
     "danmaku_offset": 0.0,
     "watch_pos": 125.5,
@@ -82,11 +85,14 @@
 {
   "pre16mib_md5": "35af6d912b6dffadc112df2ca94bbe2f",
   "watch_pos": 125.5,
-  "watched_datetime": "2026-10-10T07:00:00.000Z"
+  "watched_datetime": "2026-10-10T07:00:00.000Z",
+  "audio_stream_index": 1,
+  "subtitle_stream_index": null
 }
 ```
 
 未保存进度时, `watch_pos` 和 `watched_datetime` 为 `null`.
+该响应还包含文件保存的默认音轨和字幕轨索引, 没有选择的轨道为 `null`.
 `PUT /api/files/{file_id}/progress` 接收 `{"position":125.5}`, 成功返回 `204`, 无响应体.
 位置必须为有限且非负的原视频绝对秒数, 当前此接口不校验是否超过视频时长.
 保存时同时更新 UTC 观看时间. 进度按文件指纹持久化, 不随会话释放或缓存淘汰删除.
@@ -99,10 +105,11 @@
 `POST /api/scan` 无需请求体, 等待媒体目录收集及数据库同步完成后返回
 `200` 和 `{"ok":true,"scanned":744}`. `scanned` 是本次扫描得到的文件路径数量,
 同一内容的多个副本分别计数, 不是去重后的指纹数量.
-扫描先读取数据库全部路径, 与目录列表比对, 仅对新路径读取前 16 MiB 计算 MD5.
-地址同时存在于数据库和目录时默认文件未变, 不重算哈希或更新大小.
+扫描先读取数据库全部路径, 与目录列表比对, 仅对新路径读取前 16 MiB 计算 MD5 并探测默认轨道.
+地址同时存在于数据库和目录时默认文件未变, 不重算哈希, 不重新探测轨道或更新大小.
 完整收集失败时不会更新数据库路径快照. 同步在事务内插入新路径并删除失效路径,
 保留没有现存副本的 `file` 记录及观看进度等业务数据.
+新文件探测失败会记录警告并继续扫描, 其轨道偏好保存为 `null`.
 
 ## 媒体探测
 
@@ -185,8 +192,11 @@ curl -X POST http://localhost:56080/api/files/FILE_ID/playback \
 }
 ```
 
-`audio_stream_index: null` 表示无音轨, `subtitle_stream_index: null` 表示关闭字幕.
-省略轨道字段则使用服务端默认选择, 和显式 `null` 不同.
+`audio_stream_index: null` 表示关闭音轨, `subtitle_stream_index: null` 表示关闭字幕.
+省略轨道字段则使用数据库中保存的偏好, 不同于显式 `null`.
+扫描新文件时默认选中标记为 default 的音轨, 否则选第一条; 默认字幕优先选择 default 或 forced,
+没有匹配字幕则保存 `null`. 播放请求显式指定的轨道选择会覆盖并保存对应偏好,
+因此之后省略该字段时使用最近保存的选择. 某一个字段省略时只沿用该字段偏好, 不会覆盖它.
 客户端不能指定视频索引, 缓存键, 路径或编码配置版本, 未知请求字段会被拒绝.
 `position` 必须有限, 非负且小于视频时长; 省略或 `null` 表示读取数据库进度.
 位置只影响会话目标和下次启动时的线程申请, 不进入播放配置或缓存键.

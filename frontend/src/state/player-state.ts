@@ -3,6 +3,8 @@ export interface VideoFile {
   pre16mib_md5: string;
   name: string;
   size: number;
+  audio_stream_index: number | null;
+  subtitle_stream_index: number | null;
   ddp_epi_id: number | null;
   danmaku_offset: number;
   watch_pos: number | null;

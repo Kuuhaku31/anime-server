@@ -5,12 +5,14 @@
 use std::{collections::HashMap, fs::File, io::Read, path::{Path, PathBuf}};
 use anyhow::{Context, Result};
 use md5::{Digest, Md5};
+use tracing::warn;
 use walkdir::WalkDir;
 
 use crate::{
     AppState,
     constants::VIDEO_ROOT,
     db::{models::{FilePath, ScannedFile}, repository},
+    video::metadata::MediaInfo,
     constants::{EXTENSIONS, HASH_LIMIT},
 };
 
@@ -25,7 +27,24 @@ pub async fn scan_once(state: &AppState) -> Result<u64> {
     let known = repository::list_paths(&state.db).await?;
     let root = PathBuf::from(VIDEO_ROOT);
     // 同步目录遍历和新文件哈希放到阻塞线程池, 完整收集失败时不提交任何变更.
-    let changes = tokio::task::spawn_blocking(move || collect_files(&root, known)).await??;
+    let mut changes = tokio::task::spawn_blocking({
+        let root = root.clone();
+        move || collect_files(&root, known)
+    }).await??;
+    // 新路径仅探测一次并记录默认轨, 探测失败仍保留文件扫描结果并明确记录警告.
+    for file in &mut changes.added {
+        let source = root.join(if file.path.is_empty() {
+            format!("{}.{}", file.name_no_ext, file.extension)
+        } else {
+            format!("{}/{}.{}", file.path, file.name_no_ext, file.extension)
+        });
+        match state.metadata.get(&file.pre16mib_md5, &source, false).await {
+            Ok(info) => {
+                (file.audio_stream_index, file.subtitle_stream_index) = default_tracks(&info);
+            }
+            Err(error) => warn!(file_id = file.pre16mib_md5, "default track probe failed: {error:#}"),
+        }
+    }
     repository::sync_scanned_files(&state.db, &changes.added, &changes.removed).await?;
     Ok(changes.count)
 }
@@ -92,6 +111,8 @@ fn scan_file(root: &Path, absolute_path: &Path) -> Result<ScannedFile> {
     Ok(ScannedFile {
         pre16mib_md5: hash_prefix(absolute_path)?,
         size: metadata.len() as i64,
+        audio_stream_index: None,
+        subtitle_stream_index: None,
         path,
         name_no_ext,
         extension,
@@ -131,10 +152,38 @@ fn is_video(path: &Path) -> bool {
     .unwrap_or(false)
 }
 
+/// 新文件沿用点播默认策略: 默认音轨否则第一轨, 默认或强制字幕否则关闭.
+fn default_tracks(info: &MediaInfo) -> (Option<i32>, Option<i32>) {
+    let audio = info.audio_tracks.iter().find(|track| track.is_default)
+        .or_else(|| info.audio_tracks.first()).map(|track| track.stream_index);
+    let subtitle = info.subtitle_tracks.iter().find(|track| track.is_default || track.is_forced)
+        .map(|track| track.stream_index);
+    (audio, subtitle)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use sqlx::sqlite::SqlitePoolOptions;
+
+    #[test]
+    fn initial_track_preferences_match_server_defaults() {
+        let (info, _) = crate::video::ffmpeg::fixture();
+        assert_eq!(default_tracks(&info), (Some(1), None));
+        let info = serde_json::from_value(serde_json::json!({
+            "duration": 20.0, "start_time": 0.0,
+            "video_tracks": [{"stream_index": 0, "codec_name": "h264", "is_default": true, "is_forced": false}],
+            "audio_tracks": [
+                {"stream_index": 1, "codec_name": "aac", "is_default": false, "is_forced": false},
+                {"stream_index": 4, "codec_name": "aac", "is_default": true, "is_forced": false}
+            ],
+            "subtitle_tracks": [
+                {"stream_index": 3, "codec_name": "ass", "is_default": false, "is_forced": true}
+            ],
+            "attachments": []
+        })).unwrap();
+        assert_eq!(default_tracks(&info), (Some(4), Some(3)));
+    }
 
     #[tokio::test]
     async fn incremental_scans_reuse_paths_and_preserve_progress_after_removal() {
@@ -147,13 +196,18 @@ mod tests {
         let pool = SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
         sqlx::raw_sql(include_str!("../../sql/init.sql")).execute(&pool).await.unwrap();
 
-        let first = collect_files(&root, repository::list_paths(&pool).await.unwrap()).unwrap();
+        let mut first = collect_files(&root, repository::list_paths(&pool).await.unwrap()).unwrap();
         assert_eq!(first.count, 2);
         assert_eq!(first.added.len(), 2);
         let id = first.added[0].pre16mib_md5.clone();
+        first.added[0].audio_stream_index = Some(1);
+        first.added[0].subtitle_stream_index = Some(2);
         repository::sync_scanned_files(&pool, &first.added, &first.removed).await.unwrap();
         repository::save_progress(&pool, &id, 12.5).await.unwrap();
         repository::set_mock_identification(&pool, &id).await.unwrap();
+        let initial = repository::get_video(&pool, &id).await.unwrap().unwrap();
+        assert_eq!(initial.audio_stream_index, Some(1));
+        assert_eq!(initial.subtitle_stream_index, Some(2));
         let rowid: i64 = sqlx::query_scalar("SELECT rowid FROM file_path WHERE path = ''")
             .fetch_one(&pool).await.unwrap();
 
@@ -180,6 +234,8 @@ mod tests {
         assert_eq!(video.name, "renamed.mp4");
         assert_eq!(video.watch_pos, Some(12.5));
         assert_eq!(video.ddp_epi_id, Some(1));
+        assert_eq!(video.audio_stream_index, Some(1));
+        assert_eq!(video.subtitle_stream_index, Some(2));
 
         std::fs::remove_file(root.join("renamed.mp4")).unwrap();
         let removed = collect_files(&root, repository::list_paths(&pool).await.unwrap()).unwrap();
@@ -193,7 +249,10 @@ mod tests {
         std::fs::write(root.join("restored.mkv"), b"original").unwrap();
         let restored = collect_files(&root, repository::list_paths(&pool).await.unwrap()).unwrap();
         repository::sync_scanned_files(&pool, &restored.added, &restored.removed).await.unwrap();
-        assert_eq!(repository::get_video(&pool, &id).await.unwrap().unwrap().watch_pos, Some(12.5));
+        let restored = repository::get_video(&pool, &id).await.unwrap().unwrap();
+        assert_eq!(restored.watch_pos, Some(12.5));
+        assert_eq!(restored.audio_stream_index, Some(1));
+        assert_eq!(restored.subtitle_stream_index, Some(2));
         std::fs::remove_dir_all(&root).unwrap();
         assert!(collect_files(&root, repository::list_paths(&pool).await.unwrap()).is_err());
         assert_eq!(repository::list_paths(&pool).await.unwrap().len(), 2);
@@ -205,13 +264,15 @@ mod tests {
         let pool = SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
         sqlx::raw_sql(include_str!("../../sql/init.sql")).execute(&pool).await.unwrap();
         let existing = ScannedFile {
-            pre16mib_md5: "a".repeat(32), size: 1, path: String::new(),
+            pre16mib_md5: "a".repeat(32), size: 1, audio_stream_index: Some(1),
+            subtitle_stream_index: None, path: String::new(),
             name_no_ext: "old".to_string(), extension: "mkv".to_string(),
         };
         repository::sync_scanned_files(&pool, &[existing], &[]).await.unwrap();
         let removed = repository::list_paths(&pool).await.unwrap();
         let added = (0..2).map(|_| ScannedFile {
-            pre16mib_md5: "b".repeat(32), size: 2, path: String::new(),
+            pre16mib_md5: "b".repeat(32), size: 2, audio_stream_index: None,
+            subtitle_stream_index: None, path: String::new(),
             name_no_ext: "new".to_string(), extension: "mkv".to_string(),
         }).collect::<Vec<_>>();
         assert!(repository::sync_scanned_files(&pool, &added, &removed).await.is_err());

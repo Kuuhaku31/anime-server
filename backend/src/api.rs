@@ -1,7 +1,7 @@
-//! 定义业务 API 路由和处理函数.
-//! 提供文件查询、观看进度、媒体扫描和播放 API 路由.
 
-use std::path::PathBuf;
+// backend/src/api.rs
+//! 定义业务 API 路由和处理函数.
+//! 提供文件查询, 观看进度, 媒体扫描和播放 API 路由.
 
 use axum::{
     extract::{Json, Path, State},
@@ -13,7 +13,6 @@ use axum::{
 use serde_json::json;
 
 use crate::{
-    constants::VIDEO_ROOT,
     db::{models::ProgressInput, repository},
     video::scanner,
     AppState,
@@ -141,41 +140,6 @@ async fn scan(State(state): State<AppState>) -> impl IntoResponse {
             .into_response(),
         Err(error) => internal_error(error),
     }
-}
-
-/// 根据数据库路径查找可用媒体文件副本.
-///
-/// 规范化路径并检查符号链接目标, 确保最终文件仍位于媒体根目录内.
-async fn media_path(state: &AppState, id: &str) -> anyhow::Result<PathBuf> {
-
-    anyhow::ensure!(
-        id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit()),
-        "invalid file ID"
-    );
-
-    let root = tokio::fs::canonicalize(VIDEO_ROOT).await?;
-    let paths = repository::get_paths(&state.db, id).await?;
-
-    for entry in paths {
-        let candidate = root.join(entry.relative_path());
-
-        let resolved = match tokio::fs::canonicalize(&candidate).await {
-            Ok(path) => path,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error.into()),
-        };
-
-        anyhow::ensure!(
-            resolved.starts_with(&root),
-            "media path resolves outside media directory"
-        );
-
-        if tokio::fs::metadata(&resolved).await?.is_file() {
-            return Ok(resolved);
-        }
-    }
-
-    anyhow::bail!("no available media path for file")
 }
 
 /// 构造 404 响应.

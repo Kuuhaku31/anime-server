@@ -6,14 +6,16 @@
 
 文件表, 保存文件本身信息, 不关心文件地址.
 
-| 字段             | 类型 | 约束                    | 说明                                                 |
-| ---------------- | ---- | ----------------------- | ---------------------------------------------------- |
-| pre16mib_md5     | text | primary key             | 文件至多前 16MiB 的 MD5                              |
-| size             | int  | not null                | 文件大小, 单位字节                                   |
-| ddp_epi_id       | int  |                         | DandanPlay Episode ID, null 表示没有匹配到           |
-| danmaku_offset   | real | not null, default = 0.0 | 弹幕偏移, 单位秒, > 0 表示需要弹幕推迟显示, < 0 反之 |
-| watch_pos        | real |                         | 播放进度, 单位秒                                     |
-| watched_datetime | text |                         | 最近一次播放时间, ISO 8601 格式                      |
+| 字段                  | 类型 | 约束                    | 说明                                                 |
+| --------------------- | ---- | ----------------------- | ---------------------------------------------------- |
+| pre16mib_md5          | text | primary key             | 文件至多前 16MiB 的 MD5                              |
+| size                  | int  | not null                | 文件大小, 单位字节                                   |
+| audio_stream_index    | int  |                         | 默认音轨的容器全局流索引, null 表示不选择音轨        |
+| subtitle_stream_index | int  |                         | 默认字幕轨的容器全局流索引, null 表示关闭字幕        |
+| ddp_epi_id            | int  |                         | DandanPlay Episode ID, null 表示没有匹配到           |
+| danmaku_offset        | real | not null, default = 0.0 | 弹幕偏移, 单位秒, > 0 表示需要弹幕推迟显示, < 0 反之 |
+| watch_pos             | real |                         | 播放进度, 单位秒                                     |
+| watched_datetime      | text |                         | 最近一次播放时间, ISO 8601 格式                      |
 
 ## `file_path`
 
@@ -38,9 +40,12 @@
 
 后端启动时直接执行 `backend/sql/init.sql`, 使用 `CREATE TABLE IF NOT EXISTS`
 创建上述两张表及索引. 不使用 SQL 迁移框架.
+轨道偏好列会在初始化 SQL 后按需通过 `ALTER TABLE` 添加, 保留已有文件行和观看进度.
 
 `watch_pos` 始终保存原视频的绝对播放时间, 不是某个 HLS 会话从零开始的局部时间.
 换流, 会话释放和缓存淘汰不会删除进度, 文件识别信息或弹幕偏移.
+首次扫描新文件时会按 default 标记选择音轨, 没有 default 则选第一条; 字幕选 default 或 forced,
+没有匹配字幕则保存 null. 用户在播放器切换轨道或关闭轨道时, 显式选择会覆盖对应数据库字段.
 默认播放由服务端直接读取 `watch_pos`, 客户端不先读取或回传历史进度.
 距结尾不足 2 秒的记录从 0 开始; 换轨提交的当前绝对位置只作为新会话目标.
 

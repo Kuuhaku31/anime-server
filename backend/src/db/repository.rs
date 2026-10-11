@@ -9,6 +9,8 @@ const VIDEO_SELECT: &str = r#"
         f.pre16mib_md5,
         fp.name_no_ext || '.' || fp.extension AS name,
         f.size,
+        f.audio_stream_index,
+        f.subtitle_stream_index,
         f.ddp_epi_id,
         f.danmaku_offset,
         f.watch_pos,
@@ -42,13 +44,12 @@ pub async fn get_video(
         .await
 }
 
-pub async fn get_paths(
-    pool: &SqlitePool,
-    pre16mib_md5: &str,
-) -> Result<Vec<FilePath>, sqlx::Error> {
-    sqlx::query_as::<_, FilePath>(
-        "SELECT path, name_no_ext, extension, pre16mib_md5 FROM file_path WHERE pre16mib_md5 = ? ORDER BY path, name_no_ext, extension",
-    )
+pub async fn get_paths(pool: &SqlitePool, pre16mib_md5: &str) -> Result<Vec<FilePath>, sqlx::Error> {
+
+    sqlx::query_as::<_, FilePath>
+
+("SELECT path, name_no_ext, extension, pre16mib_md5 FROM file_path WHERE pre16mib_md5 = ? ORDER BY path, name_no_ext, extension")
+
     .bind(pre16mib_md5)
     .fetch_all(pool)
     .await
@@ -79,10 +80,12 @@ pub async fn sync_scanned_files(
 
     for file in files {
         sqlx::query(
-            "INSERT INTO file(pre16mib_md5, size) VALUES(?, ?) ON CONFLICT(pre16mib_md5) DO UPDATE SET size = excluded.size",
+            "INSERT INTO file(pre16mib_md5, size, audio_stream_index, subtitle_stream_index) VALUES(?, ?, ?, ?) ON CONFLICT(pre16mib_md5) DO UPDATE SET size = excluded.size",
         )
         .bind(&file.pre16mib_md5)
         .bind(file.size)
+        .bind(file.audio_stream_index)
+        .bind(file.subtitle_stream_index)
         .execute(&mut *tx)
         .await?;
 
@@ -98,6 +101,28 @@ pub async fn sync_scanned_files(
     }
 
     tx.commit().await
+}
+
+/// 只更新请求中显式提供的轨道偏好, 未提供的字段保持数据库原值.
+pub async fn save_track_preferences(
+    pool: &SqlitePool,
+    pre16mib_md5: &str,
+    audio: Option<Option<i32>>,
+    subtitle: Option<Option<i32>>,
+) -> Result<(), sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE file SET audio_stream_index = CASE WHEN ? THEN ? ELSE audio_stream_index END, \
+         subtitle_stream_index = CASE WHEN ? THEN ? ELSE subtitle_stream_index END WHERE pre16mib_md5 = ?",
+    )
+    .bind(audio.is_some())
+    .bind(audio.flatten())
+    .bind(subtitle.is_some())
+    .bind(subtitle.flatten())
+    .bind(pre16mib_md5)
+    .execute(pool)
+    .await?;
+    if result.rows_affected() == 0 { return Err(sqlx::Error::RowNotFound); }
+    Ok(())
 }
 
 pub async fn set_mock_identification(
@@ -119,7 +144,7 @@ pub async fn get_progress(
     pre16mib_md5: &str,
 ) -> Result<Option<WatchProgress>, sqlx::Error> {
     sqlx::query_as::<_, WatchProgress>(
-        "SELECT pre16mib_md5, watch_pos, watched_datetime FROM file WHERE pre16mib_md5 = ?",
+        "SELECT pre16mib_md5, watch_pos, watched_datetime, audio_stream_index, subtitle_stream_index FROM file WHERE pre16mib_md5 = ?",
     )
     .bind(pre16mib_md5)
     .fetch_optional(pool)

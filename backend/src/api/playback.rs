@@ -2,6 +2,8 @@
 // backend/src/api/playback.rs
 //! 定义媒体探测, 播放会话及播放资源 API.
 
+use std::path::PathBuf;
+
 use axum::{
     body::{Body, Bytes},
     extract::{rejection::JsonRejection, Path, Request, State},
@@ -16,14 +18,11 @@ use tower_http::services::ServeFile;
 use tracing::warn;
 
 use crate::{
-    api::media_path,
-    db::repository,
-    video::{
+    AppState, constants::VIDEO_ROOT, db::repository, utils, video::{
         ffmpeg::{EncodeSpec, PlaybackRequest},
         metadata::MediaInfo,
         sessions::{PlaybackStart, SessionStatus},
     },
-    AppState,
 };
 
 
@@ -39,6 +38,9 @@ pub(super) fn router() -> Router<crate::AppState> {
     .route("/api/playback/{id}", delete(release))
     .route("/playback/{id}/{asset}", get(media))
 }
+
+
+// ========================================================================== //
 
 /// 播放 API 错误.
 struct ApiError(StatusCode, String);
@@ -73,22 +75,7 @@ impl IntoResponse for ApiError {
     }
 }
 
-/// 获取媒体文件路径和元数据.
-async fn metadata(
-    state: &AppState,
-    id: &str,
-    retry: bool,
-) -> Result<(std::path::PathBuf, MediaInfo), ApiError> {
-    let path = media_path(state, id).await.map_err(ApiError::missing)?;
 
-    let info = state
-        .metadata
-        .get(id, &path, retry)
-        .await
-        .map_err(ApiError::media)?;
-
-    Ok((path, info))
-}
 
 /// 获取已缓存的媒体流信息.
 async fn streams(
@@ -109,17 +96,18 @@ async fn probe(
 /// 创建播放会话.
 ///
 /// 客户端只提交播放选项, 播放配置由服务端生成.
+///
+/// 定义了 POST /api/files/{id}/playback 的处理函数:
+/// 根据客户端请求和服务器数据创建播放会话, 最后返回 JSON 格式的会话信息.
 async fn play(
     State(state): State<AppState>,
     Path(id): Path<String>,
     input: Bytes,
-) -> Result<Json<PlaybackStart>, ApiError> {
+) -> Result<Json<PlaybackStart>, ApiError>
+{
     // 空请求体使用默认配置, 显式 null 仍交由 JSON 反序列化处理.
-    let input = if input.is_empty() {
-        PlaybackRequest::default()
-    } else {
-        serde_json::from_slice(&input).map_err(ApiError::bad)?
-    };
+    let input = if input.is_empty() { PlaybackRequest::default() }
+    else { serde_json::from_slice(&input).map_err(ApiError::bad)? };
 
     let (source, info) = metadata(&state, &id, false).await?;
 
@@ -128,8 +116,16 @@ async fn play(
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::missing("file not found"))?;
 
-    let spec =
-        EncodeSpec::new(&id, source, info, input, progress.watch_pos).map_err(ApiError::bad)?;
+    // 请求显式选择覆盖数据库偏好, 字段缺省才使用扫描或上次手动选择保存的轨道.
+    let audio_preference = input.audio_stream_index;
+    let subtitle_preference = input.subtitle_stream_index;
+    let request = input.with_preferences(progress.audio_stream_index, progress.subtitle_stream_index);
+    let spec = EncodeSpec::new(&id, source, info, request, progress.watch_pos).map_err(ApiError::bad)?;
+
+    // 只保存本次请求显式提交的选择, null 也表示将对应偏好设为关闭.
+    repository::save_track_preferences(
+        &state.db, &id, audio_preference, subtitle_preference,
+    ).await.map_err(ApiError::internal)?;
 
     let session = state
         .playback
@@ -252,4 +248,62 @@ async fn media(
     );
 
     Ok(response)
+}
+
+
+/// 获取媒体文件路径和元数据.
+async fn metadata(
+    state: &AppState,
+    id: &str,
+    retry: bool,
+) -> Result<(std::path::PathBuf, MediaInfo), ApiError> {
+
+    /// 根据数据库路径查找可用媒体文件副本.
+    ///
+    /// 规范化路径并检查符号链接目标, 确保最终文件仍位于媒体根目录内.
+    async fn media_path(state: &AppState, id: &str) -> Result<PathBuf, String> {
+
+        let id = utils::check_md5(id)?;
+
+        let root = tokio::fs::canonicalize(VIDEO_ROOT)
+        .await.map_err(|e| e.to_string())?;
+        let paths = repository::get_paths(&state.db, &id)
+        .await.map_err(|e| e.to_string())?;
+
+        // 遍历路径
+        for entry in paths {
+
+            let f = root.join(entry.relative_path());
+
+            let resolved = match tokio::fs::canonicalize(&f).await {
+                Ok(path) => path,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.to_string()),
+            };
+
+            if !resolved.starts_with(&root) {
+                return Err("media path resolves outside media directory".to_string());
+            }
+
+            if tokio::fs::metadata(&resolved)
+                .await
+                .map_err(|error| error.to_string())?
+                .is_file()
+            {
+                return Ok(resolved);
+            }
+        }
+
+        Err("no available media path for file".to_string())
+    }
+
+    let path = media_path(state, id).await.map_err(ApiError::missing)?;
+
+    let info = state
+        .metadata
+        .get(id, &path, retry)
+        .await
+        .map_err(ApiError::media)?;
+
+    Ok((path, info))
 }
