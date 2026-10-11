@@ -7,7 +7,7 @@ use serde::{Deserialize, Deserializer};
 use tokio::{io::AsyncWriteExt, process::Command, sync::watch};
 use tracing::warn;
 
-use super::{assets::RenderAssets, cache::{is_key, PlaybackVariantConfig, ENCODER_PROFILE},
+use super::{assets::RenderAssets, cache::{is_key, ENCODER_PROFILE}, PlaybackVariantConfig,
     fragment::{self, Fragment, Init, Tail}, metadata::{MediaInfo, Track},
     process::{cancelled, check_cancel, checked_output_cancellable, Cancelled, Processes}};
 

@@ -19,7 +19,7 @@ mod models;
 mod scanner;
 
 use config::AppConfig;
-use video::{cache::CacheManager, sessions::SessionManager, metadata::MetadataCache, process::Processes};
+use video::{CacheManager, SessionManager, MetadataCache, Processes};
 
 use tokio::time::{sleep, Duration};
 use tracing::{info, warn};

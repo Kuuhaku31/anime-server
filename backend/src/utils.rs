@@ -7,7 +7,7 @@ use anyhow::{ensure, Result};
 use md5::Md5;
 use tokio::process::Command;
 
-use crate::video::process::checked_output;
+use crate::video::checked_output;
 use crate::constants::FALLBACK_FONT;
 
 use std::io::Read;

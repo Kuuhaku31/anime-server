@@ -208,7 +208,7 @@ mod tests {
     #[tokio::test]
     async fn path_size_snapshot_and_batch_deletion_preserve_file_records() {
         // 验证当前扫描依赖的大小快照和批量删除, 不访问真实媒体目录.
-        let root = std::env::temp_dir().join(format!("anime-size-snapshot-{}", crate::video::cache::random_id().unwrap()));
+        let root = std::env::temp_dir().join(format!("anime-size-snapshot-{}", crate::video::random_id().unwrap()));
         std::fs::create_dir(&root).unwrap();
         let first = root.join("first.mkv");
         let second = root.join("second.mkv");
@@ -241,7 +241,7 @@ mod tests {
     #[tokio::test]
     async fn upsert_replaces_path_identity_and_rolls_back_on_path_failure() {
         // 覆盖首次插入, 重复更新, 内容替换及第二张表失败后的事务回滚.
-        let root = std::env::temp_dir().join(format!("anime-upsert-{}", crate::video::cache::random_id().unwrap()));
+        let root = std::env::temp_dir().join(format!("anime-upsert-{}", crate::video::random_id().unwrap()));
         std::fs::create_dir(&root).unwrap();
         let path = root.join("episode.part.MKV");
         std::fs::write(&path, b"original").unwrap();

@@ -7,7 +7,7 @@ use serde::Serialize;
 use tokio::{sync::Mutex, time::interval};
 use tracing::warn;
 
-use super::{cache::{random_id, ActiveCache, CacheManager}, ffmpeg::EncodeSpec, metadata::MediaInfo};
+use super::{cache::{random_id, CacheManager}, ActiveCache, ffmpeg::EncodeSpec, metadata::MediaInfo};
 
 /// 对外只暴露不透明会话和状态快照, 不返回播放配置或 variant-key.
 #[derive(Debug, Clone, Serialize)]
@@ -184,7 +184,7 @@ impl SessionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{config::PlaybackConfig, video::{ffmpeg::fixture, process::Processes}};
+    use crate::{config::PlaybackConfig, video::{fixture, Processes}};
 
     #[tokio::test]
     async fn an_abandoned_creation_reservation_expires_after_its_grace_period() {

@@ -149,7 +149,7 @@ mod tests {
     #[tokio::test]
     async fn scanned_files_rehash_content_and_preserve_other_paths() {
         // 隔离文件构造和数据库更新测试, 不调用已删除的可配置根目录扫描辅助函数.
-        let root = std::env::temp_dir().join(format!("anime-single-scan-{}", crate::video::cache::random_id().unwrap()));
+        let root = std::env::temp_dir().join(format!("anime-single-scan-{}", crate::video::random_id().unwrap()));
         std::fs::create_dir(&root).unwrap();
         let path = root.join("episode.mkv");
         std::fs::write(&path, b"first").unwrap();
@@ -196,8 +196,8 @@ mod tests {
     #[test]
     fn initial_track_preferences_match_server_defaults() {
         // 默认轨道由播放配置生成器选择, 扫描模块不再提供独立选择函数.
-        use crate::video::ffmpeg::{EncodeSpec, PlaybackRequest};
-        let (info, request) = crate::video::ffmpeg::fixture();
+        use crate::video::{EncodeSpec, PlaybackRequest};
+        let (info, request) = crate::video::fixture();
         let spec = EncodeSpec::new(&"a".repeat(32), "video.mkv".into(), info, request, None).unwrap();
         assert_eq!((spec.config.audio_stream, spec.config.subtitle_stream), (Some(1), None));
         let info = serde_json::from_value(serde_json::json!({
@@ -232,9 +232,9 @@ mod tests {
     async fn scan_entry_points_report_errors_without_touching_real_media() {
         // 构造完整隔离状态, 固定 /media 入口只测试拒绝路径和数据库读取失败.
         use std::sync::Arc;
-        use crate::{config::AppConfig, video::{cache::CacheManager, metadata::MetadataCache,
-            process::Processes, sessions::SessionManager}};
-        let root = std::env::temp_dir().join(format!("anime-scan-state-{}", crate::video::cache::random_id().unwrap()));
+        use crate::{config::AppConfig, video::{CacheManager, MetadataCache,
+            Processes, SessionManager}};
+        let root = std::env::temp_dir().join(format!("anime-scan-state-{}", crate::video::random_id().unwrap()));
         std::fs::create_dir(&root).unwrap();
         let config: AppConfig = serde_json::from_str("{}").unwrap();
         let processes = Processes::new(2, 16);

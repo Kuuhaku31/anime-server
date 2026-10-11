@@ -669,7 +669,7 @@ fn disk_usage(root: &Path) -> Result<(u64, Vec<DiskCandidate>)> {
     Ok((total, candidates))
 }
 
-pub(crate) fn is_key(value: &str) -> bool {
+pub(super) fn is_key(value: &str) -> bool {
     value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
