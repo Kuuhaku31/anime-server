@@ -78,6 +78,18 @@
         </div>
         <span id="files-count" class="count-badge">0</span>
       </div>
+      <!-- 排序仅作用于浏览器列表, 不改变服务端文件地址或播放配置. -->
+      <label class="library-sort">
+        <span>Sort by</span>
+        <select id="files-sort">
+          <option value="path">Path</option>
+          <option value="name-asc">Name A-Z</option>
+          <option value="name-desc">Name Z-A</option>
+          <option value="size-desc">Size largest first</option>
+          <option value="size-asc">Size smallest first</option>
+          <option value="recent">Recently watched</option>
+        </select>
+      </label>
       <div id="files" class="files-list"></div>
     </section>
   </main>

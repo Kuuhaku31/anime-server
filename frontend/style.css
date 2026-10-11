@@ -159,6 +159,23 @@ main {
   flex-direction: column;
   overflow: hidden;
 }
+/* 排序栏固定在列表上方, 颜色沿用播放器下拉框主题. */
+.library-sort {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 18px 12px;
+  color: var(--muted);
+}
+.library-sort select {
+  flex: 1;
+  min-width: 0;
+  padding: 7px 9px;
+  color: var(--foreground);
+  background: var(--button);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
 .files-list {
   min-height: 0;
   overflow-y: auto;
