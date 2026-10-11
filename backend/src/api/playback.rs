@@ -16,9 +16,7 @@ use tower_http::services::ServeFile;
 use tracing::warn;
 
 use crate::{
-    AppState, constants::VIDEO_ROOT, db, utils, video::{
-        EncodeSpec, PlaybackRequest, MediaInfo, PlaybackStart, SessionStatus,
-    },
+    AppState, constants::VIDEO_ROOT, db, utils, video,
 };
 
 
@@ -77,7 +75,7 @@ impl IntoResponse for ApiError {
 async fn streams(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<MediaInfo>, ApiError> {
+)-> Result<Json<video::MediaInfo>, ApiError> {
     Ok(Json(metadata(&state, &id, false).await?.1))
 }
 
@@ -85,7 +83,7 @@ async fn streams(
 async fn probe(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<MediaInfo>, ApiError> {
+)-> Result<Json<video::MediaInfo>, ApiError> {
     Ok(Json(metadata(&state, &id, true).await?.1))
 }
 
@@ -99,10 +97,10 @@ async fn play(
     State(state): State<AppState>,
     Path(id): Path<String>,
     input: Bytes,
-) -> Result<Json<PlaybackStart>, ApiError>
+) -> Result<Json<video::PlaybackStart>, ApiError>
 {
     // 空请求体使用默认配置, 显式 null 仍交由 JSON 反序列化处理.
-    let input = if input.is_empty() { PlaybackRequest::default() }
+    let input = if input.is_empty() { video::PlaybackRequest::default() }
     else { serde_json::from_slice(&input).map_err(ApiError::bad)? };
 
     let (source, info) = metadata(&state, &id, false).await?;
@@ -116,7 +114,7 @@ async fn play(
     let audio_preference = input.audio_stream_index;
     let subtitle_preference = input.subtitle_stream_index;
     let request = input.with_preferences(progress.audio_stream_index, progress.subtitle_stream_index);
-    let spec = EncodeSpec::new(&id, source, info, request, progress.watch_pos).map_err(ApiError::bad)?;
+    let spec = video::EncodeSpec::new(&id, source, info, request, progress.watch_pos).map_err(ApiError::bad)?;
 
     // 只保存本次请求显式提交的选择, null 也表示将对应偏好设为关闭.
     db::save_track_preferences(
@@ -143,7 +141,7 @@ async fn target(
     State(state): State<AppState>,
     Path(id): Path<String>,
     input: Result<Json<TargetRequest>, JsonRejection>,
-) -> Result<Json<SessionStatus>, ApiError> {
+) -> Result<Json<video::SessionStatus>, ApiError> {
     let Json(input) = input.map_err(ApiError::bad)?;
 
     let status = state
@@ -169,7 +167,7 @@ async fn target(
 async fn status(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<SessionStatus>, ApiError> {
+) -> Result<Json<video::SessionStatus>, ApiError> {
     Ok(Json(
         state
             .playback
@@ -252,7 +250,7 @@ async fn metadata(
     state: &AppState,
     id: &str,
     retry: bool,
-) -> Result<(std::path::PathBuf, MediaInfo), ApiError> {
+) -> Result<(std::path::PathBuf, video::MediaInfo), ApiError> {
 
     /// 根据数据库路径查找可用媒体文件副本.
     ///
