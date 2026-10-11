@@ -154,12 +154,16 @@ async fn main() -> Result<()> {
 
 pub(crate) async fn scan_once(state: &AppState) -> Result<ScanChanges, String> {
 
+    // 锁住扫描任务, 防止同时进行多个扫描任务
+    // 锁的有效期取决于 _scan 的作用域
+    let _scan = state.scan_lock.lock().await;
+
     // 获取数据库中已知的路径列表
     let paths_in_db = db::repository::get_paths(&state.db).await
     .map_err(|e| format!("failed to read paths from database: {e}"))?;
 
     // 据此扫描视频目录, 返回新增和删除的文件列表
-    let changes = scanner::scan_once(&state.scan_lock, paths_in_db).await?;
+    let changes = scanner::scan_once(paths_in_db).await?;
 
     // 写入失败必须返回扫描错误, 避免旧路径未更新却向客户端报告成功.
     db_repository::update(&state.db, &changes).await

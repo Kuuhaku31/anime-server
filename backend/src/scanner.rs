@@ -12,11 +12,7 @@ use crate::{
 
 
 /// 手动和定时扫描共用互斥锁, 只有完整收集成功后才能替换数据库路径快照.
-pub(crate) async fn scan_once(lock: &tokio::sync::Mutex<()>, paths_in_db: Vec<PathBuf>) -> Result<ScanChanges, String> {
-
-    // 锁住扫描任务, 防止同时进行多个扫描任务
-    // 锁的有效期取决于 _scan 的作用域
-    let _scan = lock.lock().await;
+pub(crate) async fn scan_once(paths_in_db: Vec<PathBuf>) -> Result<ScanChanges, String> {
 
     // 同步目录遍历和新文件哈希放到阻塞线程池, 完整收集失败时不提交任何变更.
     let changes = tokio::task::spawn_blocking(move || -> Result<ScanChanges, String> {
@@ -105,18 +101,17 @@ mod tests {
     #[tokio::test]
     async fn scans_return_full_paths_and_reuse_known_files() {
         // 当前入口固定扫描 /media, 只读现有媒体; 无挂载时验证明确的根目录错误.
-        let lock = tokio::sync::Mutex::new(());
         if let Err(error) = std::fs::canonicalize(constants::video_root_path()) {
             let expected = format!("cannot resolve media directory: {error}");
-            assert_eq!(scan_once(&lock, Vec::new()).await.err().unwrap(), expected);
+            assert_eq!(scan_once(Vec::new()).await.err().unwrap(), expected);
             return;
         }
-        let first = scan_once(&lock, Vec::new()).await.unwrap();
+        let first = scan_once(Vec::new()).await.unwrap();
         assert_eq!(first.count, first.added.len() as u64);
         assert!(first.removed.is_empty());
         assert!(first.added.iter().all(|file| file.path().is_absolute() && is_video(file.path())));
         let known = first.added.iter().map(|file| file.path().clone()).collect::<Vec<_>>();
-        let unchanged = scan_once(&lock, known.clone()).await.unwrap();
+        let unchanged = scan_once(known.clone()).await.unwrap();
         assert_eq!(unchanged.count, first.count);
         assert!(unchanged.added.is_empty());
         assert!(unchanged.removed.is_empty());
@@ -125,7 +120,7 @@ mod tests {
         let stale = std::env::temp_dir().join(format!("anime-stale-{}.mkv", std::process::id()));
         let mut known = known;
         known.push(stale.clone());
-        let removed = scan_once(&lock, known).await.unwrap();
+        let removed = scan_once(known).await.unwrap();
         assert_eq!(removed.count, first.count);
         assert!(removed.added.is_empty());
         assert_eq!(removed.removed, vec![stale]);
