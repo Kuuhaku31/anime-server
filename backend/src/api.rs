@@ -10,7 +10,9 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use serde::Deserialize;
 use serde_json::json;
+use tracing::info;
 
 use crate::{
     models::ProgressInput,
@@ -26,6 +28,7 @@ pub fn router(state: AppState) -> Router {
     .route("/api/files", get(list_files))
     .route("/api/files/{pre16mib_md5}", get(get_file))
     .route("/api/files/{pre16mib_md5}/identify", post(identify_file))
+    .route("/api/scan/file", post(scan_file))
     .route("/api/files/{pre16mib_md5}/progress", get(get_progress).put(save_progress),)
     .route("/api/config", get(get_config))
     .route("/api/scan", post(scan))
@@ -140,6 +143,49 @@ async fn scan(State(state): State<AppState>) -> impl IntoResponse {
             .into_response(),
         Err(error) => internal_error(error),
     }
+}
+
+/// 单文件扫描请求, 服务器完整地址是唯一定位信息.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileScanInput {
+    path: std::path::PathBuf,
+}
+
+/// 重新扫描指定记录的单个完整地址, 与全目录扫描共用锁并原子替换路径关联.
+async fn scan_file(
+    State(state): State<AppState>,
+    Json(input): Json<FileScanInput>,
+) -> axum::response::Response {
+
+    info!("服务端收到单文件扫描请求: {:?}, 正在等待锁", input.path);
+    let _scan = state.scan_lock.lock().await;
+    info!("服务端获得扫描锁, 开始扫描: {:?}", input.path);
+
+    let file = match crate::scanner::scan_file(&input.path).await {
+        Ok(file) => file,
+        Err(error) => {
+            tracing::warn!("single file scan failed: {error}, path: {:?}", input.path);
+            return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"error": error}))).into_response();
+        },
+    };
+
+    // 如果扫描结果为 None, 说明文件不存在或不在媒体目录内, 删除数据库中对应路径记录.
+    // 如果扫描结果为 Some, 则将扫描结果写入数据库, 覆盖原有路径关联.
+    if let Some(f) = file.as_ref() {
+        info!("服务端完成单文件扫描请求: {:?}, hash: {:?}", input.path, f.pre16mib_md5());
+        let _ = repository::upsert_file(&state.db, &f).await;
+    } else {
+        info!("服务端完成单文件扫描请求: {:?}, 文件不存在或不在媒体目录内", input.path);
+        let _ = repository::delete_path(&state.db, &input.path).await;
+    }
+
+    let res = (StatusCode::OK, Json(json!({
+        "ok": true, "scanned": 1,
+        "pre16mib_md5": file.as_ref().map(|f| f.pre16mib_md5()),
+    }))).into_response();
+
+    res
 }
 
 /// 构造 404 响应.

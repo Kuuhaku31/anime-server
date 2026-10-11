@@ -3,14 +3,14 @@ import "../style.css";
 import { request } from "./api/anime-server.ts";
 import { PlaybackController } from "./playback/playback-controller.ts";
 import { attachControls, element } from "./ui/controls.ts";
-import { Library } from "./ui/library.ts";
+import { fileAddress, Library } from "./ui/library.ts";
 
 const player = element<HTMLVideoElement>("#player");
 const controller = new PlaybackController(player);
 attachControls(controller, player);
 const library = new Library((file) => controller.open(file), (error) => controller.fail(error));
 // 播放状态只由控制器维护, 列表订阅变化后仅同步当前文件高亮.
-controller.addEventListener("change", () => library.select(controller.file?.pre16mib_md5 ?? null));
+controller.addEventListener("change", () => library.select(controller.file ? fileAddress(controller.file) : null));
 
 async function initialize(): Promise<void> {
   const config = await request<{ default_dark_mode: boolean }>("/api/config");

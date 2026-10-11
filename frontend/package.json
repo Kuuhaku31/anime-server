@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "vite --host 0.0.0.0",
     "build": "tsc --noEmit && vite build && mkdir -p dist/licenses && cp node_modules/hls.js/LICENSE dist/licenses/hls.txt",
-    "test": "node --experimental-strip-types --test src/playback/*.test.*"
+    "test": "node --experimental-strip-types --test src/playback/*.test.* src/ui/*.test.js"
   },
   "dependencies": {
     "hls.js": "1.7.3"

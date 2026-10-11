@@ -9,6 +9,10 @@ export interface VideoFile {
   danmaku_offset: number;
   watch_pos: number | null;
   watched_datetime: string | null;
+  // 列表返回实际展示副本的地址, 单文件重扫不影响同指纹其他副本.
+  path: string;
+  name_no_ext: string;
+  extension: string;
 }
 
 export interface Track {

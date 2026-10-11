@@ -46,6 +46,36 @@ pub(crate) async fn scan_once(paths_in_db: Vec<PathBuf>) -> Result<ScanChanges, 
 }
 
 
+/// 强制重新读取单个地址, 不沿用全目录增量扫描的跳过哈希策略.
+pub(crate) async fn scan_file(path: &Path) -> Result<Option<ScannedFile>, String> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || scan_file_at(constants::video_root_path(), &path))
+        .await.map_err(|error| format!("failed to join scan thread: {error}"))?
+}
+
+// 保留数据库中的原地址, 仅规范化目标用于校验, 避免符号链接产生额外路径记录.
+fn scan_file_at(root: &Path, path: &Path) -> Result<Option<ScannedFile>, String> {
+    let root = std::fs::canonicalize(root).map_err(|error| format!("cannot resolve media directory: {error}"))?;
+    if !path.is_absolute() || !path.starts_with(&root)
+        || path.components().any(|part| matches!(part, std::path::Component::ParentDir))
+        || !is_video(path)
+    {
+        return Err("invalid media file path".to_string());
+    }
+    let resolved = match std::fs::canonicalize(path) {
+        Ok(resolved) => resolved,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(None);
+        },
+        Err(error) => return Err(format!("cannot resolve media file: {error}")),
+    };
+    if !resolved.starts_with(&root) || !resolved.is_file() {
+        return Err("media path must resolve to a file inside media directory".to_string());
+    }
+    let file = ScannedFile::new(path)?;
+    Ok(Some(file))
+}
+
 fn is_video(path: &Path) -> bool {
     path.extension()
     .and_then(|value| value.to_str())
@@ -62,6 +92,60 @@ fn is_video(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn single_file_scan_rehashes_content_and_removes_missing_paths() {
+        // 隔离测试目录, 验证强制重算, 消失路径和越界地址, 不访问真实媒体挂载.
+        let root = std::env::temp_dir().join(format!("anime-single-scan-{}", crate::video::cache::random_id().unwrap()));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("episode.mkv");
+        std::fs::write(&path, b"first").unwrap();
+        let first = scan_file_at(&root, &path).unwrap().unwrap();
+        let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1)
+            .connect("sqlite::memory:").await.unwrap();
+        sqlx::raw_sql(include_str!("../sql/init.sql")).execute(&pool).await.unwrap();
+        crate::db::repository::upsert_file(&pool, &first).await.unwrap();
+        let old_id = first.pre16mib_md5().to_owned();
+        crate::db::repository::save_progress(&pool, &old_id, 12.5).await.unwrap();
+        // 另一个内容相同的副本不应被该地址的强制扫描删除.
+        let sibling = root.join("copy.mkv");
+        std::fs::write(&sibling, b"first").unwrap();
+        crate::db::repository::upsert_file(&pool, &scan_file_at(&root, &sibling).unwrap().unwrap()).await.unwrap();
+        #[cfg(unix)]
+        {
+            // 拒绝越界符号链接, 根目录内链接仍按原数据库地址更新.
+            let link = root.join("link.mkv");
+            std::os::unix::fs::symlink(root.parent().unwrap(), &link).unwrap();
+            assert!(scan_file_at(&root, &link).is_err());
+            std::fs::remove_file(&link).unwrap();
+            std::os::unix::fs::symlink(&sibling, &link).unwrap();
+            let linked = scan_file_at(&root, &link).unwrap().unwrap();
+            assert_eq!(linked.path(), &link);
+            std::fs::remove_file(link).unwrap();
+        }
+        assert_eq!(first.path(), &path);
+        std::fs::write(&path, b"replaced media").unwrap();
+        let second = scan_file_at(&root, &path).unwrap().unwrap();
+        assert_ne!(first.pre16mib_md5(), second.pre16mib_md5());
+        assert_eq!(second.size(), 14);
+        crate::db::repository::upsert_file(&pool, &second).await.unwrap();
+        assert_eq!(crate::db::repository::get_video_paths_by_id(&pool, &old_id).await.unwrap(), vec![sibling.clone()]);
+        assert_eq!(crate::db::repository::get_progress(&pool, &old_id).await.unwrap().unwrap().watch_pos, Some(12.5));
+        let new_id = second.pre16mib_md5();
+        assert_eq!(crate::db::repository::get_video_paths_by_id(&pool, new_id).await.unwrap(), vec![path.clone()]);
+        assert!(scan_file_at(&root, &root.join("../outside.mkv")).is_err());
+        assert!(scan_file_at(&root, Path::new("episode.mkv")).is_err());
+        assert!(scan_file_at(&root, &root.join("ignored.txt")).is_err());
+        std::fs::remove_file(&path).unwrap();
+        let removed = scan_file_at(&root, &path).unwrap();
+        // 当前单文件扫描用 None 表示文件消失, 调用方单独删除数据库地址.
+        assert!(removed.is_none());
+        crate::db::repository::delete_path(&pool, &path).await.unwrap();
+        assert_eq!(crate::db::repository::get_paths(&pool).await.unwrap(), vec![sibling.clone()]);
+        assert!(crate::db::repository::get_progress(&pool, new_id).await.unwrap().is_some());
+        std::fs::remove_file(sibling).unwrap();
+        std::fs::remove_dir(&root).unwrap();
+    }
 
     #[test]
     fn initial_track_preferences_match_server_defaults() {

@@ -51,6 +51,10 @@
 
 ## 初始化与持久化边界
 
+`repository::upsert_file` 独立在同一事务中写入单个 `ScannedFile`.
+文件指纹已存在时仅更新大小, 保留业务字段; 地址复合主键已存在时更新其指纹关联,
+不删除旧指纹的文件记录. 路径无效或任一步写入失败均返回错误, 不保留部分写入.
+
 后端启动时直接执行 `backend/sql/init.sql`, 使用 `CREATE TABLE IF NOT EXISTS`
 创建上述两张表及索引. 不使用 SQL 迁移框架.
 轨道偏好列会在初始化 SQL 后按需通过 `ALTER TABLE` 添加, 保留已有文件行和观看进度.

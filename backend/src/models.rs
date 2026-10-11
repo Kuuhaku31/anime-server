@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{constants::HASH_LIMIT, utils};
 
-/// 文件列表的去重记录, 同一指纹存在多个副本时只选一条路径作为展示信息.
+
 #[derive(Debug, Serialize, sqlx::FromRow)]
 pub(crate) struct VideoFile {
     pub pre16mib_md5: String,

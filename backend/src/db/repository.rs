@@ -1,11 +1,11 @@
 //! 封装 SQLite 数据访问操作.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use crate::{models::{ScanChanges, VideoFile, WatchProgress}};
+use crate::models::{ScanChanges, ScannedFile, VideoFile, WatchProgress};
 use sqlx::SqlitePool;
 
-// 同一指纹对应多个路径时仅展示排序后的第一条, 避免列表重复并保持展示结果稳定.
+// 列表按地址展示每个副本, 指纹仅用于关联共享的业务数据.
 const VIDEO_SELECT: &str = r#"
     SELECT
         f.pre16mib_md5,
@@ -21,13 +21,7 @@ const VIDEO_SELECT: &str = r#"
         fp.name_no_ext,
         fp.extension
     FROM file AS f
-    JOIN file_path AS fp ON fp.rowid = (
-        SELECT candidate.rowid
-        FROM file_path AS candidate
-        WHERE candidate.pre16mib_md5 = f.pre16mib_md5
-        ORDER BY candidate.path, candidate.name_no_ext, candidate.extension
-        LIMIT 1
-    )
+    JOIN file_path AS fp ON fp.pre16mib_md5 = f.pre16mib_md5
 "#;
 
 
@@ -39,7 +33,7 @@ pub async fn get_videos(p: &SqlitePool) -> Result<Vec<VideoFile>, sqlx::Error> {
 
 /// 获取指定文件指纹的数据库记录.
 pub async fn get_video_by_id(p: &SqlitePool, id: &str) -> Result<Option<VideoFile>, sqlx::Error> {
-    let query = format!("{VIDEO_SELECT} WHERE f.pre16mib_md5 = ?");
+    let query = format!("{VIDEO_SELECT} WHERE f.pre16mib_md5 = ? ORDER BY fp.path, fp.name_no_ext, fp.extension LIMIT 1");
     sqlx::query_as::<_, VideoFile>(&query)
     .bind(id).fetch_optional(p).await
 }
@@ -196,11 +190,123 @@ pub(crate) async fn update(pool: &SqlitePool, changes: &ScanChanges) -> Result<(
 }
 
 
+/// 给地址, 删除 file_path 表中指定路径
+pub(crate) async fn delete_path(pool: &SqlitePool, path: &Path) -> Result<(), sqlx::Error> {
+
+    let directory = path.parent().and_then(|d| d.to_str())
+    .ok_or_else(|| sqlx::Error::Protocol(format!("invalid path: {}", path.display()).into()))?;
+    let name_no_ext = path.file_stem().and_then(|s| s.to_str())
+    .ok_or_else(|| sqlx::Error::Protocol(format!("invalid path: {}", path.display()).into()))?;
+    let extension = path.extension().and_then(|s| s.to_str())
+    .ok_or_else(|| sqlx::Error::Protocol(format!("invalid path: {}", path.display()).into()))?;
+
+    sqlx::query("DELETE FROM file_path WHERE path = ? AND name_no_ext = ? AND extension = ?")
+    .bind(directory)
+    .bind(name_no_ext)
+    .bind(extension)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// 用 ScannedFile 插入更新 file, file_path 表:
+///
+/// 1. 插入更新 file 表
+/// 2. 插入更新 file_path 表
+pub(crate) async fn upsert_file(pool: &SqlitePool, file: &ScannedFile) -> Result<(), sqlx::Error> {
+
+    // 独立解析完整地址, 在开始事务前拒绝无法表示为数据库复合键的输入.
+    let path = file.path();
+    let invalid = || sqlx::Error::Protocol(format!("invalid absolute file path: {}", path.display()));
+    if !path.is_absolute() || path.components().any(|part| matches!(part, std::path::Component::ParentDir)) {
+        return Err(invalid());
+    }
+    let directory = path.parent().and_then(|value| value.to_str()).ok_or_else(invalid)?;
+    let name = path.file_stem().and_then(|value| value.to_str()).ok_or_else(invalid)?;
+    let extension = path.extension().and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty()).ok_or_else(invalid)?;
+    let mut transaction = pool.begin().await?;
+
+    // 文件指纹冲突仅更新大小, 不覆盖观看进度, 识别信息或轨道偏好.
+    sqlx::query(
+        "INSERT INTO file (pre16mib_md5, size) VALUES (?, ?) \
+         ON CONFLICT (pre16mib_md5) DO UPDATE SET size = excluded.size",
+    )
+        .bind(file.pre16mib_md5())
+        .bind(file.size())
+        .execute(&mut *transaction)
+        .await?;
+
+    // 地址冲突直接更新指纹关联, 保留该路径行以及旧指纹的业务记录.
+    sqlx::query(
+        "INSERT INTO file_path (path, name_no_ext, extension, pre16mib_md5) VALUES (?, ?, ?, ?) \
+         ON CONFLICT (path, name_no_ext, extension) DO UPDATE SET pre16mib_md5 = excluded.pre16mib_md5",
+    )
+        .bind(directory)
+        .bind(name)
+        .bind(extension)
+        .bind(file.pre16mib_md5())
+        .execute(&mut *transaction)
+        .await?;
+
+    transaction.commit().await
+}
+
+
+// ========================================================================== //
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::models::ScannedFile;
     use sqlx::sqlite::SqlitePoolOptions;
+
+    #[tokio::test]
+    async fn upsert_replaces_path_identity_and_rolls_back_on_path_failure() {
+        // 覆盖首次插入, 重复更新, 内容替换及第二张表失败后的事务回滚.
+        let root = std::env::temp_dir().join(format!("anime-upsert-{}", crate::video::cache::random_id().unwrap()));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("episode.part.MKV");
+        std::fs::write(&path, b"original").unwrap();
+        let pool = SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        sqlx::raw_sql(include_str!("../../sql/init.sql")).execute(&pool).await.unwrap();
+        let first = ScannedFile::new(&path).unwrap();
+        let old_id = first.pre16mib_md5();
+        upsert_file(&pool, &first).await.unwrap();
+        save_progress(&pool, old_id, 12.5).await.unwrap();
+        save_track_preferences(&pool, old_id, Some(Some(1)), Some(Some(3))).await.unwrap();
+        set_mock_identification(&pool, old_id).await.unwrap();
+        let rowid: i64 = sqlx::query_scalar("SELECT rowid FROM file_path").fetch_one(&pool).await.unwrap();
+        sqlx::query("UPDATE file SET size = 0").execute(&pool).await.unwrap();
+        upsert_file(&pool, &first).await.unwrap();
+        let video = get_video_by_id(&pool, old_id).await.unwrap().unwrap();
+        assert_eq!(video.size, first.size());
+        assert_eq!(video.watch_pos, Some(12.5));
+        assert_eq!(video.audio_stream_index, Some(1));
+        assert_eq!(video.subtitle_stream_index, Some(3));
+        assert_eq!(video.ddp_epi_id, Some(1));
+
+        std::fs::write(&path, b"replacement").unwrap();
+        let replacement = ScannedFile::new(&path).unwrap();
+        upsert_file(&pool, &replacement).await.unwrap();
+        assert_eq!(sqlx::query_scalar::<_, String>("SELECT pre16mib_md5 FROM file_path")
+            .fetch_one(&pool).await.unwrap(), replacement.pre16mib_md5());
+        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT rowid FROM file_path").fetch_one(&pool).await.unwrap(), rowid);
+        assert_eq!(get_progress(&pool, old_id).await.unwrap().unwrap().watch_pos, Some(12.5));
+        assert_eq!(get_progress(&pool, replacement.pre16mib_md5()).await.unwrap().unwrap().audio_stream_index, None);
+
+        sqlx::raw_sql("CREATE TRIGGER reject_path BEFORE UPDATE ON file_path BEGIN SELECT RAISE(ABORT, 'reject path'); END;")
+            .execute(&pool).await.unwrap();
+        std::fs::write(&path, b"rejected replacement").unwrap();
+        let rejected = ScannedFile::new(&path).unwrap();
+        assert!(upsert_file(&pool, &rejected).await.is_err());
+        assert!(get_progress(&pool, rejected.pre16mib_md5()).await.unwrap().is_none());
+        assert_eq!(sqlx::query_scalar::<_, String>("SELECT pre16mib_md5 FROM file_path")
+            .fetch_one(&pool).await.unwrap(), replacement.pre16mib_md5());
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
 
     #[tokio::test]
     async fn changes_update_exact_paths_and_preserve_file_preferences() {
@@ -221,6 +327,15 @@ mod tests {
             let id = changes.added[0].pre16mib_md5().to_owned();
             update(&pool, &changes).await.unwrap();
             assert_eq!(get_paths(&pool).await.unwrap().len(), 2);
+            // 列表不按指纹去重, 用返回行验证每个地址关联到同一指纹.
+            let videos = get_videos(&pool).await.unwrap();
+            assert_eq!(videos.len(), 2);
+            for path in [&first, &second] {
+                assert!(videos.iter().any(|video| {
+                    std::path::Path::new(&video.path).join(format!("{}.{}", video.name_no_ext, video.extension)) == *path
+                        && video.pre16mib_md5 == id
+                }));
+            }
             assert!(get_paths(&pool).await.unwrap().contains(&first));
             // 空变更不应删除并重建已有路径行.
             let rowid: i64 = sqlx::query_scalar("SELECT rowid FROM file_path WHERE name_no_ext = 'episode.part'")
