@@ -21,6 +21,7 @@ mod video;
 mod utils;
 mod constants;
 mod models;
+mod scanner;
 
 use config::AppConfig;
 use video::{cache::CacheManager, sessions::SessionManager, metadata::MetadataCache, process::Processes};
@@ -28,7 +29,7 @@ use video::{cache::CacheManager, sessions::SessionManager, metadata::MetadataCac
 use tokio::time::{sleep, Duration};
 use tracing::{info, warn};
 
-use crate::{models::ScanChanges, video::scanner};
+use crate::models::ScanChanges;
 use crate::db::repository as db_repository;
 
 #[derive(Clone)]
