@@ -20,13 +20,9 @@ STRICT;
 -- 文件路径表
 CREATE TABLE IF NOT EXISTS "file_path"
 (
-    "path"          TEXT NOT NULL,
-    "name_no_ext"   TEXT NOT NULL,
-    "extension"     TEXT NOT NULL,
+    "path"          TEXT PRIMARY KEY NOT NULL CHECK (substr(path, 1, 1) = '/'),
     "pre16mib_md5"  TEXT NOT NULL
-    REFERENCES "file"("pre16mib_md5") ON DELETE CASCADE,
-
-    PRIMARY KEY ("path", "name_no_ext", "extension")
+    REFERENCES "file"("pre16mib_md5") ON DELETE CASCADE
 )
 STRICT;
 

@@ -37,7 +37,8 @@
 
 `GET /api/files` 返回 `200` 和视频记录数组. 每条记录包含 `pre16mib_md5`, `name`, `size`,
 `audio_stream_index`, `subtitle_stream_index`,
-`ddp_epi_id`, `danmaku_offset`, `watch_pos`, `watched_datetime`, `path`, `name_no_ext`, `extension`.
+`ddp_epi_id`, `danmaku_offset`, `watch_pos`, `watched_datetime`, `path`.
+`path` 是完整容器内绝对文件地址, `name` 仅为从该地址提取的显示文件名.
 大小单位为字节, 观看位置和弹幕偏移单位为秒. 尚无业务数据的可空字段返回 `null`.
 同一指纹存在多个副本时分别返回每个地址, 客户端以完整服务器地址作为列表主键,
 不按指纹去重. 播放, 识别和观看进度接口仍通过指纹关联业务数据.
@@ -56,23 +57,15 @@
     "danmaku_offset": 0.0,
     "watch_pos": 125.5,
     "watched_datetime": "2026-10-10T07:00:00.000Z",
-    "path": "/media/series",
-    "name_no_ext": "episode",
-    "extension": "mkv"
+    "path": "/media/series/episode.mkv"
   },
   "paths": [
-    {
-      "path": "/media/series",
-      "name_no_ext": "episode",
-      "extension": "mkv",
-      "pre16mib_md5": "35af6d912b6dffadc112df2ca94bbe2f"
-    }
+    "/media/series/episode.mkv"
   ]
 }
 ```
 
-`paths` 包含该指纹的全部数据库路径, `path` 是容器内文件所在目录的绝对地址,
-不包含文件名. 拼接 `name_no_ext.extension` 后得到完整文件地址.
+`paths` 包含该指纹的全部完整绝对文件地址, 无需客户端拼接.
 详情接口不检查每个副本当前是否仍存在, 也不返回原始媒体播放 URL.
 播放前会重新查找可用副本并验证规范化路径仍位于媒体根目录.
 
@@ -108,9 +101,15 @@
 `POST /api/scan` 无需请求体, 等待媒体目录收集及数据库同步完成后返回
 `200` 和 `{"ok":true,"scanned":744}`. `scanned` 是本次扫描得到的文件路径数量,
 同一内容的多个副本分别计数, 不是去重后的指纹数量.
-扫描先读取数据库全部路径, 与目录列表比对, 仅对新路径读取前 16 MiB 计算 MD5 并记录大小.
-地址同时存在于数据库和目录时默认文件未变, 不重算哈希, 不重新探测轨道或更新大小.
-完整收集失败时不会更新数据库路径快照. 同步在事务内插入新路径并删除失效路径,
+扫描先读取数据库全部路径及关联文件大小, 与目录列表比对,
+对新路径或大小变化的路径读取前 16 MiB 计算 MD5 并记录大小.
+同地址同大小不重算哈希或写入, 即使内容被同大小文件替换.
+扫描摘要的 `added` 包含新增和大小变化的写入地址数, `removed` 统计删除地址数,
+`total` 统计实际视频地址数; HTTP 响应中的 `scanned` 仍对应 `total`.
+扫描期间每个新增或大小变化的文件立即用独立事务更新数据库.
+单文件数据库写入失败打印地址和错误后继续, 不计入 `added`, 完整遍历后仍清理失效路径.
+目录读取或哈希失败仍返回错误并保留此前成功写入, 不执行失效路径清理.
+完整遍历成功后在一个事务内删除失效路径,
 保留没有现存副本的 `file` 记录及观看进度等业务数据.
 扫描不探测默认轨道, 新文件记录的轨道偏好保存为 `null`.
 

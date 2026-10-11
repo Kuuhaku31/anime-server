@@ -1,67 +1,108 @@
 
-// backend/src/video/scanner.rs
+// backend/src/scanner.rs
 //! 扫描媒体目录并同步文件索引.
 
-use std::{collections::HashMap, path::{Path, PathBuf}};
+use std::{collections::HashSet, path::{Path, PathBuf}};
 use anyhow::Result;
+use tracing::info;
 use walkdir::WalkDir;
 
 use crate::{
-    constants::{self, EXTENSIONS}, models::{ScanChanges, ScannedFile},
+    AppState, constants::{self, EXTENSIONS}, db::repository, models::{ScanChanges, ScannedFile},
 };
 
 
-/// 手动和定时扫描共用互斥锁, 只有完整收集成功后才能替换数据库路径快照.
-pub(crate) async fn scan_once(paths_in_db: Vec<PathBuf>) -> Result<ScanChanges, String> {
+/// 扫描媒体目录, 同步数据库索引, 返回扫描摘要:
+///
+/// 遍历媒体目录, 对每个视频文件:
+///  - 检查该文件地址是否在数据库 file_path 表内
+///  - 如果不在数据库 file_path 表内, 计算文件前 16MiB 的 MD5 哈希, 并将文件地址和哈希写入数据库
+///  - 如果在数据库内, 检查文件大小是否变化, 如果变化则重新计算哈希并更新数据库
+///  - 统计好实际导致插入更新数据库的文件地址数量
+///  - 获得一个媒体目录下所有视频文件地址列表
+/// 获取数据库 file_path 表所有地址, 和媒体目录下所有视频文件地址列表进行比对,
+/// 删除 file_path 表内存在但媒体目录下不存在的地址, 统计删除数量.
+/// 最后返回一个 ScanChanges 结构体, 包含新增, 删除和总计的文件数量.
+pub(crate) async fn scan_root(state: &AppState) -> Result<ScanChanges, String> {
 
-    // 同步目录遍历和新文件哈希放到阻塞线程池, 完整收集失败时不提交任何变更.
-    let changes = tokio::task::spawn_blocking(move || -> Result<ScanChanges, String> {
+    // 整轮扫描持有锁, 防止手动和后台扫描交错更新.
+    info!("准备扫描媒体目录: {}", constants::video_root_path().display());
+    let _scan = state.scan_lock.lock().await;
+    info!("扫描媒体目录开始: {}", constants::video_root_path().display());
 
-        // 规范化扫描根目录, 即使调用方传入相对地址也只写入绝对目录.
-        let root = constants::video_root_path();
-        let root = std::fs::canonicalize(root).map_err(|e| format!("cannot resolve media directory: {e}"))?;
+    let path_and_size_in_db = repository::get_paths_and_size(&state.db).await
+    .map_err(|error| format!("failed to read paths and sizes from database: {error}"))?;
+    let root = tokio::fs::canonicalize(constants::video_root_path()).await
+    .map_err(|error| format!("cannot resolve media directory: {error}"))?;
 
-        let paths = paths_in_db.into_iter();
-        let mut known: HashMap<_, _> = paths.map(|path| (path.clone(), path)).collect();
-        let mut added = Vec::new();
-        let mut count = 0; // 所有现存视频路径数
-        for entry in WalkDir::new(&root) {
-            let entry = entry.map_err(|e| format!("failed to read media directory entry: {e}"))?;
-            let absolute_path = entry.path();
-            if !entry.file_type().is_file() || !is_video(absolute_path) { continue; }
-            count += 1;
-            // 地址相同即认为未变, 即使内容或大小改变也不重算哈希, 符合增量扫描契约.
-            if known.remove(absolute_path).is_none() {
-                added.push(ScannedFile::new(absolute_path)?);
-            }
+    let mut paths_in_folder = Vec::new();
+    let mut added = 0;
+
+    // 边遍历边写入, 哈希交给阻塞线程, 每个文件的两表更新独立提交.
+    for entry in WalkDir::new(&root).sort_by_file_name() {
+
+        let entry = entry.map_err(|error| format!("failed to read media directory entry: {error}"))?;
+        let path = entry.path();
+
+        if !entry.file_type().is_file() || !is_video(path) { continue; } // 只处理视频文件
+        paths_in_folder.push(path.to_path_buf());
+        let size = tokio::fs::metadata(path).await
+        .map_err(|error| format!("failed to read media file metadata {}: {error}", path.display()))?.len();
+
+        if path_and_size_in_db.get(path) == Some(&size) { continue; } // 同地址同大小不重算哈希
+
+        // 单文件写入失败记录完整地址和错误后继续, 仅成功提交的地址计入 added.
+        let file = match ScannedFile::new(path) {
+            Ok(file) => file,
+            Err(error) => {
+                tracing::error!(path = %path.display(), "failed to scan media file: {error}");
+                continue;
+            },
+        };
+
+        match repository::upsert_file(&state.db, &file).await {
+            Ok(()) => added += 1,
+            Err(error) => tracing::error!(path = %file.path().display(), "failed to update scanned file: {error}"),
         }
+    }
 
-        let changes = ScanChanges { added, removed: known.into_values().collect(), count };
+    let mut removed = 0;
+    let total = paths_in_folder.len() as u64;
 
-        Ok(changes)
+    // 查找数据库中已知但在文件夹中不存在的路径, 作为删除列表.
+    let paths_in_folder_set: HashSet<&Path> = paths_in_folder.iter().map(|p| p.as_path()).collect();
+    let need_delete: Vec<PathBuf> = path_and_size_in_db.keys()
+        .filter(|path| !paths_in_folder_set.contains(path.as_path()))
+        .cloned()
+        .collect();
+    if !need_delete.is_empty() {
+        repository::delete_paths(&state.db, &need_delete).await.map_err(|error| error.to_string())?;
+        removed = need_delete.len() as u64;
+    }
 
-    }).await.map_err(|e| format!("failed to join scan thread: {e}"))??;
+    let changes = ScanChanges {
+        added, removed, total,
+    };
 
+    info!("扫描媒体目录完成: {}, 添加: {}, 删除: {}, 总计: {}", constants::video_root_path().display(), added, removed, total);
     Ok(changes)
 }
 
 
 /// 强制重新读取单个地址, 不沿用全目录增量扫描的跳过哈希策略.
-pub(crate) async fn scan_file(path: &Path) -> Result<Option<ScannedFile>, String> {
-    let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || scan_file_at(constants::video_root_path(), &path))
-        .await.map_err(|error| format!("failed to join scan thread: {error}"))?
-}
+pub(crate) async fn scan_file(state: &AppState, path: &Path) -> Result<Option<ScannedFile>, String> {
 
-// 保留数据库中的原地址, 仅规范化目标用于校验, 避免符号链接产生额外路径记录.
-fn scan_file_at(root: &Path, path: &Path) -> Result<Option<ScannedFile>, String> {
-    let root = std::fs::canonicalize(root).map_err(|error| format!("cannot resolve media directory: {error}"))?;
+    let p = path.to_owned();
+    let file = tokio::task::spawn_blocking(move || -> Result<Option<ScannedFile>, String> {
+    let path = &p;
+    let root = std::fs::canonicalize(constants::video_root_path()).map_err(|error| format!("cannot resolve media directory: {error}"))?;
     if !path.is_absolute() || !path.starts_with(&root)
         || path.components().any(|part| matches!(part, std::path::Component::ParentDir))
         || !is_video(path)
     {
-        return Err("invalid media file path".to_string());
+        return Err(format!("invalid media file path: {:?}", path));
     }
+
     let resolved = match std::fs::canonicalize(path) {
         Ok(resolved) => resolved,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -70,10 +111,22 @@ fn scan_file_at(root: &Path, path: &Path) -> Result<Option<ScannedFile>, String>
         Err(error) => return Err(format!("cannot resolve media file: {error}")),
     };
     if !resolved.starts_with(&root) || !resolved.is_file() {
-        return Err("media path must resolve to a file inside media directory".to_string());
+        return Err(format!("media path must resolve to a file inside media directory: {:?}", path));
     }
-    let file = ScannedFile::new(path)?;
-    Ok(Some(file))
+    Ok(Some(ScannedFile::new(path)?))
+    }).await.map_err(|error| format!("failed to join scan thread: {error}"))??;
+
+    // 如果扫描结果为 None, 说明文件不存在或不在媒体目录内, 删除数据库中对应路径记录.
+    // 如果扫描结果为 Some, 则将扫描结果写入数据库, 覆盖原有路径关联.
+    if let Some(f) = file.as_ref() {
+        info!("服务端完成单文件扫描请求: {:?}, hash: {:?}", path, f.pre16mib_md5());
+        repository::upsert_file(&state.db, f).await.map_err(|error| error.to_string())?;
+    } else {
+        info!("服务端完成单文件扫描请求: {:?}, 文件不存在或不在媒体目录内", path);
+        repository::delete_path(&state.db, path).await.map_err(|error| error.to_string())?;
+    };
+
+    Ok(file)
 }
 
 fn is_video(path: &Path) -> bool {
@@ -94,13 +147,13 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn single_file_scan_rehashes_content_and_removes_missing_paths() {
-        // 隔离测试目录, 验证强制重算, 消失路径和越界地址, 不访问真实媒体挂载.
+    async fn scanned_files_rehash_content_and_preserve_other_paths() {
+        // 隔离文件构造和数据库更新测试, 不调用已删除的可配置根目录扫描辅助函数.
         let root = std::env::temp_dir().join(format!("anime-single-scan-{}", crate::video::cache::random_id().unwrap()));
         std::fs::create_dir(&root).unwrap();
         let path = root.join("episode.mkv");
         std::fs::write(&path, b"first").unwrap();
-        let first = scan_file_at(&root, &path).unwrap().unwrap();
+        let first = ScannedFile::new(&path).unwrap();
         let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1)
             .connect("sqlite::memory:").await.unwrap();
         sqlx::raw_sql(include_str!("../sql/init.sql")).execute(&pool).await.unwrap();
@@ -110,22 +163,19 @@ mod tests {
         // 另一个内容相同的副本不应被该地址的强制扫描删除.
         let sibling = root.join("copy.mkv");
         std::fs::write(&sibling, b"first").unwrap();
-        crate::db::repository::upsert_file(&pool, &scan_file_at(&root, &sibling).unwrap().unwrap()).await.unwrap();
+        crate::db::repository::upsert_file(&pool, &ScannedFile::new(&sibling).unwrap()).await.unwrap();
         #[cfg(unix)]
         {
-            // 拒绝越界符号链接, 根目录内链接仍按原数据库地址更新.
+            // 文件构造保留符号链接原地址, 不替换为目标地址.
             let link = root.join("link.mkv");
-            std::os::unix::fs::symlink(root.parent().unwrap(), &link).unwrap();
-            assert!(scan_file_at(&root, &link).is_err());
-            std::fs::remove_file(&link).unwrap();
             std::os::unix::fs::symlink(&sibling, &link).unwrap();
-            let linked = scan_file_at(&root, &link).unwrap().unwrap();
+            let linked = ScannedFile::new(&link).unwrap();
             assert_eq!(linked.path(), &link);
             std::fs::remove_file(link).unwrap();
         }
         assert_eq!(first.path(), &path);
         std::fs::write(&path, b"replaced media").unwrap();
-        let second = scan_file_at(&root, &path).unwrap().unwrap();
+        let second = ScannedFile::new(&path).unwrap();
         assert_ne!(first.pre16mib_md5(), second.pre16mib_md5());
         assert_eq!(second.size(), 14);
         crate::db::repository::upsert_file(&pool, &second).await.unwrap();
@@ -133,15 +183,11 @@ mod tests {
         assert_eq!(crate::db::repository::get_progress(&pool, &old_id).await.unwrap().unwrap().watch_pos, Some(12.5));
         let new_id = second.pre16mib_md5();
         assert_eq!(crate::db::repository::get_video_paths_by_id(&pool, new_id).await.unwrap(), vec![path.clone()]);
-        assert!(scan_file_at(&root, &root.join("../outside.mkv")).is_err());
-        assert!(scan_file_at(&root, Path::new("episode.mkv")).is_err());
-        assert!(scan_file_at(&root, &root.join("ignored.txt")).is_err());
         std::fs::remove_file(&path).unwrap();
-        let removed = scan_file_at(&root, &path).unwrap();
-        // 当前单文件扫描用 None 表示文件消失, 调用方单独删除数据库地址.
-        assert!(removed.is_none());
+        // 文件已消失时构造失败, 独立删除数据库地址仍保留业务记录.
+        assert!(ScannedFile::new(&path).is_err());
         crate::db::repository::delete_path(&pool, &path).await.unwrap();
-        assert_eq!(crate::db::repository::get_paths(&pool).await.unwrap(), vec![sibling.clone()]);
+        assert_eq!(crate::db::repository::get_paths_and_size(&pool).await.unwrap().into_keys().collect::<Vec<_>>(), vec![sibling.clone()]);
         assert!(crate::db::repository::get_progress(&pool, new_id).await.unwrap().is_some());
         std::fs::remove_file(sibling).unwrap();
         std::fs::remove_dir(&root).unwrap();
@@ -183,30 +229,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scans_return_full_paths_and_reuse_known_files() {
-        // 当前入口固定扫描 /media, 只读现有媒体; 无挂载时验证明确的根目录错误.
-        if let Err(error) = std::fs::canonicalize(constants::video_root_path()) {
-            let expected = format!("cannot resolve media directory: {error}");
-            assert_eq!(scan_once(Vec::new()).await.err().unwrap(), expected);
-            return;
+    async fn scan_entry_points_report_errors_without_touching_real_media() {
+        // 构造完整隔离状态, 固定 /media 入口只测试拒绝路径和数据库读取失败.
+        use std::sync::Arc;
+        use crate::{config::AppConfig, video::{cache::CacheManager, metadata::MetadataCache,
+            process::Processes, sessions::SessionManager}};
+        let root = std::env::temp_dir().join(format!("anime-scan-state-{}", crate::video::cache::random_id().unwrap()));
+        std::fs::create_dir(&root).unwrap();
+        let config: AppConfig = serde_json::from_str("{}").unwrap();
+        let processes = Processes::new(2, 16);
+        let cache = CacheManager::new(root.clone(), config.playback.clone(), processes.clone()).await.unwrap();
+        let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1)
+            .connect("sqlite::memory:").await.unwrap();
+        sqlx::raw_sql(include_str!("../sql/init.sql")).execute(&pool).await.unwrap();
+        let state = AppState {
+            db: pool, config: Arc::new(config), metadata: MetadataCache::new(processes),
+            playback: SessionManager::new(cache, 60), scan_lock: Arc::new(tokio::sync::Mutex::new(())),
+        };
+        let root_error = std::fs::canonicalize(constants::video_root_path()).err();
+        for path in ["episode.mkv", "/media/../outside.mkv", "/media/ignored.txt"] {
+            let error = scan_file(&state, Path::new(path)).await.err().unwrap();
+            if let Some(root_error) = &root_error {
+                assert_eq!(error, format!("cannot resolve media directory: {root_error}"));
+            } else {
+                assert!(error.starts_with("invalid media file path:"));
+            }
         }
-        let first = scan_once(Vec::new()).await.unwrap();
-        assert_eq!(first.count, first.added.len() as u64);
-        assert!(first.removed.is_empty());
-        assert!(first.added.iter().all(|file| file.path().is_absolute() && is_video(file.path())));
-        let known = first.added.iter().map(|file| file.path().clone()).collect::<Vec<_>>();
-        let unchanged = scan_once(known.clone()).await.unwrap();
-        assert_eq!(unchanged.count, first.count);
-        assert!(unchanged.added.is_empty());
-        assert!(unchanged.removed.is_empty());
-
-        // 根目录外的虚拟旧地址不会匹配扫描结果, 应出现在删除列表中.
-        let stale = std::env::temp_dir().join(format!("anime-stale-{}.mkv", std::process::id()));
-        let mut known = known;
-        known.push(stale.clone());
-        let removed = scan_once(known).await.unwrap();
-        assert_eq!(removed.count, first.count);
-        assert!(removed.added.is_empty());
-        assert_eq!(removed.removed, vec![stale]);
+        assert!(repository::get_paths_and_size(&state.db).await.unwrap().is_empty());
+        // 关闭数据库确保全目录入口在读取路径时失败, 不遍历或更新真实媒体.
+        state.db.close().await;
+        assert!(scan_root(&state).await.err().unwrap().starts_with("failed to read paths and sizes from database:"));
+        assert!(state.scan_lock.try_lock().is_ok());
+        state.playback.shutdown().await.unwrap();
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

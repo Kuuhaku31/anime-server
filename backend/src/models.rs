@@ -19,8 +19,6 @@ pub(crate) struct VideoFile {
     pub(crate) watch_pos: Option<f64>,
     pub(crate) watched_datetime: Option<String>,
     pub(crate) path: String,
-    pub(crate) name_no_ext: String,
-    pub(crate) extension: String,
 }
 
 
@@ -53,7 +51,14 @@ pub(crate) struct ScannedFile {
 impl ScannedFile {
 
     pub(crate) fn new(path: &Path) -> Result<Self, String> {
+        // 地址始终为完整绝对文件地址, 不规范化符号链接以保留原路径身份.
+        if !path.is_absolute() || path.to_str().is_none()
+            || path.components().any(|part| matches!(part, std::path::Component::ParentDir))
+        {
+            return Err(format!("invalid absolute file path: {}", path.display()));
+        }
         let metadata = std::fs::metadata(path).map_err(|e| e.to_string())?;
+        if !metadata.is_file() { return Err(format!("not a file: {}", path.display())); }
         let path_buf = path.to_path_buf();
         let hash = utils::md5_hash_prefix(&path_buf, HASH_LIMIT)?;
         Ok(Self {
@@ -67,14 +72,11 @@ impl ScannedFile {
     pub(crate) fn pre16mib_md5      (&self) -> &str { &self.pre16mib_md5 }
     pub(crate) fn size              (&self) -> i64 { self.size }
     pub(crate) fn path              (&self) -> &PathBuf { &self.path }
-    pub(crate) fn file_dir          (&self) -> Option<&std::path::Path> { self.path.parent() }
-    pub(crate) fn file_name_no_ext  (&self) -> Option<&str> { self.path.file_stem().and_then(|s| s.to_str()) }
-    pub(crate) fn file_extension    (&self) -> Option<&str> { self.path.extension().and_then(|s| s.to_str()) }
 }
 
 
 pub(crate) struct ScanChanges {
-    pub(crate) added: Vec<ScannedFile>,
-    pub(crate) removed: Vec<PathBuf>,
-    pub(crate) count: u64, // 所有现存视频路径数
+    pub(crate) added: u64,
+    pub(crate) removed: u64,
+    pub(crate) total: u64, // 所有现存视频路径数
 }

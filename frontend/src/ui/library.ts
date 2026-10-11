@@ -5,7 +5,7 @@ import { element } from "./controls.ts";
 
 // 服务器地址是列表身份, 重扫导致指纹变化时同地址仍对应同一行.
 export function fileAddress(file: VideoFile): string {
-  return `${file.path.replace(/\/$/, "")}/${file.name_no_ext}.${file.extension}`;
+  return file.path;
 }
 
 export class Library {

@@ -31,9 +31,9 @@ test("rescan submits the displayed path once and restores the button after error
   };
   const file = {
     pre16mib_md5: "a".repeat(32), name: "episode.part.MKV", size: 100, ddp_epi_id: null,
-    path: "/media/series", name_no_ext: "episode.part", extension: "MKV",
+    path: "/media/series/episode.part.MKV",
   };
-  const copy = { ...file, path: "/media/copies" };
+  const copy = { ...file, path: "/media/copies/episode.part.MKV" };
   const calls = [];
   const errors = [];
   let complete;

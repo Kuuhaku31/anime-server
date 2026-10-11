@@ -15,9 +15,7 @@ use serde_json::json;
 use tracing::info;
 
 use crate::{
-    models::ProgressInput,
-    db::{repository},
-    AppState,
+    AppState, db::repository, models::ProgressInput, scanner,
 };
 
 mod playback;
@@ -43,7 +41,7 @@ async fn get_config(State(state): State<AppState>) -> impl IntoResponse {
 
 /// 获取全部视频记录.
 async fn list_files(State(state): State<AppState>) -> impl IntoResponse {
-    match repository::get_videos(&state.db).await {
+    match repository::get_video_files(&state.db).await {
         Ok(items) => (StatusCode::OK, Json(items)).into_response(),
         Err(error) => internal_error(error),
     }
@@ -132,12 +130,12 @@ async fn save_progress(
 
 /// 执行一次媒体目录扫描.
 async fn scan(State(state): State<AppState>) -> impl IntoResponse {
-    match crate::scan_once(&state).await {
+    match scanner::scan_root(&state).await {
         Ok(change) => (
             StatusCode::OK,
             Json(json!({
                 "ok": true,
-                "scanned": change.count,
+                "scanned": change.total,
             })),
         )
             .into_response(),
@@ -162,26 +160,18 @@ async fn scan_file(
     let _scan = state.scan_lock.lock().await;
     info!("服务端获得扫描锁, 开始扫描: {:?}", input.path);
 
-    let file = match crate::scanner::scan_file(&input.path).await {
-        Ok(file) => file,
+    // 扫描
+    let file = match crate::scanner::scan_file(&state, &input.path).await {
+        Ok(f) => f,
         Err(error) => {
             tracing::warn!("single file scan failed: {error}, path: {:?}", input.path);
             return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"error": error}))).into_response();
         },
     };
 
-    // 如果扫描结果为 None, 说明文件不存在或不在媒体目录内, 删除数据库中对应路径记录.
-    // 如果扫描结果为 Some, 则将扫描结果写入数据库, 覆盖原有路径关联.
-    if let Some(f) = file.as_ref() {
-        info!("服务端完成单文件扫描请求: {:?}, hash: {:?}", input.path, f.pre16mib_md5());
-        let _ = repository::upsert_file(&state.db, &f).await;
-    } else {
-        info!("服务端完成单文件扫描请求: {:?}, 文件不存在或不在媒体目录内", input.path);
-        let _ = repository::delete_path(&state.db, &input.path).await;
-    }
 
     let res = (StatusCode::OK, Json(json!({
-        "ok": true, "scanned": 1,
+        "ok": true, "scanned": usize::from(file.is_some()),
         "pre16mib_md5": file.as_ref().map(|f| f.pre16mib_md5()),
     }))).into_response();
 
