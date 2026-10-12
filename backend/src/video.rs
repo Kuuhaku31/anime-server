@@ -106,7 +106,7 @@ pub(crate) async  fn new_session(
 
     let spec = models::EncodeSpec::new(&id, source, info, request, watch_pos).unwrap();
 
-    let session = state.playback.create(&state.processes, spec).await.unwrap();
+    let session = state.playback.create(&state.processes, &state.cache, spec).await.unwrap();
 
     Ok(session)
 }

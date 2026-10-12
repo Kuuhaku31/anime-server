@@ -166,7 +166,7 @@ async fn target(
 
     let status = state
         .playback
-        .status(&id)
+        .status(&state.cache, &id)
         .await
         .map_err(ApiError::missing)?;
 
@@ -176,7 +176,7 @@ async fn target(
 
     let status = state
         .playback
-        .target(&id, input.position)
+        .target(&state.cache, &id, input.position)
         .await
         .map_err(ApiError::missing)?;
 
@@ -191,7 +191,7 @@ async fn status(
     Ok(Json(
         state
             .playback
-            .status(&id)
+            .status(&state.cache, &id)
             .await
             .map_err(ApiError::missing)?,
     ))
@@ -204,7 +204,7 @@ async fn heartbeat(
 ) -> Result<StatusCode, ApiError> {
     state
         .playback
-        .heartbeat(&id)
+        .heartbeat(&state.cache, &id)
         .await
         .map_err(ApiError::missing)?;
 
@@ -218,7 +218,7 @@ async fn release(
 ) -> Result<StatusCode, ApiError> {
     state
         .playback
-        .release(&id)
+        .release(&state.cache, &id)
         .await
         .map_err(ApiError::internal)?;
 
@@ -234,7 +234,7 @@ async fn media(
     // 持有 lease 直到 ServeFile 完成文件打开, 避免资源目录被提前删除.
     let (path, mime, _lease) = state
         .playback
-        .media_path(&id, &asset)
+        .media_path(&state.cache, &id, &asset)
         .await
         .map_err(ApiError::missing)?;
 

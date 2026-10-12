@@ -41,37 +41,36 @@ struct Session {
 #[derive(Clone)]
 pub(crate) struct SessionManager {
     sessions: Arc<Mutex<HashMap<String, Session>>>,
-    cache: CacheManager,
     idle_seconds: u64,
 }
 
 impl SessionManager {
-    pub(crate) fn new(cache: CacheManager, idle_seconds: u64) -> Self {
-        Self { sessions: Arc::new(Mutex::new(HashMap::new())), cache, idle_seconds }
+    pub(crate) fn new(idle_seconds: u64) -> Self {
+        Self { sessions: Arc::new(Mutex::new(HashMap::new())), idle_seconds }
     }
 
     /// 先预留会话名额再等待缓存加载, 防止并发创建绕过数量上限.
-    pub(crate) async fn create(&self, processes: &Processes, spec: EncodeSpec) -> Result<PlaybackStart> {
+    pub(crate) async fn create(&self, processes: &Processes, cache: &CacheManager, spec: EncodeSpec) -> Result<PlaybackStart> {
         let id = random_id()?;
         let key = spec.config.key()?;
         let media = spec.info.clone();
         let selection = (spec.config.audio_stream, spec.config.subtitle_stream);
         {
             let mut sessions = self.sessions.lock().await;
-            ensure!(!self.cache.stopping(), "server is shutting down");
+            ensure!(!cache.stopping(), "server is shutting down");
             ensure!(sessions.len() < 32, "too many playback sessions; stop an existing stream");
             sessions.insert(id.clone(), Session { variant_key: key.clone(), created: Instant::now(), touched: None });
         }
         // 等待旧写入者回收时不持有会话表锁, 其他客户端仍能立即释放租约.
         let result = async {
-            self.cache.acquire(processes, spec, &id).await?.wait_loaded().await?;
-            self.status(&id).await
+            cache.acquire(processes, spec, &id).await?.wait_loaded().await?;
+            self.status(cache, &id).await
         }.await;
         match result {
             Ok(session) => Ok(PlaybackStart::new(session, media, selection.0, selection.1)),
             Err(error) => {
                 self.sessions.lock().await.remove(&id);
-                if let Err(cleanup) = self.cache.release(&key, &id).await {
+                if let Err(cleanup) = cache.release(&key, &id).await {
                     return Err(error.context(format!("session cleanup failed: {cleanup:#}")));
                 }
                 Err(error)
@@ -87,9 +86,9 @@ impl SessionManager {
         Ok(session.variant_key.clone())
     }
 
-    pub(crate) async fn status(&self, id: &str) -> Result<SessionStatus> {
+    pub(crate) async fn status(&self, cache: &CacheManager, id: &str) -> Result<SessionStatus> {
         let key = self.key(id).await?;
-        let cache = self.cache.get(&key).await?;
+        let cache = cache.get(&key).await?;
         let status = cache.status(id).await?;
         Ok(SessionStatus {
             session_id: id.to_string(), url: format!("/playback/{id}/index.m3u8?revision={}", status.revision),
@@ -100,20 +99,20 @@ impl SessionManager {
         })
     }
 
-    pub(crate) async fn heartbeat(&self, id: &str) -> Result<()> {
-        self.status(id).await?;
+    pub(crate) async fn heartbeat(&self, cache: &CacheManager, id: &str) -> Result<()> {
+        self.status(cache, id).await?;
         Ok(())
     }
 
-    pub(crate) async fn target(&self, id: &str, target: f64) -> Result<SessionStatus> {
+    pub(crate) async fn target(&self, cache: &CacheManager, id: &str, target: f64) -> Result<SessionStatus> {
         let key = self.key(id).await?;
-        self.cache.target(&key, id, target).await?;
-        self.status(id).await
+        cache.target(&key, id, target).await?;
+        self.status(cache, id).await
     }
 
-    pub(crate) async fn media_path(&self, id: &str, name: &str) -> Result<(PathBuf, &'static str, Arc<ActiveCache>)> {
+    pub(crate) async fn media_path(&self, cache: &CacheManager, id: &str, name: &str) -> Result<(PathBuf, &'static str, Arc<ActiveCache>)> {
         let key = self.key(id).await?;
-        let (path, cache) = self.cache.media_path(&key, id, name).await?;
+        let (path, cache) = cache.media_path(&key, id, name).await?;
         let mime = if name.ends_with(".m3u8") { "application/vnd.apple.mpegurl" }
             else if name.ends_with(".m4s") { "video/iso.segment" } else { "video/mp4" };
         // 只在文件打开期间持有额外 Arc, 即使最后一份租约被删除也不会被 LRU 抢先删除.
@@ -121,52 +120,53 @@ impl SessionManager {
     }
 
     /// 先移除会话再释放租约, 重复释放和并发过期清理只会有一方实际扣除租约.
-    pub(crate) async fn release(&self, id: &str) -> Result<()> {
+    pub(crate) async fn release(&self, cache: &CacheManager, id: &str) -> Result<()> {
         let session = self.sessions.lock().await.remove(id);
-        if let Some(session) = session { self.cache.release(&session.variant_key, id).await?; }
+        if let Some(session) = session { cache.release(&session.variant_key, id).await?; }
         Ok(())
     }
 
-    pub(crate) fn spawn_expiration(&self) {
+    pub(crate) fn spawn_expiration(&self, cache: &CacheManager) {
         let manager = self.clone();
+        let cache = cache.clone();
         tokio::spawn(async move {
             let mut tick = interval(Duration::from_secs(5));
             loop {
                 tick.tick().await;
-                if manager.cache.stopping() { break; }
-                if let Err(error) = manager.expire().await {
+                if cache.stopping() { break; }
+                if let Err(error) = expire(&cache, &manager).await {
                     warn!("playback cache maintenance failed: {error:#}");
                 }
             }
         });
     }
 
-    // 锁内批量摘除过期会话, 锁外逐一清理, 单个失败不能阻断其余租约释放.
-    async fn expire(&self) -> Result<()> {
-        let expired = {
-            let mut sessions = self.sessions.lock().await;
-            let ids: Vec<_> = sessions.iter().filter(|(_, session)| match session.touched {
-                Some(touched) => touched.elapsed().as_secs() >= self.idle_seconds,
-                None => session.created.elapsed().as_secs() >= self.idle_seconds.max(120),
-            })
-                .map(|(id, _)| id.clone()).collect();
-            ids.into_iter().filter_map(|id| sessions.remove(&id).map(|session| (id, session))).collect::<Vec<_>>()
-        };
-        let mut errors = Vec::new();
-        for (id, session) in expired {
-            if let Err(error) = self.cache.release(&session.variant_key, &id).await {
-                errors.push(format!("session {id}: {error:#}"));
-            }
-        }
-        if let Err(error) = self.cache.maintain().await { errors.push(format!("{error:#}")); }
-        ensure!(errors.is_empty(), "session expiration failed: {}", errors.join("; "));
-        Ok(())
-    }
-
-    pub(crate) async fn shutdown(&self, processes: &Processes) -> Result<()> {
+    pub(crate) async fn shutdown(&self, cache: &CacheManager, processes: &Processes) -> Result<()> {
         self.sessions.lock().await.clear();
-        self.cache.shutdown(processes).await
+        cache.shutdown(processes).await
     }
+}
+
+// 锁内批量摘除过期会话, 锁外逐一清理, 单个失败不能阻断其余租约释放.
+async fn expire(cache: &CacheManager, manager: &SessionManager) -> Result<()> {
+    let expired = {
+        let mut sessions = manager.sessions.lock().await;
+        let ids: Vec<_> = sessions.iter().filter(|(_, session)| match session.touched {
+            Some(touched) => touched.elapsed().as_secs() >= manager.idle_seconds,
+            None => session.created.elapsed().as_secs() >= manager.idle_seconds.max(120),
+        })
+            .map(|(id, _)| id.clone()).collect();
+        ids.into_iter().filter_map(|id| sessions.remove(&id).map(|session| (id, session))).collect::<Vec<_>>()
+    };
+    let mut errors = Vec::new();
+    for (id, session) in expired {
+        if let Err(error) = cache.release(&session.variant_key, &id).await {
+            errors.push(format!("session {id}: {error:#}"));
+        }
+    }
+    if let Err(error) = cache.maintain().await { errors.push(format!("{error:#}")); }
+    ensure!(errors.is_empty(), "session expiration failed: {}", errors.join("; "));
+    Ok(())
 }
 
 

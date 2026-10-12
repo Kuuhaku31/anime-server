@@ -36,6 +36,7 @@ struct AppState {
     metadata: MetadataCache, // 元数据缓存
     processes: Processes, // 共享的 FFmpeg 进程池
     playback: SessionManager, // 播放会话管理
+    cache: CacheManager, // 缓存管理
 }
 
 
@@ -74,7 +75,7 @@ async fn main() -> Result<()> {
 
     info!("cache manager initialized at {}", constants::CACHE_DIR);
 
-    let playback = SessionManager::new(cache, config.playback.idle_timeout_seconds);
+    let playback = SessionManager::new(config.playback.idle_timeout_seconds);
     let metadata = MetadataCache::new();
 
     let state = AppState {
@@ -84,6 +85,7 @@ async fn main() -> Result<()> {
         playback: playback.clone(),
         scan_lock: Arc::new(tokio::sync::Mutex::new(())),
         processes,
+        cache,
     };
 
     // 启动后台扫描任务, 定期扫描视频目录并更新数据库和元数据缓存.
@@ -99,11 +101,12 @@ async fn main() -> Result<()> {
             sleep(Duration::from_secs(s.config.scan_interval_seconds)).await;
         }
     });
-    state.playback.spawn_expiration(); // 启动一个后台异步任务, 定期回收失去联系的播放会话并维护磁盘缓存
+    state.playback.spawn_expiration(&state.cache); // 启动一个后台异步任务, 定期回收失去联系的播放会话并维护磁盘缓存
     info!("background tasks started: video scan and playback session expiration");
 
     // API 和前端静态文件由同一端口提供, 浏览器通过同源相对 URL 访问服务.
     let processes = state.processes.clone();
+    let cache = state.cache.clone();
     let app = api::router(state)
     .route("/health", get(|| async { Json(serde_json::json!({"status": "ok"})) }))
 
@@ -130,7 +133,7 @@ async fn main() -> Result<()> {
         }
 
         // 等待分片边界落盘并回收子进程, 不依赖容器强制终止来结束转码.
-        if let Err(error) = playback.shutdown(&processes).await {
+        if let Err(error) = playback.shutdown(&cache, &processes).await {
             tracing::error!("playback shutdown failed: {error:#}");
         }
     }).await?;
