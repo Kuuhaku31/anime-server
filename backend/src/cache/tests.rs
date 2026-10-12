@@ -1,5 +1,75 @@
 //! 集中保存缓存状态, 生命周期及磁盘淘汰测试, 保持原有注释禁用状态.
 
+use super::{CacheFolder, CachedMedia, FolderState};
+use crate::{models::PlaybackVariantConfig, video::{self, EncodeSpec}};
+use std::{path::PathBuf, time::SystemTime};
+use tokio::sync::{watch, Mutex, Notify};
+
+fn state() -> FolderState {
+    let (cancel, _) = watch::channel(false);
+    FolderState {
+        media: CachedMedia::default(),
+        loaded: true,
+        active: true,
+        worker_active: true,
+        encoding: false,
+        finalizing: false,
+        encoding_threads: 0,
+        desired_threads: 2,
+        start_requested: false,
+        stop_after: None,
+        stop_deadline: None,
+        cancel,
+        revision: 1,
+        last_used: SystemTime::now(),
+        error: None,
+    }
+}
+
+fn folder() -> CacheFolder {
+    let (info, request) = video::fixture();
+    let config = PlaybackVariantConfig::new(&"a".repeat(32), &info, &request).unwrap();
+    CacheFolder {
+        key: config.key().to_owned(),
+        directory: PathBuf::new(),
+        spec: EncodeSpec::from_config(config, PathBuf::new(), info).unwrap(),
+        state: Mutex::new(state()),
+        changed: Notify::new(),
+    }
+}
+
+#[tokio::test]
+async fn worker_waits_for_an_explicit_start_request() {
+    let folder = folder();
+    let mut cancel = folder.state.lock().await.cancel.subscribe();
+    let waiting = folder.wait_start(&mut cancel);
+    tokio::pin!(waiting);
+    assert!(tokio::time::timeout(std::time::Duration::from_millis(10), &mut waiting).await.is_err());
+
+    folder.state.lock().await.request_start(8);
+    folder.changed.notify_waiters();
+    tokio::time::timeout(std::time::Duration::from_secs(1), waiting).await.unwrap().unwrap();
+}
+
+#[test]
+fn start_requests_can_change_before_encoding_and_are_ignored_afterward() {
+    let mut state = state();
+
+    assert!(state.request_start(8));
+    assert!(state.request_start(4));
+    assert_eq!(state.desired_threads, 4);
+    assert!(state.start_requested);
+
+    state.encoding = true;
+    assert!(!state.request_start(8));
+    assert_eq!(state.desired_threads, 4);
+
+    state.encoding = false;
+    state.media.complete = true;
+    assert!(!state.request_start(8));
+    assert_eq!(state.desired_threads, 4);
+}
+
 // use super::*;
 
 // #[tokio::test]
@@ -36,7 +106,7 @@
 //
 //     folder.state.lock().await.stop_after = Some(2);
 //     assert!(folder.status().await.unwrap().stopping());
-//     folder.state.lock().await.target = None;
+//     folder.state.lock().await.active = false;
 //     assert!(folder.status().await.is_err());
 // }
 
@@ -65,7 +135,7 @@
 //     CacheFolder {
 //         key: config.key().to_owned(),
 //         directory: PathBuf::new(),
-//         spec: EncodeSpec::from_config(config, "video.mkv".into(), info, 0.0).unwrap(),
+//         spec: EncodeSpec::from_config(config, "video.mkv".into(), info).unwrap(),
 //         state: Mutex::new(FolderState {
 //             media: CachedMedia {
 //                 complete: true, init: None,
@@ -73,7 +143,7 @@
 //                     start: Tail::default(), end: Tail { video: 360000, audio: 192000 }, sequence: 1,
 //                 }],
 //             },
-//             loaded: true, target: Some(0.0), worker_active: true, encoding: false,
+//             loaded: true, active: true, worker_active: true, encoding: false,
 //             finalizing: true, encoding_threads: 2, stop_after: None, stop_deadline: None,
 //             cancel: watch::channel(false).0, revision: 42,
 //             last_used: SystemTime::UNIX_EPOCH, error: Some("fixture error".to_owned()),

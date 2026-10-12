@@ -34,13 +34,15 @@ pub(crate) struct FolderState {
     media: CachedMedia,
     // 恢复完成前的空 media 只是占位, 不能作为创建响应返回.
     loaded: bool,
-    target: Option<f64>,
+    active: bool,
     // worker 覆盖整个任务生命周期, encoding 仅表示编码进程仍在运行.
     worker_active: bool,
     encoding: bool,
     // 开始最终清理后不能撤销停止, 新租约必须等待旧写入者退出.
     finalizing: bool,
     encoding_threads: usize,
+    desired_threads: usize,
+    start_requested: bool,
     stop_after: Option<usize>,
     stop_deadline: Option<Instant>,
     cancel: watch::Sender<bool>,
@@ -69,7 +71,8 @@ pub(crate) struct CachePin {
 /// 缓存统一入口, 独占目录锁并管理两个按需加载的 Map.
 ///
 /// new 校验缓存根目录并初始化临时资源目录和容量维护.
-/// media_info 查询或重试成功元数据缓存, acquire 激活指定播放配置的共享文件夹.
+/// media_info 查询或重试成功元数据缓存, acquire 恢复共享缓存并返回状态快照.
+/// start 校验并保存启动线程数, 但不接收播放等待位置.
 /// status 返回字段私有的 FolderState 快照, duration 独立读取不可变执行参数.
 /// shutdown 拒绝新请求, 停止生成任务并等待写入者退出.
 #[derive(Clone)]
@@ -118,10 +121,10 @@ impl CacheManager {
         Ok(manager)
     }
 
-    // 查找或创建共享缓存
-    pub(crate) async fn acquire(&self, config: &PlaybackVariantConfig) -> Result<()> {
+    // 恢复并激活共享缓存, 不启动新的 FFmpeg 编码任务.
+    pub(crate) async fn acquire(&self, config: &PlaybackVariantConfig) -> Result<FolderState> {
         let key = config.key().to_owned();
-        loop {
+        let output = loop {
             let entries = self.inner.entries.lock().await;
             ensure!(!self.is_stopping(), "server is shutting down");
             if let Some(output) = entries.get(&key).cloned() {
@@ -137,26 +140,27 @@ impl CacheManager {
                     notified.await;
                     continue;
                 }
+                state.active = true;
                 state.last_used = SystemTime::now();
-                state.target = Some(0.0);
                 state.stop_after = None;
                 state.stop_deadline = None;
                 if !state.media.complete && !state.worker_active {
                     state.worker_active = true;
                     state.error = None;
                     state.cancel = watch::channel(false).0;
+                    state.start_requested = false;
                     state.revision = REVISION.fetch_add(1, Ordering::Relaxed);
                     self.spawn(&output).await;
                 }
                 drop(state);
-                return Ok(());
+                break output.clone();
             }
             ensure!(entries.len() < 32, "too many active playback configurations");
             drop(entries);
             let info = self.media_info(config.src_file_pre16mib_md5(), false).await?;
             let source = db::get_a_video_path_by_id(&self.inner.database, config.src_file_pre16mib_md5()).await?
                 .context("video file not found")?;
-            let spec = EncodeSpec::from_config(config.clone(), source, info, 0.0)?;
+            let spec = EncodeSpec::from_config(config.clone(), source, info)?;
             let mut entries = self.inner.entries.lock().await;
             ensure!(!self.is_stopping(), "server is shutting down");
             if entries.contains_key(&key) { continue; }
@@ -164,8 +168,10 @@ impl CacheManager {
             let output = Arc::new(CacheFolder {
                 key: key.to_string(), directory: self.inner.root.join("playback").join(&key), spec: spec.clone(),
                 state: Mutex::new(FolderState {
-                    media: CachedMedia::default(), loaded: false, target: Some(spec.target),
-                    worker_active: true, encoding: false, finalizing: false, encoding_threads: 0,
+                    media: CachedMedia::default(), loaded: false, active: true,
+                    worker_active: true, encoding: false, finalizing: false,
+                    encoding_threads: 0, desired_threads: self.inner.config.ffmpeg_threads,
+                    start_requested: false,
                     stop_after: None, stop_deadline: None, cancel: watch::channel(false).0,
                     revision: REVISION.fetch_add(1, Ordering::Relaxed), last_used: SystemTime::now(), error: None,
                 }),
@@ -177,12 +183,10 @@ impl CacheManager {
                 Entry::Occupied(_) => bail!("playback activation raced while holding its lock"),
             }
             self.spawn(&output).await;
-            return Ok(());
-        }
-    }
-
-    pub(crate) async fn wait_loaded(&self, key: &str) -> Result<()> {
-        self.get(key).await?.wait_loaded().await
+            break output;
+        };
+        output.wait_loaded().await?;
+        output.status().await
     }
 
     pub(crate) async fn status(&self, key: &str) -> Result<FolderState> {
@@ -194,22 +198,51 @@ impl CacheManager {
         Ok(self.get(key).await?.spec.duration)
     }
 
-    /// 更新等待目标但不重建缓存, 运行中的编码进程也不会因此热调线程.
-    pub(crate) async fn target(&self, key: &str, target: f64) -> Result<()> {
-        let output = self.get(key).await?;
-        ensure!(target.is_finite() && target >= 0.0 && target < output.spec.duration, "position must be within the video duration");
-        let mut state = output.state.lock().await;
-        state.target = Some(target);
-        state.last_used = SystemTime::now();
-        Ok(())
+    /// 返回 SessionManager 选择启动线程数所需的基础值和变体上限.
+    pub(crate) fn thread_limits(&self) -> (usize, usize) {
+        (self.inner.config.ffmpeg_threads, self.inner.config.max_variant_threads)
     }
 
-    /// 最后一个会话离开时解除目标并停止缓存生成.
+    /// 请求启动未完成缓存; 编码启动前的并发请求可以覆盖期望线程数.
+    pub(crate) async fn start(&self, key: &str, desired_threads: usize) -> Result<()> {
+        let (base, maximum) = self.thread_limits();
+        ensure!(desired_threads >= base && desired_threads <= maximum,
+            "requested encoder threads must be between {base} and {maximum}");
+        loop {
+            ensure!(!self.is_stopping(), "server is shutting down");
+            let output = self.get(key).await?;
+            let notified = output.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let mut state = output.state.lock().await;
+            ensure!(state.active, "playback cache has no active session");
+            if state.finalizing || (state.worker_active && *state.cancel.borrow()) {
+                drop(state);
+                notified.await;
+                continue;
+            }
+            if !state.request_start(desired_threads) { return Ok(()); }
+            state.last_used = SystemTime::now();
+            if !state.worker_active {
+                state.worker_active = true;
+                state.error = None;
+                state.finalizing = false;
+                state.cancel = watch::channel(false).0;
+                state.revision = REVISION.fetch_add(1, Ordering::Relaxed);
+                self.spawn(&output).await;
+            }
+            output.changed.notify_waiters();
+            return Ok(());
+        }
+    }
+
+    /// 最后一个会话离开时标记为非活动并停止缓存生成.
     pub(crate) async fn release(&self, key: &str) -> Result<()> {
         let entries = self.inner.entries.lock().await;
         let Some(output) = entries.get(key).cloned() else { return Ok(()); };
         let mut state = output.state.lock().await;
-        if state.target.take().is_none() { return Ok(()); }
+        if !state.active { return Ok(()); }
+        state.active = false;
         state.last_used = SystemTime::now();
         if state.worker_active {
             CacheFolder::stop(&mut state);
@@ -230,7 +263,7 @@ impl CacheManager {
         ensure!(video::media_filename(name), "playback asset not found");
         let output = self.get(key).await?;
         let mut state = output.state.lock().await;
-        ensure!(state.target.is_some(), "playback cache has no active session");
+        ensure!(state.active, "playback cache has no active session");
         ensure!(!state.media.segments.is_empty(), "playback output is not ready");
         if let Some(index) = name.strip_prefix("segment_").and_then(|name| name.strip_suffix(".m4s")) {
             ensure!(index.parse::<usize>()? < state.media.segments.len(), "playback segment is not published");
@@ -258,7 +291,7 @@ impl CacheManager {
             for (key, folder) in entries.iter() {
                 if Arc::strong_count(folder) != 1 { continue; }
                 let state = folder.state.lock().await;
-                if state.target.is_none() && !state.worker_active && !state.finalizing {
+                if !state.active && !state.worker_active && !state.finalizing {
                     removable.push(key.clone());
                 }
             }
@@ -292,7 +325,7 @@ impl CacheManager {
             let entries = self.inner.entries.lock().await;
             for output in entries.values() {
                 let mut state = output.state.lock().await;
-                state.target = None;
+                state.active = false;
                 if state.worker_active { CacheFolder::stop(&mut state); }
             }
         }
@@ -343,7 +376,7 @@ impl CacheManager {
         let mut state = output.state.lock().await;
         state.finalizing = true;
         if let Err(error) = result {
-            if !error.is::<Cancelled>() || state.target.is_some() {
+            if !error.is::<Cancelled>() || state.active {
                 state.error = Some(format!("{error:#}"));
                 warn!(variant_key = output.key, "cache generation failed: {error:#}");
             }
@@ -380,6 +413,7 @@ impl CacheManager {
         output.changed.notify_waiters();
         if complete { return Ok(()); }
         check_cancel(cancel)?;
+        output.wait_start(cancel).await?;
         if resume.video > 0 && !video::has_video_after(&output.spec, resume, processes, cancel).await? {
             return self.complete(output).await;
         }
@@ -418,7 +452,7 @@ impl CacheManager {
             };
             assets.prepare(&output.spec, seconds, cancel).await?;
         }
-        // 排队时只取基础预算, 等到真正启动前才按最新客户端目标申请额外线程.
+        // 先取得基础预算, 真正启动前再读取 SessionManager 最新提交的期望线程数.
         let encoder = tokio::select! {
             biased;
             _ = cancelled(cancel) => return Err(Cancelled.into()),
@@ -434,11 +468,8 @@ impl CacheManager {
         let mut child = {
             let mut state = output.state.lock().await;
             check_cancel(cancel)?;
-            ensure!(state.target.is_some(), "cache generation has no active session");
-            let desired = if state.target.is_some_and(|target| target >= state.media.tail().seconds()) {
-                self.inner.config.max_variant_threads
-            } else { base };
-            processes.extend_encoding_threads(&mut threads, desired)?;
+            ensure!(state.active && state.start_requested, "cache generation has no active start request");
+            processes.extend_encoding_threads(&mut threads, state.desired_threads)?;
             let child = video::command(&output.spec, directory, assets, resume, threads.num_permits())?
                 .spawn().context("failed to start FFmpeg")?;
             state.encoding = true;
@@ -639,9 +670,26 @@ impl CacheFolder {
 
     async fn status(&self) -> Result<FolderState> {
         let mut state = self.state.lock().await;
-        state.target.context("playback cache has no active session")?;
+        ensure!(state.active, "playback cache has no active session");
         state.last_used = SystemTime::now();
         Ok(state.clone())
+    }
+
+    async fn wait_start(&self, cancel: &mut watch::Receiver<bool>) -> Result<()> {
+        loop {
+            check_cancel(cancel)?;
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let state = self.state.lock().await;
+            ensure!(state.active, "playback cache has no active session");
+            if state.start_requested { return Ok(()); }
+            drop(state);
+            tokio::select! {
+                _ = &mut notified => {},
+                _ = cancelled(cancel) => return Err(Cancelled.into()),
+            }
+        }
     }
 
     fn stop(state: &mut FolderState) {
@@ -652,6 +700,16 @@ impl CacheFolder {
         } else {
             state.cancel.send_replace(true);
         }
+    }
+}
+
+impl FolderState {
+    // 编码启动前允许并发创建更新请求, 启动后保留当前任务线程数.
+    fn request_start(&mut self, desired_threads: usize) -> bool {
+        if self.media.complete || self.encoding { return false; }
+        self.desired_threads = desired_threads;
+        self.start_requested = true;
+        true
     }
 }
 

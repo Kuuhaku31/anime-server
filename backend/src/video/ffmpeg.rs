@@ -387,8 +387,7 @@ use super::*;
     fn make_spec(id: &str, source: &str, info: MediaInfo, request: PlaybackRequest, saved: Option<f64>) -> anyhow::Result<EncodeSpec> {
         let request = request.with_saved_position(saved);
         let config = PlaybackVariantConfig::new(id, &info, &request)?;
-        let target = playback_target(&info, &request)?;
-        EncodeSpec::from_config(config, source.into(), info, target)
+        EncodeSpec::from_config(config, source.into(), info)
     }
 
     // #[test]
@@ -396,14 +395,11 @@ use super::*;
     //     // file ID 默认请求使用服务端进度和默认轨道, null 仍可关闭音轨.
     //     let (info, request) = fixture();
     //     let spec = make_spec(&"a".repeat(32), "video", info.clone(), request, Some(7.375)).unwrap();
-    //     assert_eq!(spec.target, 7.375);
     //     assert_eq!(spec.config.audio_stream, Some(1));
     //     let request = serde_json::from_str(r#"{"audio_stream_index":null,"subtitle_stream_index":2,"position":8.5}"#).unwrap();
     //     let changed = make_spec(&"a".repeat(32), "video", info.clone(), request, Some(3.0)).unwrap();
-    //     assert_eq!(changed.target, 8.5);
     //     assert_eq!(changed.config.audio_stream, None);
     //     assert_eq!(changed.config.subtitle_stream, Some(2));
-    //     assert_eq!(make_spec(&"a".repeat(32), "video", info, PlaybackRequest::default(), Some(19.0)).unwrap().target, 0.0);
     // }
 
     // #[test]
@@ -433,7 +429,7 @@ use super::*;
         for position in [-1.0, f64::NAN, f64::INFINITY, 20.0] {
             let (info, mut request) = fixture();
             request.position = Some(position);
-            assert!(make_spec(&"a".repeat(32), "video", info, request, None).is_err());
+            assert!(playback_target(&info, &request).is_err());
         }
         for value in [
             serde_json::json!({"video_stream_index":0}), serde_json::json!({"encoder_profile":ENCODER_PROFILE}),

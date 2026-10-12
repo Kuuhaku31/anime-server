@@ -151,8 +151,11 @@ Web 界面在缓存状态及生成范围连续 180 秒没有进展时显示错�
 HLS 元数据加载最多等待 30 秒, 超时后显示错误并释放租约.
 最后一个租约释放时, 编码器最多再提交一个完整分片, 30 秒内仍未完成则强制停止.
 
-任务启动前, 如果任一客户端目标尚未覆盖, 非阻塞申请最多 `max_variant_threads` 个线程;
-否则只申请基础线程. 预算不足时使用当前可取得且不低于基础值的数量启动.
+缓存恢复与编码启动分两步. CacheManager 恢复磁盘状态并返回 `buffered_until` 快照,
+不读取或保存会话等待位置. SessionManager 在创建会话时聚合同一 variant 的最大 position;
+当该位置大于或等于快照尾部时请求 `max_variant_threads`, 否则请求基础线程数.
+CacheManager 校验线程数范围, 并在 FFmpeg 实际启动前接受并发会话更新的请求.
+普通 position 更新不通知 CacheManager. 预算不足时使用当前可取得且不低于基础值的数量启动.
 运行中的任务不热调, 不抢占其他任务的线程, 实际编码进程退出时归还许可.
 这个预算不包括解码器, 滤镜和工具内部辅助线程, 不是操作系统线程总数上限.
 默认 2 个进程名额仅容纳一个编码器加一个校验进程; 需要两个编码器时将 `max_processes` 设为 3.
@@ -284,7 +287,9 @@ VFR 输入按同一恒帧率规则采样, 必要的重复或丢帧来自固定�
 查询数据库中的源文件路径并运行 ffprobe; 显式 probe 会跳过已有结果, 探测失败不会缓存.
 服务重启后元数据重新探测.
 
-播放请求和媒体文件路径由不同边界管理. API 负责将数据库中的轨道偏好和观看进度合并到
+播放请求和媒体文件路径由不同边界管理. CacheManager 的活动状态只表示 variant 是否仍有会话,
+等待 position 仅保存在 SessionManager. 创建时由 SessionManager 决定期望线程数,
+并在恢复完成后调用 CacheManager 启动未完成缓存. API 负责将数据库中的轨道偏好和观看进度合并到
 `PlaybackRequest`; SessionManager 按文件 MD5 向 CacheManager 临时取得 `MediaInfo`,
 构造不可变的 `PlaybackVariantConfig` 并计算 variant-key. CacheManager 接收该配置,
 自行查询源路径并组装编码参数, 活动缓存 Map 仅在相应 variant 被请求时创建条目.

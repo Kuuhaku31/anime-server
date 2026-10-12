@@ -16,7 +16,6 @@ pub(crate) struct EncodeSpec {
     pub(super) info: MediaInfo,
     pub(crate) subtitle: Option<Track>,
     pub(super) hdr: bool,
-    pub(crate) target: f64,
 }
 
 fn select(tracks: &[Track], index: Option<i32>, kind: &str) -> Result<Option<Track>> {
@@ -25,15 +24,14 @@ fn select(tracks: &[Track], index: Option<i32>, kind: &str) -> Result<Option<Tra
 }
 
 impl EncodeSpec {
-    pub(crate) fn from_config(config: PlaybackVariantConfig, source: PathBuf, info: MediaInfo, target: f64) -> Result<Self> {
+    pub(crate) fn from_config(config: PlaybackVariantConfig, source: PathBuf, info: MediaInfo) -> Result<Self> {
         let video = info.video_tracks.iter().find(|track| track.stream_index == config.video_stream())
             .context("configured video track does not exist")?;
         select(&info.audio_tracks, config.audio_stream(), "audio")?;
         let subtitle = select(&info.subtitle_tracks, config.selection().1, "subtitle")?;
-        ensure!(target.is_finite() && target >= 0.0 && target < info.duration, "position must be within the video duration");
         Ok(Self {
             config, source, duration: info.duration, source_start: info.start_time,
-            hdr: video.is_hdr(), info, subtitle, target,
+            hdr: video.is_hdr(), info, subtitle,
         })
     }
 }

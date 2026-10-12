@@ -35,6 +35,8 @@ pub(crate) use models::EncodeSpec;
 pub(crate) use ffmpeg::{CachedMedia, command, has_video_after, recover, read_playlist, media_filename,
     regular_bytes, atomic_file, segment_name, sync_directory, write_playlist, validate_segment};
 pub(crate) use fragment::{Init, Tail, normalize};
+#[cfg(test)]
+pub(crate) use ffmpeg::fixture;
 pub(crate) use process::{cancelled, check_cancel, read_tail, Cancelled};
 
 /// 不可变的播放变体身份配置, 由媒体信息和客户端轨道请求构造.

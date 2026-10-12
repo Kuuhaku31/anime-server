@@ -72,16 +72,16 @@ impl SessionManager {
         }
         // 等待旧写入者回收时不持有会话表锁, 其他客户端仍能立即释放租约.
         let result = async {
-            self.cache.acquire(&config).await?;
-            self.refresh_variant_target(&key).await?;
-            self.cache.wait_loaded(&key).await?;
+            let cache = self.cache.acquire(&config).await?;
+            let threads = self.desired_threads(&key, cache.buffered_until()).await?;
+            self.cache.start(&key, threads).await?;
             self.status(&id).await
         }.await;
         match result {
             Ok(session) => Ok(PlaybackStart::new(session, media, selection.0, selection.1)),
             Err(error) => {
                 self.sessions.lock().await.remove(&id);
-                if let Err(cleanup) = self.refresh_variant_target(&key).await {
+                if let Err(cleanup) = self.refresh_variant(&key).await {
                     return Err(error.context(format!("session cleanup failed: {cleanup:#}")));
                 }
                 Err(error)
@@ -123,14 +123,12 @@ impl SessionManager {
         let current = self.status(id).await?;
         ensure!(target.is_finite() && target >= 0.0 && target < current.duration,
             "position must be within the video duration");
-        let key = {
+        {
             let mut sessions = self.sessions.lock().await;
             let session = sessions.get_mut(id).context("playback session not found or expired")?;
             session.target = target;
             session.touched = Some(Instant::now());
-            session.variant_key.clone()
-        };
-        self.refresh_variant_target(&key).await?;
+        }
         self.status(id).await
     }
 
@@ -147,21 +145,30 @@ impl SessionManager {
         Ok((path, mime, pin))
     }
 
-    /// 先移除会话再更新变体聚合目标, 重复释放和并发过期清理不会重复停用缓存.
+    /// 先移除会话, 仅最后一个会话离开时停用共享缓存.
     pub(crate) async fn release(&self, id: &str) -> Result<()> {
         let session = self.sessions.lock().await.remove(id);
-        if let Some(session) = session { self.refresh_variant_target(&session.variant_key).await?; }
+        if let Some(session) = session { self.refresh_variant(&session.variant_key).await?; }
         Ok(())
     }
 
-    async fn refresh_variant_target(&self, key: &str) -> Result<()> {
+    async fn desired_threads(&self, key: &str, buffered_until: f64) -> Result<usize> {
         let sessions = self.sessions.lock().await;
         let target = sessions.values()
             .filter(|session| session.variant_key == key)
             .map(|session| session.target)
             .max_by(f64::total_cmp);
-        if let Some(target) = target { self.cache.target(key, target).await }
-        else { self.cache.release(key).await }
+        let target = target.context("playback session ended before cache generation started")?;
+        let (base, maximum) = self.cache.thread_limits();
+        Ok(select_threads(target, buffered_until, base, maximum))
+    }
+
+    async fn refresh_variant(&self, key: &str) -> Result<()> {
+        let sessions = self.sessions.lock().await;
+        if !sessions.values().any(|session| session.variant_key == key) {
+            self.cache.release(key).await?;
+        }
+        Ok(())
     }
 
     pub(crate) fn spawn_expiration(&self) {
@@ -184,6 +191,24 @@ impl SessionManager {
     }
 }
 
+// 只由 SessionManager 根据位置快照选择线程数, CacheManager 不读取 position.
+fn select_threads(target: f64, buffered_until: f64, base: usize, maximum: usize) -> usize {
+    if target >= buffered_until { maximum } else { base }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::select_threads;
+
+    // 等于缓存尾部时仍需等待后续分片, 因此选择变体线程上限.
+    #[test]
+    fn thread_policy_uses_maximum_when_position_reaches_cache_tail() {
+        assert_eq!(select_threads(6.0, 5.0, 2, 8), 8);
+        assert_eq!(select_threads(5.0, 5.0, 2, 8), 8);
+        assert_eq!(select_threads(4.0, 5.0, 2, 8), 2);
+    }
+}
+
 // 锁内批量摘除过期会话, 锁外逐一清理, 单个失败不能阻断其余租约释放.
 async fn expire(manager: &SessionManager) -> Result<()> {
     let expired = {
@@ -198,7 +223,7 @@ async fn expire(manager: &SessionManager) -> Result<()> {
     let mut errors = Vec::new();
     let variants: std::collections::HashSet<_> = expired.iter().map(|session| session.variant_key.clone()).collect();
     for key in variants {
-        if let Err(error) = manager.refresh_variant_target(&key).await {
+        if let Err(error) = manager.refresh_variant(&key).await {
             errors.push(format!("variant {key}: {error:#}"));
         }
     }
