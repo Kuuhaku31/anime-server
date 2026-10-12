@@ -17,6 +17,8 @@ use crate::{cache::metadata::MetadataEntry, config::PlaybackConfig, db, utils};
 
 mod disk;
 mod metadata;
+#[cfg(test)]
+mod tests;
 
 use disk::{disk_usage, persist_used};
 use crate::video::{
@@ -24,12 +26,6 @@ use crate::video::{
     Init, Tail, cancelled, check_cancel, read_tail, Cancelled, Processes,
 };
 use crate::models::PlaybackVariantConfig;
-
-
-static REVISION: AtomicU64 = AtomicU64::new(1);
-
-// 进程实际退出时立即归还预算, 不把后续磁盘提交算成正在编码.
-type EncoderBudget = Option<(OwnedSemaphorePermit, OwnedSemaphorePermit, OwnedSemaphorePermit)>;
 
 
 /// 缓存文件夹状态, 对外仅提供克隆快照和只读 getter.
@@ -65,72 +61,9 @@ impl FolderState {
     pub(crate) fn error(&self) -> Option<&str> { self.error.as_deref() }
 }
 
-/// 媒体文件打开期间的缓存保护对象.
-///
-/// `SessionManager::media_path` 返回其 `Arc`, 调用方持有它直到文件打开完成,
-/// 防止最后会话释放后 LRU 在文件打开之前删除缓存.
-/// 外部不能直接创建, 查询或修改该对象, 媒体访问仍须经过有效会话.
-/// 同一配置的全部会话共享此元素, 只有其生成任务能发布正式分片.
-struct CacheFolder {
-    key: String,
-    directory: PathBuf,
-    spec: EncodeSpec,
-    state: Mutex<FolderState>,
-    changed: Notify,
-}
-
 /// 文件打开期间持有缓存文件夹, 避免无活动会话时被 LRU 回收.
 pub(crate) struct CachePin {
     _folder: Arc<CacheFolder>,
-}
-
-impl CacheFolder {
-    async fn wait_loaded(&self) -> Result<()> {
-        // 创建响应必须反映磁盘的真实完成状态, 等待期间不占用全局活动集合锁.
-        loop {
-            // 先注册通知再检查条件, 避免恢复完成通知落在检查与等待之间.
-            let notified = self.changed.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            let state = self.state.lock().await;
-            if state.loaded { return Ok(()); }
-            ensure!(state.worker_active, "cache activation failed: {}",
-                state.error.as_deref().unwrap_or("generation stopped before loading"));
-            drop(state);
-            notified.await;
-        }
-    }
-
-    async fn status(&self) -> Result<FolderState> {
-        let mut state = self.state.lock().await;
-        state.target.context("playback cache has no active session")?;
-        state.last_used = SystemTime::now();
-        Ok(state.clone())
-    }
-
-    fn stop(state: &mut FolderState) {
-        if state.encoding {
-            // 只允许再提交一个分片. 已在私有目录生成的更远内容也不能越过此边界发布.
-            state.stop_after.get_or_insert(state.media.segments.len() + 1);
-            state.stop_deadline.get_or_insert(Instant::now() + Duration::from_secs(30));
-        } else {
-            state.cancel.send_replace(true);
-        }
-    }
-}
-
-struct CacheInner {
-    root: PathBuf,
-    config: PlaybackConfig,
-    database: SqlitePool,
-    processes: Processes,
-    metadata: Mutex<HashMap<String, MetadataEntry>>,
-    // 同时访问集合和元素时先锁 entries 再锁 state, 创建与回收必须保持相同顺序.
-    entries: Mutex<HashMap<String, Arc<CacheFolder>>>,
-    workers: Mutex<JoinSet<()>>,
-    maintenance: Mutex<()>,
-    stop: watch::Sender<bool>,
-    _directory_lock: File,
 }
 
 /// 缓存统一入口, 独占目录锁并管理两个按需加载的 Map.
@@ -185,14 +118,12 @@ impl CacheManager {
         Ok(manager)
     }
 
-    pub(crate) fn stopping(&self) -> bool { *self.inner.stop.borrow() }
-
     // 查找或创建共享缓存
     pub(crate) async fn acquire(&self, config: &PlaybackVariantConfig) -> Result<()> {
         let key = config.key().to_owned();
         loop {
             let entries = self.inner.entries.lock().await;
-            ensure!(!self.stopping(), "server is shutting down");
+            ensure!(!self.is_stopping(), "server is shutting down");
             if let Some(output) = entries.get(&key).cloned() {
                 let notified = output.changed.notified();
                 tokio::pin!(notified);
@@ -227,7 +158,7 @@ impl CacheManager {
                 .context("video file not found")?;
             let spec = EncodeSpec::from_config(config.clone(), source, info, 0.0)?;
             let mut entries = self.inner.entries.lock().await;
-            ensure!(!self.stopping(), "server is shutting down");
+            ensure!(!self.is_stopping(), "server is shutting down");
             if entries.contains_key(&key) { continue; }
             ensure!(entries.len() < 32, "too many active playback configurations");
             let output = Arc::new(CacheFolder {
@@ -248,21 +179,6 @@ impl CacheManager {
             self.spawn(&output).await;
             return Ok(());
         }
-    }
-
-    async fn spawn(&self, output: &Arc<CacheFolder>) {
-        let manager = self.clone();
-        let output = output.clone();
-        let processes = self.inner.processes.clone();
-        self.inner.workers.lock().await.spawn(async move {
-            manager.generate(&processes, &output).await;
-            drop(output);
-            if let Err(error) = manager.maintain().await { warn!("cache maintenance failed: {error:#}"); }
-        });
-    }
-
-    async fn get(&self, key: &str) -> Result<Arc<CacheFolder>> {
-        self.inner.entries.lock().await.get(key).cloned().context("playback cache is no longer active")
     }
 
     pub(crate) async fn wait_loaded(&self, key: &str) -> Result<()> {
@@ -307,8 +223,10 @@ impl CacheManager {
         Ok(())
     }
 
+    /// 获取分片资源.
     /// 只开放正式清单中的已发布资源, 私有工作目录和未验证尾部不能被读取.
     pub(crate) async fn media_path(&self, key: &str, name: &str) -> Result<(PathBuf, CachePin)> {
+
         ensure!(video::media_filename(name), "playback asset not found");
         let output = self.get(key).await?;
         let mut state = output.state.lock().await;
@@ -322,7 +240,99 @@ impl CacheManager {
         let file = tokio::fs::symlink_metadata(&path).await.context("cached media file is missing")?;
         ensure!(file.is_file() && file.len() > 0, "unsafe or empty cached media file");
         drop(state);
+
         Ok((path, CachePin { _folder: output }))
+    }
+
+    /// 按磁盘访问时间淘汰非活动缓存, 正在打开媒体文件的旧引用仍受保护.
+    pub(crate) async fn maintain(&self) -> Result<()> {
+        if let Ok(mut workers) = self.inner.workers.try_lock() {
+            while let Some(result) = workers.try_join_next() {
+                if let Err(error) = result { warn!("cache worker failed: {error}"); }
+            }
+        }
+        let _maintenance = self.inner.maintenance.lock().await;
+        {
+            let mut entries = self.inner.entries.lock().await;
+            let mut removable = Vec::new();
+            for (key, folder) in entries.iter() {
+                if Arc::strong_count(folder) != 1 { continue; }
+                let state = folder.state.lock().await;
+                if state.target.is_none() && !state.worker_active && !state.finalizing {
+                    removable.push(key.clone());
+                }
+            }
+            for key in removable { entries.remove(&key); }
+        }
+        let root = self.inner.root.clone();
+        let (mut total, mut candidates) = tokio::task::spawn_blocking(move || disk_usage(&root)).await??;
+        candidates.sort_by_key(|candidate| candidate.0);
+        for (_, key, size) in candidates {
+            if total <= self.inner.config.cache_max_bytes { break; }
+            let entries = self.inner.entries.lock().await;
+            if entries.contains_key(&key) {
+                continue;
+            }
+            let path = self.inner.root.join("playback").join(&key);
+            let trash = self.inner.root.join("playback").join(format!(".evict-{key}-{}", utils::random_id()?));
+            // 先原子移走不活跃目录, 避免长时间删除文件阻塞其他缓存的状态和释放请求.
+            tokio::fs::rename(&path, &trash).await?;
+            drop(entries);
+            tokio::fs::remove_dir_all(trash).await?;
+            total = total.saturating_sub(size);
+            info!(variant_key = key, "evicted inactive playback cache");
+        }
+        Ok(())
+    }
+
+    /// 先拒绝新租约并请求边界停止, 等全部写入者退出后才关闭媒体进程许可.
+    pub(crate) async fn shutdown(&self) -> Result<()> {
+        self.inner.stop.send_replace(true);
+        {
+            let entries = self.inner.entries.lock().await;
+            for output in entries.values() {
+                let mut state = output.state.lock().await;
+                state.target = None;
+                if state.worker_active { CacheFolder::stop(&mut state); }
+            }
+        }
+        let mut errors = Vec::new();
+        {
+            let mut workers = self.inner.workers.lock().await;
+            while let Some(result) = workers.join_next().await {
+                if let Err(error) = result { errors.push(error.to_string()); }
+            }
+        }
+        self.inner.entries.lock().await.clear();
+        self.inner.processes.slots.close();
+        self.inner.processes.encoders.close();
+        if let Err(error) = self.maintain().await { errors.push(format!("{error:#}")); }
+        ensure!(errors.is_empty(), "cache shutdown failed: {}", errors.join("; "));
+        Ok(())
+    }
+
+    pub(crate) fn is_stopping(&self) -> bool { *self.inner.stop.borrow() }
+}
+
+
+// ========================================================================== //
+// ========================================================================== //
+// ========================================================================== //
+
+impl CacheManager {
+    async fn spawn(&self, output: &Arc<CacheFolder>) {
+        let manager = self.clone();
+        let output = output.clone();
+        let processes = self.inner.processes.clone();
+        self.inner.workers.lock().await.spawn(async move {
+            manager.generate(&processes, &output).await;
+            drop(output);
+            if let Err(error) = manager.maintain().await { warn!("cache maintenance failed: {error:#}"); }
+        });
+    }
+
+    async fn get(&self, key: &str) -> Result<Arc<CacheFolder>> {
+        self.inner.entries.lock().await.get(key).cloned().context("playback cache is no longer active")
     }
 
     // 成功, 失败和取消统一收尾, 有会话时保留错误快照.
@@ -584,363 +594,68 @@ impl CacheManager {
         Ok(())
     }
 
-    /// 按磁盘访问时间淘汰非活动缓存, 正在打开媒体文件的旧引用仍受保护.
-    pub(crate) async fn maintain(&self) -> Result<()> {
-        if let Ok(mut workers) = self.inner.workers.try_lock() {
-            while let Some(result) = workers.try_join_next() {
-                if let Err(error) = result { warn!("cache worker failed: {error}"); }
-            }
+}
+
+// 私有共享状态只由缓存管理器和生成任务访问.
+struct CacheInner {
+    root: PathBuf,
+    config: PlaybackConfig,
+    database: SqlitePool,
+    processes: Processes,
+    metadata: Mutex<HashMap<String, MetadataEntry>>,
+    // 同时访问集合和元素时先锁 entries 再锁 state, 创建与回收必须保持相同顺序.
+    entries: Mutex<HashMap<String, Arc<CacheFolder>>>,
+    workers: Mutex<JoinSet<()>>,
+    maintenance: Mutex<()>,
+    stop: watch::Sender<bool>,
+    _directory_lock: File,
+}
+
+/// 同一配置的全部会话共享此元素, 只有其生成任务能发布正式分片.
+struct CacheFolder {
+    key: String,
+    directory: PathBuf,
+    spec: EncodeSpec,
+    state: Mutex<FolderState>,
+    changed: Notify,
+}
+
+impl CacheFolder {
+    async fn wait_loaded(&self) -> Result<()> {
+        // 创建响应必须反映磁盘的真实完成状态, 等待期间不占用全局活动集合锁.
+        loop {
+            // 先注册通知再检查条件, 避免恢复完成通知落在检查与等待之间.
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let state = self.state.lock().await;
+            if state.loaded { return Ok(()); }
+            ensure!(state.worker_active, "cache activation failed: {}",
+                state.error.as_deref().unwrap_or("generation stopped before loading"));
+            drop(state);
+            notified.await;
         }
-        let _maintenance = self.inner.maintenance.lock().await;
-        {
-            let mut entries = self.inner.entries.lock().await;
-            let mut removable = Vec::new();
-            for (key, folder) in entries.iter() {
-                if Arc::strong_count(folder) != 1 { continue; }
-                let state = folder.state.lock().await;
-                if state.target.is_none() && !state.worker_active && !state.finalizing {
-                    removable.push(key.clone());
-                }
-            }
-            for key in removable { entries.remove(&key); }
-        }
-        let root = self.inner.root.clone();
-        let (mut total, mut candidates) = tokio::task::spawn_blocking(move || disk_usage(&root)).await??;
-        candidates.sort_by_key(|candidate| candidate.0);
-        for (_, key, size) in candidates {
-            if total <= self.inner.config.cache_max_bytes { break; }
-            let entries = self.inner.entries.lock().await;
-            if entries.contains_key(&key) {
-                continue;
-            }
-            let path = self.inner.root.join("playback").join(&key);
-            let trash = self.inner.root.join("playback").join(format!(".evict-{key}-{}", utils::random_id()?));
-            // 先原子移走不活跃目录, 避免长时间删除文件阻塞其他缓存的状态和释放请求.
-            tokio::fs::rename(&path, &trash).await?;
-            drop(entries);
-            tokio::fs::remove_dir_all(trash).await?;
-            total = total.saturating_sub(size);
-            info!(variant_key = key, "evicted inactive playback cache");
-        }
-        Ok(())
     }
 
-    /// 先拒绝新租约并请求边界停止, 等全部写入者退出后才关闭媒体进程许可.
-    pub(crate) async fn shutdown(&self) -> Result<()> {
-        self.inner.stop.send_replace(true);
-        {
-            let entries = self.inner.entries.lock().await;
-            for output in entries.values() {
-                let mut state = output.state.lock().await;
-                state.target = None;
-                if state.worker_active { CacheFolder::stop(&mut state); }
-            }
+    async fn status(&self) -> Result<FolderState> {
+        let mut state = self.state.lock().await;
+        state.target.context("playback cache has no active session")?;
+        state.last_used = SystemTime::now();
+        Ok(state.clone())
+    }
+
+    fn stop(state: &mut FolderState) {
+        if state.encoding {
+            // 只允许再提交一个分片. 已在私有目录生成的更远内容也不能越过此边界发布.
+            state.stop_after.get_or_insert(state.media.segments.len() + 1);
+            state.stop_deadline.get_or_insert(Instant::now() + Duration::from_secs(30));
+        } else {
+            state.cancel.send_replace(true);
         }
-        let mut errors = Vec::new();
-        {
-            let mut workers = self.inner.workers.lock().await;
-            while let Some(result) = workers.join_next().await {
-                if let Err(error) = result { errors.push(error.to_string()); }
-            }
-        }
-        self.inner.entries.lock().await.clear();
-        self.inner.processes.slots.close();
-        self.inner.processes.encoders.close();
-        if let Err(error) = self.maintain().await { errors.push(format!("{error:#}")); }
-        ensure!(errors.is_empty(), "cache shutdown failed: {}", errors.join("; "));
-        Ok(())
     }
 }
 
-// ========================================================================== //
-// ========================================================================== //
-// ========================================================================== //
+static REVISION: AtomicU64 = AtomicU64::new(1);
 
-#[cfg(test)]
-mod tests {
-    // use super::*;
-
-    // // 构造已恢复的缓存文件夹, 不启动媒体进程或访问真实视频.
-    // fn folder() -> CacheFolder {
-    //         let (info, request) = video::fixture();
-    //     let config = PlaybackVariantConfig::new(&"a".repeat(32), &info, &request).unwrap();
-    //     CacheFolder {
-    //         key: config.key().to_owned(),
-    //         directory: PathBuf::new(),
-    //         spec: EncodeSpec::from_config(config, "video.mkv".into(), info, 0.0).unwrap(),
-    //         state: Mutex::new(FolderState {
-    //             media: CachedMedia {
-    //                 complete: true, init: None,
-    //                     segments: vec![video::Fragment {
-    //                     start: Tail::default(), end: Tail { video: 360000, audio: 192000 }, sequence: 1,
-    //                 }],
-    //             },
-    //             loaded: true, target: Some(0.0), worker_active: true, encoding: false,
-    //             finalizing: true, encoding_threads: 2, stop_after: None, stop_deadline: None,
-    //             cancel: watch::channel(false).0, revision: 42,
-    //             last_used: SystemTime::UNIX_EPOCH, error: Some("fixture error".to_owned()),
-    //         }),
-    //         changed: Notify::new(),
-    //     }
-    // }
-
-    // #[tokio::test]
-    // async fn folder_snapshot_preserves_status_and_is_independent_of_later_updates() {
-    //     let folder = folder();
-    //     let snapshot = folder.status().await.unwrap();
-    //     assert!(snapshot.complete());
-    //     assert!(snapshot.generating());
-    //     assert!(snapshot.stopping());
-    //     assert!(snapshot.ready());
-    //     assert_eq!(snapshot.buffered_until(), 4.0);
-    //     assert_eq!(snapshot.encoding_threads(), 2);
-    //     assert_eq!(snapshot.revision(), 42);
-    //     assert_eq!(snapshot.error(), Some("fixture error"));
-    //     assert!(snapshot.last_used > SystemTime::UNIX_EPOCH);
-
-    //     // 后续缓存更新不改变已返回快照中的媒体前缀和错误.
-    //     {
-    //         let mut state = folder.state.lock().await;
-    //         state.media = CachedMedia::default();
-    //         state.worker_active = false;
-    //         state.finalizing = false;
-    //         state.encoding_threads = 0;
-    //         state.error = None;
-    //     }
-    //     let updated = folder.status().await.unwrap();
-    //     assert!(!updated.complete() && !updated.generating() && !updated.stopping() && !updated.ready());
-    //     assert_eq!(updated.buffered_until(), 0.0);
-    //     assert_eq!(updated.encoding_threads(), 0);
-    //     assert_eq!(updated.error(), None);
-    //     assert!(snapshot.complete() && snapshot.ready());
-    //     assert_eq!(snapshot.buffered_until(), 4.0);
-    //     assert_eq!(snapshot.error(), Some("fixture error"));
-
-    //     folder.state.lock().await.stop_after = Some(2);
-    //     assert!(folder.status().await.unwrap().stopping());
-    //     folder.state.lock().await.target = None;
-    //     assert!(folder.status().await.is_err());
-    // }
-
-    // #[tokio::test]
-    // async fn manager_reads_duration_separately_from_folder_snapshot() {
-    //     let root = std::env::temp_dir().join(format!("anime-state-snapshot-{}", utils::random_id().unwrap()));
-    //     tokio::fs::create_dir(&root).await.unwrap();
-    //     let database = sqlx::sqlite::SqlitePoolOptions::new().connect("sqlite::memory:").await.unwrap();
-    //     let manager = CacheManager::new(root.clone(), PlaybackConfig::default(), database, Processes::new(2, 16)).await.unwrap();
-    //     let folder = Arc::new(folder());
-    //     let key = folder.key.clone();
-    //     manager.inner.entries.lock().await.insert(key.clone(), folder);
-    //     assert_eq!(manager.duration(&key).await.unwrap(), 20.0);
-    //     assert_eq!(manager.status(&key).await.unwrap().revision(), 42);
-    //     manager.inner.entries.lock().await.remove(&key);
-    //     assert!(manager.duration(&key).await.is_err());
-    //     assert!(manager.status(&key).await.is_err());
-    //     drop(manager);
-    //     tokio::fs::remove_dir_all(root).await.unwrap();
-    // }
-
-}
-
-
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//     use crate::video::models::PlaybackVariantConfig;
-
-//     #[test]
-//     fn configuration_serialization_is_canonical_and_excludes_runtime_fields() {
-//         let config = PlaybackVariantConfig {
-//             src_file_pre16mib_md5: "35af6d912b6dffadc112df2ca94bbe2f".to_string(),
-//             video_stream: 0, audio_stream: Some(1), subtitle_stream: Some(3),
-//             encoder_profile: "h264-high-yuv420p-aac-fmp4-v1".to_string(),
-//         };
-//         assert_eq!(config.key().unwrap(), "bc892e2d4aa401399639fe22ee897b43");
-//         let mut updated = config.clone();
-//         updated.encoder_profile = ENCODER_PROFILE.to_string();
-//         assert_ne!(updated.key().unwrap(), config.key().unwrap());
-//         updated.audio_stream = None;
-//         updated.subtitle_stream = None;
-//         assert!(String::from_utf8(serde_json::to_vec(&updated).unwrap()).unwrap()
-//             .contains("\"audio_stream\":null,\"subtitle_stream\":null"));
-//         for key in ["../main.db", "ABCDEF0123456789ABCDEF0123456789", "a", ""] {
-//             assert!(!is_key(key));
-//         }
-//     }
-
-//     #[tokio::test]
-//     async fn startup_does_not_activate_disk_entries_and_lru_includes_partial_caches() {
-//         // 不完整和完整目录都参与 LRU, 未知文件和目录保持不动.
-//         let root = std::env::temp_dir().join(format!("anime-active-lru-{}", random_id().unwrap()));
-//         // 测试负责创建缓存挂载目录, 管理器要求根目录已经存在.
-//         tokio::fs::create_dir(&root).await.unwrap();
-//         let config = PlaybackConfig { cache_max_bytes: 80, ..PlaybackConfig::default() };
-//         let manager = CacheManager::new(root.clone(), config, Processes::new(2, 16)).await.unwrap();
-//         for (name, age) in [('a', 1), ('b', 2)] {
-//             let directory = root.join("playback").join(name.to_string().repeat(32));
-//             tokio::fs::create_dir(&directory).await.unwrap();
-//             tokio::fs::write(directory.join("segment_000000.m4s"), vec![0; 60]).await.unwrap();
-//             if name == 'b' { tokio::fs::write(directory.join("complete"), []).await.unwrap(); }
-//             persist_used(&directory, SystemTime::UNIX_EPOCH + Duration::from_secs(age)).await.unwrap();
-//         }
-//         assert!(manager.inner.entries.lock().await.is_empty());
-//         manager.maintain().await.unwrap();
-//         assert!(!root.join("playback").join("a".repeat(32)).exists());
-//         assert!(root.join("playback").join("b".repeat(32)).exists());
-//         assert!(CacheManager::new(root.clone(), PlaybackConfig::default(), Processes::new(2, 16)).await.is_err());
-//         manager.shutdown().await.unwrap();
-//         tokio::fs::remove_dir_all(root).await.unwrap();
-//     }
-
-//     #[tokio::test]
-//     async fn last_lease_retires_the_entry_but_an_open_pin_still_blocks_eviction() {
-//         // 仅模拟已经发布的文件, 区分活动租约保护和退出集合后的文件打开保护.
-//         use tokio::io::AsyncReadExt;
-//         let root = std::env::temp_dir().join(format!("anime-media-pin-{}", random_id().unwrap()));
-//         // 测试负责创建缓存挂载目录, 管理器要求根目录已经存在.
-//         tokio::fs::create_dir(&root).await.unwrap();
-//         let config = PlaybackConfig { cache_max_bytes: 1, ..PlaybackConfig::default() };
-//         let manager = CacheManager::new(root.clone(), config, Processes::new(2, 16)).await.unwrap();
-//         let (info, request) = ffmpeg::fixture();
-//         let spec = EncodeSpec::new(&"a".repeat(32), "video.mkv".into(), info, request, None).unwrap();
-//         let key = spec.config.key().unwrap();
-//         let directory = root.join("playback").join(&key);
-//         tokio::fs::create_dir(&directory).await.unwrap();
-//         tokio::fs::write(directory.join("init.mp4"), b"file-open fixture").await.unwrap();
-//         let output = Arc::new(ActiveCache {
-//             key: key.clone(), directory: directory.clone(), spec: spec.clone(), changed: Notify::new(),
-//             state: Mutex::new(ActiveState {
-//                 media: CachedMedia { complete: true, init: None, segments: vec![fragment::Fragment {
-//                     start: Tail::default(), end: Tail { video: 360000, audio: 192000 }, sequence: 1,
-//                 }] },
-//                 loaded: true, clients: HashMap::from([("first".to_string(), 0.0)]),
-//                 worker_active: false, encoding: false, finalizing: false, encoding_threads: 0,
-//                 stop_after: None, stop_deadline: None, cancel: watch::channel(false).0,
-//                 revision: 1, last_used: SystemTime::now(), error: None,
-//             }),
-//         });
-//         manager.inner.entries.lock().await.insert(key.clone(), output);
-//         let shared = manager.acquire(spec, "second").await.unwrap();
-//         assert_eq!(shared.state.lock().await.clients.len(), 2);
-//         manager.maintain().await.unwrap();
-//         assert!(directory.exists());
-//         let (path, pin) = manager.media_path(&key, "second", "init.mp4").await.unwrap();
-//         manager.release(&key, "first").await.unwrap();
-//         manager.release(&key, "first").await.unwrap();
-//         assert_eq!(shared.state.lock().await.clients.len(), 1);
-//         drop(shared);
-//         manager.release(&key, "second").await.unwrap();
-//         assert!(manager.get(&key).await.is_err());
-//         assert!(pin.status("second").await.is_err());
-//         manager.maintain().await.unwrap();
-//         assert!(directory.exists());
-//         let mut file = tokio::fs::File::open(path).await.unwrap();
-//         drop(pin);
-//         manager.maintain().await.unwrap();
-//         assert!(!directory.exists());
-//         let mut data = Vec::new();
-//         file.read_to_end(&mut data).await.unwrap();
-//         assert_eq!(data, b"file-open fixture");
-//         manager.shutdown().await.unwrap();
-//         tokio::fs::remove_dir_all(root).await.unwrap();
-//     }
-
-//     #[tokio::test]
-//     async fn stop_is_revocable_but_a_finalizing_writer_must_exit_before_reactivation() {
-//         // 占满进程名额, 让测试只控制租约和停止边界, 不依赖真实编码速度.
-//         let root = std::env::temp_dir().join(format!("anime-reactivate-{}", random_id().unwrap()));
-//         // 测试负责创建缓存挂载目录, 管理器要求根目录已经存在.
-//         tokio::fs::create_dir(&root).await.unwrap();
-//         let processes = Processes::new(2, 16);
-//         let held = processes.slots.acquire_many(2).await.unwrap();
-//         let manager = CacheManager::new(root.clone(), PlaybackConfig::default(), processes.clone()).await.unwrap();
-//         let (info, request) = ffmpeg::fixture();
-//         let spec = EncodeSpec::new(&"a".repeat(32), "video.mkv".into(), info, request, None).unwrap();
-//         let output = manager.acquire(spec.clone(), "first").await.unwrap();
-//         output.wait_loaded().await.unwrap();
-//         output.state.lock().await.encoding = true;
-//         manager.release(&output.key, "first").await.unwrap();
-//         let deadline = {
-//             let mut state = output.state.lock().await;
-//             assert_eq!(state.stop_after, Some(1));
-//             let deadline = state.stop_deadline.unwrap();
-//             ActiveCache::stop(&mut state);
-//             assert_eq!(state.stop_deadline, Some(deadline));
-//             deadline
-//         };
-//         assert!(deadline > Instant::now());
-//         let shared = manager.acquire(spec.clone(), "second").await.unwrap();
-//         assert!(Arc::ptr_eq(&output, &shared));
-//         {
-//             let mut state = output.state.lock().await;
-//             assert_eq!(state.clients.len(), 1);
-//             assert!(state.stop_after.is_none() && state.stop_deadline.is_none());
-//             assert!(!*state.cancel.borrow());
-//             state.encoding = false;
-//             state.finalizing = true;
-//         }
-//         let waiting = manager.acquire(spec, "third");
-//         tokio::pin!(waiting);
-//         assert!(tokio::time::timeout(Duration::from_millis(30), &mut waiting).await.is_err());
-//         manager.release(&output.key, "second").await.unwrap();
-//         let next = tokio::time::timeout(Duration::from_secs(2), waiting).await.unwrap().unwrap();
-//         assert!(!Arc::ptr_eq(&output, &next));
-//         assert_eq!(manager.inner.entries.lock().await.len(), 1);
-//         manager.release(&next.key, "third").await.unwrap();
-//         manager.shutdown().await.unwrap();
-//         drop(held);
-//         tokio::fs::remove_dir_all(root).await.unwrap();
-//     }
-
-//     #[tokio::test]
-//     async fn activation_io_failure_does_not_leave_an_unleased_active_entry() {
-//         // 用普通文件阻断目录创建, 同时触发恢复失败和最后释放时的 mtime 写入失败.
-//         let root = std::env::temp_dir().join(format!("anime-activation-failure-{}", random_id().unwrap()));
-//         // 测试负责创建缓存挂载目录, 管理器要求根目录已经存在.
-//         tokio::fs::create_dir(&root).await.unwrap();
-//         let manager = CacheManager::new(root.clone(), PlaybackConfig::default(), Processes::new(2, 16)).await.unwrap();
-//         let playback = root.join("playback");
-//         tokio::fs::remove_dir(&playback).await.unwrap();
-//         tokio::fs::write(&playback, b"not a directory").await.unwrap();
-//         let (info, request) = ffmpeg::fixture();
-//         let spec = EncodeSpec::new(&"a".repeat(32), "video.mkv".into(), info, request, None).unwrap();
-//         let output = manager.acquire(spec, "failed").await.unwrap();
-//         assert!(output.wait_loaded().await.is_err());
-//         assert!(manager.release(&output.key, "failed").await.is_err());
-//         assert!(manager.get(&output.key).await.is_err());
-//         tokio::fs::remove_file(&playback).await.unwrap();
-//         tokio::fs::create_dir(&playback).await.unwrap();
-//         manager.shutdown().await.unwrap();
-//         tokio::fs::remove_dir_all(root).await.unwrap();
-//     }
-
-//     #[tokio::test]
-//     async fn publication_monitor_never_waits_for_the_future_it_is_polling() {
-//         // 模拟提交持锁等待磁盘, 防止监控分支与同一 select 中的提交 future 自锁.
-//         let root = std::env::temp_dir().join(format!("anime-publication-{}", random_id().unwrap()));
-//         // 测试负责创建缓存挂载目录, 管理器要求根目录已经存在.
-//         tokio::fs::create_dir(&root).await.unwrap();
-//         let processes = Processes::new(2, 16);
-//         let held = processes.slots.acquire_many(2).await.unwrap();
-//         let manager = CacheManager::new(root.clone(), PlaybackConfig::default(), processes.clone()).await.unwrap();
-//         let (info, request) = ffmpeg::fixture();
-//         let spec = EncodeSpec::new(&"a".repeat(32), "video.mkv".into(), info, request, None).unwrap();
-//         let output = manager.acquire(spec, "test").await.unwrap();
-//         let cancel = output.state.lock().await.cancel.subscribe();
-//         let mut child = tokio::process::Command::new("sleep").arg("5").kill_on_drop(true).spawn().unwrap();
-//         let step = async {
-//             let _state = output.state.lock().await;
-//             tokio::time::sleep(Duration::from_millis(150)).await;
-//             Ok(42)
-//         };
-//         let result = tokio::time::timeout(Duration::from_secs(1),
-//             manager.checked_step(&output, &mut child, &mut None, Instant::now(), 0, &cancel, step)).await;
-//         child.kill().await.unwrap();
-//         child.wait().await.unwrap();
-//         manager.release(&output.key, "test").await.unwrap();
-//         manager.shutdown().await.unwrap();
-//         drop(held);
-//         tokio::fs::remove_dir_all(root).await.unwrap();
-//         assert_eq!(result.unwrap().unwrap(), 42);
-//     }
-// }
+// 进程实际退出时立即归还预算, 不把后续磁盘提交算成正在编码.
+type EncoderBudget = Option<(OwnedSemaphorePermit, OwnedSemaphorePermit, OwnedSemaphorePermit)>;

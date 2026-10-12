@@ -66,7 +66,7 @@ impl SessionManager {
         let selection = config.selection();
         {
             let mut sessions = self.sessions.lock().await;
-            ensure!(!self.cache.stopping(), "server is shutting down");
+            ensure!(!self.cache.is_stopping(), "server is shutting down");
             ensure!(sessions.len() < 32, "too many playback sessions; stop an existing stream");
             sessions.insert(id.clone(), Session { variant_key: key.clone(), target, created: Instant::now(), touched: None });
         }
@@ -170,7 +170,7 @@ impl SessionManager {
             let mut tick = interval(Duration::from_secs(5));
             loop {
                 tick.tick().await;
-                if manager.cache.stopping() { break; }
+                if manager.cache.is_stopping() { break; }
                 if let Err(error) = expire(&manager).await {
                     warn!("playback cache maintenance failed: {error:#}");
                 }

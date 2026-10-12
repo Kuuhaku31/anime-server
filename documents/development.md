@@ -31,6 +31,9 @@ Serde 序列化和反序列化不依赖字段公开, 不为接口响应字段额
 调用媒体执行能力, 不暴露或依赖 video 私有子模块路径.
 `sessions.rs` 保留在 crate 层, 直接使用 `crate::cache` 管理共享缓存租约.
 video 下的编码, 资源, 分片, 进程和执行参数文件保持原位.
+`cache.rs` 将 crate 内可见类型和方法放在前面, 私有生成流程, 状态类型及工具定义放在后面.
+入口文件中的缓存测试集中到私有 `cache/tests.rs`, 仅在测试构建时加载,
+保留原有测试的注释禁用状态. 元数据子模块的内部测试仍就近维护.
 
 播放请求 `PlaybackRequest` 和创建响应 `PlaybackStart` 定义在 `models.rs`,
 由 `video.rs` 保留重导出入口. 请求选轨的缺省/null 区分及响应 flatten 结构不变.
