@@ -1,6 +1,6 @@
-//! 定义媒体探测, 播放会话及播放资源 API.
 
-use std::path::PathBuf;
+// backend/src/api/playback.rs
+//! 定义媒体探测, 播放会话及播放资源 API.
 
 use axum::{
     body::{Body, Bytes},
@@ -16,7 +16,7 @@ use tower_http::services::ServeFile;
 use tracing::warn;
 
 use crate::{
-    AppState, constants::VIDEO_ROOT, db, models, utils, video,
+    AppState, db, models, video,
 };
 
 
@@ -76,7 +76,19 @@ async fn streams(
     State(state): State<AppState>,
     Path(id): Path<String>,
 )-> Result<Json<video::MediaInfo>, ApiError> {
-    Ok(Json(get_metadata(&state, &id, false).await?.1))
+    Ok(Json({
+        let state: &AppState = &state;
+        let id: &str = &id;
+        async move {
+            let path = db::get_a_video_path_by_id(&state.db, id).await.map_err(ApiError::missing)?.ok_or_else(|| ApiError::missing("file not found"))?;
+            let info = state
+                .metadata
+                .get(id, &path, false)
+                .await
+                .map_err(ApiError::media)?;
+            Ok((path, info))
+        }
+    }.await?.1))
 }
 
 /// 重新探测媒体文件.
@@ -84,7 +96,19 @@ async fn probe(
     State(state): State<AppState>,
     Path(id): Path<String>,
 )-> Result<Json<video::MediaInfo>, ApiError> {
-    Ok(Json(get_metadata(&state, &id, true).await?.1))
+    Ok(Json({
+        let state: &AppState = &state;
+        let id: &str = &id;
+        async move {
+            let path = db::get_a_video_path_by_id(&state.db, id).await.map_err(ApiError::missing)?.ok_or_else(|| ApiError::missing("file not found"))?;
+            let info = state
+                .metadata
+                .get(id, &path, true)
+                .await
+                .map_err(ApiError::media)?;
+            Ok((path, info))
+        }
+    }.await?.1))
 }
 
 /// 创建播放会话.
@@ -103,29 +127,25 @@ async fn play(
     let input = if input.is_empty() { models::PlaybackRequest::default() }
     else { serde_json::from_slice(&input).map_err(ApiError::bad)? };
 
-    // 返回媒体文件路径和元数据
-    let (source, info) = get_metadata(&state, &id, false).await?;
-
     // 读取数据库中保存的播放进度
     let progress = db::get_progress(&state.db, &id).await
     .map_err(ApiError::internal)?.ok_or_else(|| ApiError::missing("file not found"))?;
+
+    // 返回媒体文件路径和元数据
+    let source = db::get_a_video_path_by_id(&state.db, &id).await.map_err(ApiError::missing)?.ok_or_else(|| ApiError::missing("file not found"))?;
+    let info = state.metadata.get(&id, &source, false).await.map_err(ApiError::media)?;
 
     // 请求显式选择覆盖数据库偏好, 字段缺省才使用扫描或上次手动选择保存的轨道.
     let audio_preference = input.audio_stream_index;
     let subtitle_preference = input.subtitle_stream_index;
     let request = input.with_preferences(progress.audio_stream_index, progress.subtitle_stream_index);
-    let spec = video::EncodeSpec::new(&id, source, info, request, progress.watch_pos).map_err(ApiError::bad)?;
 
     // 只保存本次请求显式提交的选择, null 也表示将对应偏好设为关闭.
-    db::save_track_preferences(
-        &state.db, &id, audio_preference, subtitle_preference,
-    ).await.map_err(ApiError::internal)?;
+    db::save_track_preferences(&state.db, &id, audio_preference, subtitle_preference)
+    .await.map_err(ApiError::internal)?;
 
-    let session = state
-        .playback
-        .create(spec)
-        .await
-        .map_err(ApiError::internal)?;
+    // 创建播放会话并返回结果.
+    let session = video::new_session(&state, &id, source, info, request, progress.watch_pos).await.map_err(ApiError::internal)?;
 
     Ok(Json(session))
 }
@@ -242,60 +262,4 @@ async fn media(
     );
 
     Ok(response)
-}
-
-
-/// 获取媒体文件路径和元数据.
-async fn get_metadata(
-    state: &AppState,
-    id: &str,
-    retry: bool,
-) -> Result<(std::path::PathBuf, video::MediaInfo), ApiError> {
-
-    /// 根据数据库路径查找可用媒体文件副本.
-    ///
-    /// 规范化路径并检查符号链接目标, 确保最终文件仍位于媒体根目录内.
-    async fn media_path(state: &AppState, id: &str) -> Result<PathBuf, String> {
-
-        let id = utils::check_md5(id)?;
-
-        let root = tokio::fs::canonicalize(VIDEO_ROOT)
-        .await.map_err(|e| e.to_string())?;
-        let paths = db::get_video_paths_by_id(&state.db, &id)
-        .await.map_err(|e| e.to_string())?;
-
-        // 遍历路径
-        for f in paths {
-
-            let resolved = match tokio::fs::canonicalize(&f).await {
-                Ok(path) => path,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error.to_string()),
-            };
-
-            if !resolved.starts_with(&root) {
-                return Err("media path resolves outside media directory".to_string());
-            }
-
-            if tokio::fs::metadata(&resolved)
-                .await
-                .map_err(|error| error.to_string())?
-                .is_file()
-            {
-                return Ok(resolved);
-            }
-        }
-
-        Err("no available media path for file".to_string())
-    }
-
-    let path = media_path(state, id).await.map_err(ApiError::missing)?;
-
-    let info = state
-        .metadata
-        .get(id, &path, retry)
-        .await
-        .map_err(ApiError::media)?;
-
-    Ok((path, info))
 }

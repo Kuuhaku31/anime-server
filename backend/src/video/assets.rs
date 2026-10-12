@@ -5,7 +5,7 @@ use std::{path::{Path, PathBuf}, time::Instant};
 use anyhow::{ensure, Context, Result};
 use tokio::{process::Command, sync::watch};
 
-use super::{cache::{is_key, random_id}, ffmpeg::EncodeSpec, process::checked_output_cancellable};
+use super::{cache::{is_key, random_id}, models::EncodeSpec, process::checked_output_cancellable};
 
 /// 资源只属于本次字幕渲染任务, 不进入持久播放配置或缓存身份.
 pub(super) struct RenderAssets {

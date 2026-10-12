@@ -7,13 +7,13 @@ use std::{
 };
 
 use anyhow::{bail, ensure, Context, Result};
-use md5::{Digest, Md5};
-use serde::Serialize;
 use tokio::{process::Child, sync::{watch, Mutex, Notify, OwnedSemaphorePermit}, task::JoinSet, time::interval};
 use tracing::{info, warn};
 
 use crate::config::PlaybackConfig;
-use super::{assets::{self, RenderAssets}, ffmpeg::{self, CachedMedia, EncodeSpec},
+use super::{
+    models::EncodeSpec,
+    assets::{self, RenderAssets}, ffmpeg::{self, CachedMedia},
     fragment::{self, Init, Tail}, process::{cancelled, check_cancel, read_tail, Cancelled, Processes}};
 
 // 编码或续接规则改变兼容性时必须升级, 避免新任务复用旧契约的缓存.
@@ -23,22 +23,6 @@ static REVISION: AtomicU64 = AtomicU64::new(1);
 // 进程实际退出时立即归还预算, 不把后续磁盘提交算成正在编码.
 type EncoderBudget = Option<(OwnedSemaphorePermit, OwnedSemaphorePermit, OwnedSemaphorePermit)>;
 
-/// 缓存身份只由源文件指纹, 全局流索引和编码契约决定, 不包含路径或播放位置.
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
-pub(crate) struct PlaybackVariantConfig {
-    pub(crate) src_file_pre16mib_md5: String,
-    pub(crate) video_stream: i32,
-    pub(crate) audio_stream: Option<i32>,
-    pub(crate) subtitle_stream: Option<i32>,
-    pub(crate) encoder_profile: String,
-}
-
-impl PlaybackVariantConfig {
-    // 字段声明顺序和显式 null 都参与哈希, 不能排序字段或省略空音轨与字幕.
-    pub(crate) fn key(&self) -> Result<String> {
-        Ok(format!("{:x}", Md5::digest(serde_json::to_vec(self)?)))
-    }
-}
 
 /// complete 只描述媒体是否完整, generating 还包括排队和收尾, 两者可以同时为真.
 #[derive(Clone)]
@@ -688,6 +672,7 @@ pub(crate) fn random_id() -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::video::models::PlaybackVariantConfig;
 
     #[test]
     fn configuration_serialization_is_canonical_and_excludes_runtime_fields() {

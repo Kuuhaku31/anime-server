@@ -69,9 +69,12 @@ async fn main() -> Result<()> {
     // 探测, 资源准备, 编码和解码校验共用进程预算, 防止不同模块各自突破全局上限.
     let processes = Processes::new(config.playback.max_processes, config.playback.max_total_ffmpeg_threads);
     let cache = CacheManager::new(constants::CACHE_DIR.into(), config.playback.clone(), processes.clone()).await?;
+
     info!("cache manager initialized at {}", constants::CACHE_DIR);
+
     let playback = SessionManager::new(cache, config.playback.idle_timeout_seconds);
     let metadata = MetadataCache::new(processes);
+
     let state = AppState {
         db: db::initialize_database().await?,
         config: Arc::new(config),

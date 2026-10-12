@@ -1,4 +1,3 @@
-
 // backend/src/video.rs
 
 //! 统一提供媒体探测, 播放会话和缓存管理接口, 隐藏具体实现子模块.
@@ -13,12 +12,15 @@
 //! 活动缓存去重, 分片生成与校验, 停止续接和磁盘淘汰均由内部实现处理.
 
 mod assets;
-mod metadata;
-mod process;
+mod cache;
 mod ffmpeg;
 mod fragment;
+mod metadata;
+mod process;
 mod sessions;
-mod cache;
+mod models;
+
+use std::path::PathBuf;
 
 /// 共享媒体资源限流器.
 ///
@@ -46,19 +48,6 @@ pub(crate) use metadata::MediaInfo;
 /// `retry = true` 显式绕过已有结果, 探测错误仍向调用方返回.
 pub(crate) use metadata::MetadataCache;
 
-/// 服务端构造的单次播放执行参数.
-///
-/// `new(id, source, info, request, saved_position)` 校验指纹, 轨道和目标位置,
-/// 合并历史进度与请求意图, 再交给 `SessionManager::create`.
-/// 源文件地址, 目标位置和媒体处理细节不参与缓存身份计算.
-pub(crate) use ffmpeg::EncodeSpec;
-
-/// 稳定的缓存身份配置, 不等同于客户端播放请求.
-///
-/// `key()` 按字段声明顺序序列化, 保留可选轨道的 null, 再计算 MD5.
-/// 配置只包含源文件指纹, 视频/音频/字幕流索引和编码契约.
-/// 不应将文件路径, 会话 ID, 播放位置或动态线程数加入配置.
-pub(crate) use cache::PlaybackVariantConfig;
 
 /// 活动缓存及磁盘播放缓存的管理器.
 ///
@@ -100,3 +89,24 @@ pub(crate) use cache::random_id;
 /// 跨模块测试用媒体信息及请求样本, 不作为生产业务接口提供.
 #[cfg(test)]
 pub(crate) use ffmpeg::fixture;
+
+use crate::models::PlaybackRequest;
+
+
+// ========================================================================== //
+
+pub(crate) async  fn new_session(
+    state: &crate::AppState,
+    id: &str,
+    source: PathBuf,
+    info: MediaInfo,
+    request: PlaybackRequest,
+    watch_pos: Option<f64>,
+) -> Result<crate::models::PlaybackStart, String> {
+
+    let spec = models::EncodeSpec::new(&id, source, info, request, watch_pos).unwrap();
+
+    let session = state.playback.create(spec).await.unwrap();
+
+    Ok(session)
+}

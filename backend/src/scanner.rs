@@ -196,25 +196,26 @@ mod tests {
     #[test]
     fn initial_track_preferences_match_server_defaults() {
         // 默认轨道由播放配置生成器选择, 扫描模块不再提供独立选择函数.
-        use crate::video::EncodeSpec;
-        use crate::models;
-        let (info, request) = crate::video::fixture();
-        let spec = EncodeSpec::new(&"a".repeat(32), "video.mkv".into(), info, request, None).unwrap();
-        assert_eq!((spec.config.audio_stream, spec.config.subtitle_stream), (Some(1), None));
-        let info = serde_json::from_value(serde_json::json!({
-            "duration": 20.0, "start_time": 0.0,
-            "video_tracks": [{"stream_index": 0, "codec_name": "h264", "is_default": true, "is_forced": false}],
-            "audio_tracks": [
-                {"stream_index": 1, "codec_name": "aac", "is_default": false, "is_forced": false},
-                {"stream_index": 4, "codec_name": "aac", "is_default": true, "is_forced": false}
-            ],
-            "subtitle_tracks": [
-                {"stream_index": 3, "codec_name": "ass", "is_default": false, "is_forced": true}
-            ],
-            "attachments": []
-        })).unwrap();
-        let spec = EncodeSpec::new(&"a".repeat(32), "video.mkv".into(), info, models::PlaybackRequest::default(), None).unwrap();
-        assert_eq!((spec.config.audio_stream, spec.config.subtitle_stream), (Some(4), Some(3)));
+        todo!();
+        // use crate::video::EncodeSpec;
+        // use crate::models;
+        // let (info, request) = crate::video::fixture();
+        // let spec = EncodeSpec::new(&"a".repeat(32), "video.mkv".into(), info, request, None).unwrap();
+        // assert_eq!((spec.config.audio_stream, spec.config.subtitle_stream), (Some(1), None));
+        // let info = serde_json::from_value(serde_json::json!({
+        //     "duration": 20.0, "start_time": 0.0,
+        //     "video_tracks": [{"stream_index": 0, "codec_name": "h264", "is_default": true, "is_forced": false}],
+        //     "audio_tracks": [
+        //         {"stream_index": 1, "codec_name": "aac", "is_default": false, "is_forced": false},
+        //         {"stream_index": 4, "codec_name": "aac", "is_default": true, "is_forced": false}
+        //     ],
+        //     "subtitle_tracks": [
+        //         {"stream_index": 3, "codec_name": "ass", "is_default": false, "is_forced": true}
+        //     ],
+        //     "attachments": []
+        // })).unwrap();
+        // let spec = EncodeSpec::new(&"a".repeat(32), "video.mkv".into(), info, models::PlaybackRequest::default(), None).unwrap();
+        // assert_eq!((spec.config.audio_stream, spec.config.subtitle_stream), (Some(4), Some(3)));
     }
 
     #[test]

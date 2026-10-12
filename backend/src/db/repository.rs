@@ -52,6 +52,12 @@ pub(crate) async fn get_video_paths_by_id(p: &SqlitePool, id: &str) -> Result<Ve
         .map(|paths| paths.into_iter().map(PathBuf::from).collect())
 }
 
+pub(crate) async fn get_a_video_path_by_id(p: &SqlitePool, id: &str) -> Result<Option<PathBuf>, sqlx::Error> {
+    sqlx::query_scalar::<_, String>("SELECT path FROM file_path WHERE pre16mib_md5 = ? ORDER BY path LIMIT 1")
+        .bind(id).fetch_optional(p).await
+        .map(|opt| opt.map(PathBuf::from))
+}
+
 /// 返回文件地址表所有完整文件地址及其对应的文件大小
 pub(crate) async fn get_paths_and_size(pool: &SqlitePool) -> Result<HashMap<PathBuf, u64>, sqlx::Error> {
     let records = sqlx::query_as::<_, (String, u64)>(

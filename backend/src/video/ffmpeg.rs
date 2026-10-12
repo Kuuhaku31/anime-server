@@ -1,67 +1,21 @@
 //! 构建顺序转码命令并恢复和验证持久 HLS.
 
-use std::{path::{Path, PathBuf}, process::Stdio};
+use std::{path::Path, process::Stdio};
 
 use anyhow::{ensure, Context, Result};
 use serde::Deserialize;
 use tokio::{io::AsyncWriteExt, process::Command, sync::watch};
 use tracing::warn;
 
-use crate::models::PlaybackRequest;
+#[cfg(test)]
+use crate::{models::PlaybackRequest, video::MediaInfo};
+use crate::video::models::EncodeSpec;
 
-use super::{assets::RenderAssets, cache::{is_key, ENCODER_PROFILE}, PlaybackVariantConfig,
-    fragment::{self, Fragment, Init, Tail}, metadata::{MediaInfo, Track},
+use super::{assets::RenderAssets, cache::is_key,
+    fragment::{self, Fragment, Init, Tail},
     process::{cancelled, check_cancel, checked_output_cancellable, Cancelled, Processes}};
 
-/// 单次任务的执行参数, 只有 config 参与缓存身份计算, 其余字段用于媒体处理和调度.
-#[derive(Clone)]
-pub(crate) struct EncodeSpec {
-    pub(crate) config: PlaybackVariantConfig,
-    pub(super) source: PathBuf,
-    pub(super) duration: f64,
-    // 容器时间轴原点可能为负数, 视频, 音频和字幕都要按同一原点归零.
-    source_start: f64,
-    pub(super) info: MediaInfo,
-    pub(super) subtitle: Option<Track>,
-    hdr: bool,
-    pub(super) target: f64,
-}
 
-impl EncodeSpec {
-    pub(crate) fn new(id: &str, source: PathBuf, info: MediaInfo, request: PlaybackRequest,
-        saved_position: Option<f64>) -> Result<Self> {
-        ensure!(is_key(id), "invalid source file ID");
-        let saved = saved_position.unwrap_or(0.0);
-        ensure!(saved.is_finite() && saved >= 0.0, "invalid saved playback position");
-        // 保留原有体验: 已到结尾的观看记录从头播放, 显式换轨位置则严格校验.
-        let target = request.position.unwrap_or(if saved < info.duration - 2.0 { saved } else { 0.0 });
-        ensure!(target.is_finite() && target >= 0.0 && target < info.duration, "position must be within the video duration");
-        let video = info.video_tracks.first().context("media has no playable video stream")?;
-        let audio_index = request.audio_stream_index.unwrap_or_else(|| {
-            info.audio_tracks.iter().find(|track| track.is_default).or(info.audio_tracks.first()).map(|track| track.stream_index)
-        });
-        let subtitle_index = request.subtitle_stream_index.unwrap_or_else(|| {
-            info.subtitle_tracks.iter().find(|track| track.is_default || track.is_forced).map(|track| track.stream_index)
-        });
-        let audio = select(&info.audio_tracks, audio_index, "audio")?;
-        let subtitle = select(&info.subtitle_tracks, subtitle_index, "subtitle")?;
-        let config = PlaybackVariantConfig {
-            src_file_pre16mib_md5: id.to_string(), video_stream: video.stream_index,
-            audio_stream: audio.map(|track| track.stream_index),
-            subtitle_stream: subtitle.as_ref().map(|track| track.stream_index),
-            encoder_profile: ENCODER_PROFILE.to_string(),
-        };
-        Ok(Self {
-            config, source, duration: info.duration, source_start: info.start_time,
-            hdr: video.is_hdr(), info, subtitle, target,
-        })
-    }
-}
-
-fn select(tracks: &[Track], index: Option<i32>, kind: &str) -> Result<Option<Track>> {
-    index.map(|index| tracks.iter().find(|track| track.stream_index == index).cloned()
-        .with_context(|| format!("selected {kind} track does not exist"))).transpose()
-}
 
 /// 只向私有工作目录生成 HLS, 正式缓存由 CacheManager 校验后原子追加.
 pub(super) fn command(spec: &EncodeSpec, directory: &Path, assets: Option<&RenderAssets>,
@@ -424,7 +378,9 @@ pub(crate) fn fixture() -> (MediaInfo, PlaybackRequest) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::video::{cache::ENCODER_PROFILE, models::EncodeSpec};
+
+use super::*;
 
     #[test]
     fn defaults_explicit_off_and_saved_positions_are_distinct() {
