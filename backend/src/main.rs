@@ -19,7 +19,7 @@ mod models;
 mod scanner;
 
 use config::AppConfig;
-use video::{CacheManager, SessionManager, MetadataCache, Processes};
+use video::{CacheManager, SessionManager, Processes};
 
 use tokio::time::{sleep, Duration};
 use tracing::{info, warn};
@@ -33,7 +33,6 @@ struct AppState {
     config: Arc<AppConfig>, // 应用配置
     scan_lock: Arc<tokio::sync::Mutex<()>>, // 扫描锁, 防止同时进行多个扫描任务
 
-    metadata: MetadataCache, // 元数据缓存
     processes: Processes, // 共享的 FFmpeg 进程池
     playback: SessionManager, // 播放会话管理
     cache: CacheManager, // 缓存管理
@@ -76,12 +75,10 @@ async fn main() -> Result<()> {
     info!("cache manager initialized at {}", constants::CACHE_DIR);
 
     let playback = SessionManager::new(config.playback.idle_timeout_seconds);
-    let metadata = MetadataCache::new();
 
     let state = AppState {
         db: db::initialize_database().await?,
         config: Arc::new(config),
-        metadata,
         playback: playback.clone(),
         scan_lock: Arc::new(tokio::sync::Mutex::new(())),
         processes,

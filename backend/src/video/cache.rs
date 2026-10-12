@@ -10,7 +10,7 @@ use anyhow::{bail, ensure, Context, Result};
 use tokio::{process::Child, sync::{watch, Mutex, Notify, OwnedSemaphorePermit}, task::JoinSet, time::interval};
 use tracing::{info, warn};
 
-use crate::config::PlaybackConfig;
+use crate::{config::PlaybackConfig, video::metadata::MetadataCache};
 use super::{
     models::EncodeSpec,
     assets::{self, RenderAssets}, ffmpeg::{self, CachedMedia},
@@ -58,6 +58,11 @@ struct ActiveState {
     error: Option<String>,
 }
 
+/// 媒体文件打开期间的缓存保护对象.
+///
+/// `SessionManager::media_path` 返回其 `Arc`, 调用方持有它直到文件打开完成,
+/// 防止最后会话释放后 LRU 在文件打开之前删除缓存.
+/// 外部不能直接创建, 查询或修改该对象, 媒体访问仍须经过有效会话.
 /// 同一配置的全部会话共享此元素, 只有其生成任务能发布正式分片.
 pub(crate) struct ActiveCache {
     key: String,
@@ -124,6 +129,7 @@ struct CacheInner {
 #[derive(Clone)]
 pub(crate) struct CacheManager {
     inner: Arc<CacheInner>,
+    pub(crate) metadata_cache: MetadataCache,
 }
 
 impl CacheManager {
@@ -151,11 +157,14 @@ impl CacheManager {
         info!("缓存管理器配置和磁盘目录检查通过, 开始恢复磁盘缓存和启动后台维护任务...");
 
         let (stop, _) = watch::channel(false);
-        let manager = Self { inner: Arc::new(CacheInner {
-            root, config, entries: Mutex::new(HashMap::new()), retired: Mutex::new(Vec::new()),
-            workers: Mutex::new(JoinSet::new()), maintenance: Mutex::new(()), stop,
-            _directory_lock: directory_lock,
-        }) };
+        let manager = Self {
+            inner: Arc::new(CacheInner {
+                root, config, entries: Mutex::new(HashMap::new()), retired: Mutex::new(Vec::new()),
+                workers: Mutex::new(JoinSet::new()), maintenance: Mutex::new(()), stop,
+                _directory_lock: directory_lock,
+            }),
+            metadata_cache: MetadataCache::new(),
+        };
         manager.maintain().await?;
         info!("缓存管理器初始化完成, 根目录: {}, 最大缓存容量: {} MiB, 最大并发编码线程数: {}",
             manager.inner.root.display(), manager.inner.config.cache_max_bytes / 1024 / 1024,

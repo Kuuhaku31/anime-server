@@ -9,7 +9,7 @@ use tracing::warn;
 
 use crate::{models::PlaybackStart, video::Processes};
 
-use super::{cache::{random_id, CacheManager}, ActiveCache, models::EncodeSpec};
+use super::{cache::{random_id, CacheManager}, cache::ActiveCache, models::EncodeSpec};
 
 /// 对外只暴露不透明会话和状态快照, 不返回播放配置或 variant-key.
 #[derive(Debug, Clone, Serialize)]

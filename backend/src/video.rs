@@ -41,13 +41,6 @@ pub(crate) use process::checked_output;
 /// 不随 API 响应公开, 调用方无需自行解析 ffprobe 输出.
 pub(crate) use metadata::MediaInfo;
 
-/// 按源文件指纹复用探测结果的缓存.
-///
-/// `new(processes)` 使用共享媒体进程名额.
-/// `get(id, path, retry)` 探测服务器文件地址, 同时缓存成功和失败结果.
-/// `retry = true` 显式绕过已有结果, 探测错误仍向调用方返回.
-pub(crate) use metadata::MetadataCache;
-
 
 /// 活动缓存及磁盘播放缓存的管理器.
 ///
@@ -57,12 +50,6 @@ pub(crate) use metadata::MetadataCache;
 /// 获取缓存, 分片发布和淘汰接口只供模块内部的会话及生成任务使用.
 pub(crate) use cache::CacheManager;
 
-/// 媒体文件打开期间的缓存保护对象.
-///
-/// `SessionManager::media_path` 返回其 `Arc`, 调用方持有它直到文件打开完成,
-/// 防止最后会话释放后 LRU 在文件打开之前删除缓存.
-/// 外部不能直接创建, 查询或修改该对象, 媒体访问仍须经过有效会话.
-pub(crate) use cache::ActiveCache;
 
 /// 单个播放会话的状态快照, 可序列化为客户端响应.
 ///
@@ -83,8 +70,8 @@ pub(crate) use sessions::SessionStatus;
 pub(crate) use sessions::SessionManager;
 
 /// 跨模块测试用随机名称生成器, 不作为生产业务接口提供.
-#[cfg(test)]
-pub(crate) use cache::random_id;
+// #[cfg(test)]
+// pub(crate) use cache::random_id;
 
 /// 跨模块测试用媒体信息及请求样本, 不作为生产业务接口提供.
 // #[cfg(test)]

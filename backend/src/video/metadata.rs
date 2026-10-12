@@ -49,9 +49,16 @@ pub(crate) struct MediaInfo {
     pub(super) attachments: Vec<Attachment>,
 }
 
+/// 按源文件指纹复用探测结果的缓存.
+///
+/// `new(processes)` 使用共享媒体进程名额.
+/// `get(id, path, retry)` 探测服务器文件地址, 同时缓存成功和失败结果.
+/// `retry = true` 显式绕过已有结果, 探测错误仍向调用方返回.
 /// 按文件指纹复用探测成功或失败结果, 显式 Retry probe 才绕过旧结果.
 #[derive(Clone)]
-pub(crate) struct MetadataCache { entries: Arc<Mutex<HashMap<String, Result<MediaInfo, String>>>> }
+pub(crate) struct MetadataCache {
+    entries: Arc<Mutex<HashMap<String, Result<MediaInfo, String>>>>
+}
 
 impl MetadataCache {
 
