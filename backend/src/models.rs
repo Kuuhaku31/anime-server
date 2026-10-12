@@ -2,11 +2,15 @@
 // backend/src/models.rs
 //! 定义数据库记录和接口数据结构.
 
+mod media;
+
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::{constants::HASH_LIMIT, utils, video::{MediaInfo, SessionStatus}};
+use crate::{constants::HASH_LIMIT, utils, video::SessionStatus};
+pub(crate) use media::{Attachment, MediaInfo, PlaybackVariantConfig, Track};
+
 
 
 #[derive(Debug, Serialize, sqlx::FromRow)]

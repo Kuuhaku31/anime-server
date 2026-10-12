@@ -57,7 +57,7 @@ impl RenderAssets {
             let remaining = seconds.checked_sub(started.elapsed().as_secs())
                 .filter(|seconds| *seconds > 0).context("subtitle preparation timed out")?;
             command.arg("-i").arg(&spec.source)
-                .args(["-map", &format!("0:{}", spec.config.video_stream), "-c:v", "copy", "-t", "0", "-f", "null", "-"]);
+                .args(["-map", &format!("0:{}", spec.config.video_stream()), "-c:v", "copy", "-t", "0", "-f", "null", "-"]);
             checked_output_cancellable(&mut command, remaining, cancel).await?;
             for path in paths {
                 let size = tokio::fs::metadata(path).await?.len();

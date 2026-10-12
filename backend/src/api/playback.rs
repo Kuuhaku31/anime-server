@@ -15,7 +15,7 @@ use tower_http::services::ServeFile;
 use tracing::warn;
 
 use crate::{
-    AppState, db, models, video,
+    AppState, db, models::{self, MediaInfo}, video,
 };
 
 
@@ -79,7 +79,7 @@ impl IntoResponse for ApiError {
 async fn streams(
     State(state): State<AppState>,
     Path(id): Path<String>,
-)-> Result<Json<video::MediaInfo>, ApiError> {
+)-> Result<Json<MediaInfo>, ApiError> {
     let info = state.session_manager.media_info(&id, false).await.map_err(media_info_error)?;
     Ok(Json(info))
 }
@@ -88,7 +88,7 @@ async fn streams(
 async fn probe(
     State(state): State<AppState>,
     Path(id): Path<String>,
-)-> Result<Json<video::MediaInfo>, ApiError> {
+)-> Result<Json<MediaInfo>, ApiError> {
     let info = state.session_manager.media_info(&id, true).await.map_err(media_info_error)?;
     Ok(Json(info))
 }

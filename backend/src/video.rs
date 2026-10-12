@@ -30,12 +30,6 @@ pub(crate) use process::Processes;
 /// stderr 诊断及子进程回收. 不自行获取 `Processes` 的并发许可.
 pub(crate) use process::checked_output;
 
-/// 媒体探测结果, 可序列化为视频, 音频和字幕轨道信息.
-///
-/// 轨道选择使用容器内全局流索引. 时间轴原点和字体附件只供模块内部处理,
-/// 不随 API 响应公开, 调用方无需自行解析 ffprobe 输出.
-pub(crate) use metadata::MediaInfo;
-
 
 /// 活动缓存及磁盘播放缓存的管理器.
 ///
@@ -46,7 +40,7 @@ pub(crate) use metadata::MediaInfo;
 pub(crate) use cache::{CacheManager, CachePin};
 
 /// 不可变的播放变体身份配置, 由媒体信息和客户端轨道请求构造.
-pub(crate) use models::{playback_target, PlaybackVariantConfig};
+pub(crate) use models::playback_target;
 
 
 /// 单个播放会话的状态快照, 可序列化为客户端响应.

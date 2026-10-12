@@ -7,10 +7,10 @@ use serde::Serialize;
 use tokio::{sync::Mutex, time::interval};
 use tracing::warn;
 
-use crate::models::{PlaybackRequest, PlaybackStart};
-use crate::video::{CachePin, MediaInfo};
+use crate::models::{MediaInfo, PlaybackRequest, PlaybackStart, PlaybackVariantConfig};
+use crate::video::CachePin;
 
-use crate::video::{playback_target, CacheManager, PlaybackVariantConfig};
+use crate::video::{playback_target, CacheManager};
 
 /// 对外只暴露不透明会话和状态快照, 不返回播放配置或 variant-key.
 #[derive(Debug, Clone, Serialize)]
@@ -62,7 +62,7 @@ impl SessionManager {
         let config = PlaybackVariantConfig::new(file_id, &media, &request)?;
         let target = playback_target(&media, &request)?;
         let id = crate::utils::random_id()?;
-        let key = config.key()?;
+        let key = config.key().to_owned();
         let selection = config.selection();
         {
             let mut sessions = self.sessions.lock().await;

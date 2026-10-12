@@ -15,13 +15,13 @@ use sqlx::SqlitePool;
 
 use crate::{config::PlaybackConfig, db, utils};
 use super::{
-    metadata::{self, MediaInfo},
-    models::{EncodeSpec, PlaybackVariantConfig},
+    metadata,
+    models::EncodeSpec,
     assets::{self, RenderAssets}, ffmpeg::{self, CachedMedia},
     fragment::{self, Init, Tail}, process::{cancelled, check_cancel, read_tail, Cancelled, Processes}};
+use crate::models::{MediaInfo, PlaybackVariantConfig};
 
-// 编码或续接规则改变兼容性时必须升级, 避免新任务复用旧契约的缓存.
-pub(super) const ENCODER_PROFILE: &str = "h264-high-yuv420p-aac-fmp4-v2";
+
 static REVISION: AtomicU64 = AtomicU64::new(1);
 
 // 进程实际退出时立即归还预算, 不把后续磁盘提交算成正在编码.
@@ -222,7 +222,7 @@ impl CacheManager {
 
     // 查找或创建共享缓存
     pub(crate) async fn acquire(&self, config: &PlaybackVariantConfig) -> Result<()> {
-        let key = config.key()?;
+        let key = config.key().to_owned();
         loop {
             let entries = self.inner.entries.lock().await;
             ensure!(!self.stopping(), "server is shutting down");
@@ -255,8 +255,8 @@ impl CacheManager {
             }
             ensure!(entries.len() < 32, "too many active playback configurations");
             drop(entries);
-            let info = self.media_info(&config.src_file_pre16mib_md5, false).await?;
-            let source = db::get_a_video_path_by_id(&self.inner.database, &config.src_file_pre16mib_md5).await?
+            let info = self.media_info(config.src_file_pre16mib_md5(), false).await?;
+            let source = db::get_a_video_path_by_id(&self.inner.database, config.src_file_pre16mib_md5()).await?
                 .context("video file not found")?;
             let spec = EncodeSpec::from_config(config.clone(), source, info, 0.0)?;
             let mut entries = self.inner.entries.lock().await;
@@ -264,7 +264,7 @@ impl CacheManager {
             if entries.contains_key(&key) { continue; }
             ensure!(entries.len() < 32, "too many active playback configurations");
             let output = Arc::new(CacheFolder {
-                key: key.clone(), directory: self.inner.root.join("playback").join(&key), spec: spec.clone(),
+                key: key.to_string(), directory: self.inner.root.join("playback").join(&key), spec: spec.clone(),
                 state: Mutex::new(FolderState {
                     media: CachedMedia::default(), loaded: false, target: Some(spec.target),
                     worker_active: true, encoding: false, finalizing: false, encoding_threads: 0,
@@ -274,7 +274,7 @@ impl CacheManager {
                 changed: Notify::new(),
             });
             // 先保留唯一活动元素, 磁盘校验在该元素的任务内进行, 不阻塞其他会话的 DELETE.
-            match entries.entry(key.clone()) {
+            match entries.entry(key.to_string()) {
                 Entry::Vacant(entry) => { entry.insert(output.clone()); },
                 Entry::Occupied(_) => bail!("playback activation raced while holding its lock"),
             }
@@ -564,7 +564,7 @@ impl CacheManager {
         first: bool, cancel: &mut watch::Receiver<bool>) -> Result<()> {
         let init_bytes = ffmpeg::regular_bytes(&directory.join("init.mp4"), 4 * 1024 * 1024).await?;
         let init = Init::parse(&init_bytes)?;
-        ensure!(init.audio() == output.spec.config.audio_stream.is_some(), "unexpected generated audio track");
+        ensure!(init.audio() == output.spec.config.audio_stream().is_some(), "unexpected generated audio track");
         let (expected, count) = {
             let mut state = output.state.lock().await;
             if let Some(existing) = &state.media.init { existing.compatible(&init)?; }

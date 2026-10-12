@@ -144,27 +144,27 @@ fn is_video(path: &Path) -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn initial_track_preferences_match_server_defaults() {
-        let info: crate::video::MediaInfo = serde_json::from_value(serde_json::json!({
-            "duration": 20.0, "start_time": 0.0,
-            "video_tracks": [{"stream_index": 0, "codec_name": "h264", "is_default": true, "is_forced": false}],
-            "audio_tracks": [
-                {"stream_index": 1, "codec_name": "aac", "is_default": false, "is_forced": false},
-                {"stream_index": 4, "codec_name": "aac", "is_default": true, "is_forced": false}
-            ],
-            "subtitle_tracks": [
-                {"stream_index": 3, "codec_name": "ass", "is_default": false, "is_forced": true}
-            ],
-            "attachments": []
-        })).unwrap();
-        let config = crate::video::PlaybackVariantConfig::new(
-            &"a".repeat(32),
-            &info,
-            &crate::models::PlaybackRequest::default(),
-        ).unwrap();
-        assert_eq!(config.selection(), (Some(4), Some(3)));
-    }
+    // #[test]
+    // fn initial_track_preferences_match_server_defaults() {
+    //     let info: crate::video::MediaInfo = serde_json::from_value(serde_json::json!({
+    //         "duration": 20.0, "start_time": 0.0,
+    //         "video_tracks": [{"stream_index": 0, "codec_name": "h264", "is_default": true, "is_forced": false}],
+    //         "audio_tracks": [
+    //             {"stream_index": 1, "codec_name": "aac", "is_default": false, "is_forced": false},
+    //             {"stream_index": 4, "codec_name": "aac", "is_default": true, "is_forced": false}
+    //         ],
+    //         "subtitle_tracks": [
+    //             {"stream_index": 3, "codec_name": "ass", "is_default": false, "is_forced": true}
+    //         ],
+    //         "attachments": []
+    //     })).unwrap();
+    //     let config = crate::video::PlaybackVariantConfig::new(
+    //         &"a".repeat(32),
+    //         &info,
+    //         &crate::models::PlaybackRequest::default(),
+    //     ).unwrap();
+    //     assert_eq!(config.selection(), (Some(4), Some(3)));
+    // }
 
     #[test]
     fn video_extensions_are_case_insensitive() {

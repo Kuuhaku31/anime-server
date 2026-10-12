@@ -17,3 +17,7 @@ pub(crate) const FALLBACK_FONT: &str = "/usr/share/fonts/opentype/noto/NotoSansC
 
 
 pub(crate) fn video_root_path() -> &'static Path { Path::new(VIDEO_ROOT) }
+
+
+// 编码或续接规则改变兼容性时必须升级, 避免新任务复用旧契约的缓存.
+pub(crate) const ENCODER_PROFILE: &str = "h264-high-yuv420p-aac-fmp4-v2";

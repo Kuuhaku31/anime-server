@@ -3,50 +3,15 @@
 use std::{collections::HashMap, path::Path};
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tokio::process::Command;
 
+use crate::models::{Attachment, MediaInfo, Track};
 use super::process::Processes;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(super) struct Track {
-    pub(super) stream_index: i32,
-    codec_name: String,
-    language: Option<String>,
-    title: Option<String>,
-    pub(super) is_default: bool,
-    pub(super) is_forced: bool,
-    #[serde(skip_serializing)]
-    color_transfer: Option<String>,
-}
 
-impl Track {
-    pub(super) fn is_bitmap(&self) -> bool {
-        matches!(self.codec_name.as_str(), "hdmv_pgs_subtitle" | "dvd_subtitle" | "dvb_subtitle" | "xsub")
-    }
 
-    pub(super) fn is_hdr(&self) -> bool {
-        matches!(self.color_transfer.as_deref(), Some("smpte2084" | "arib-std-b67"))
-    }
-}
 
-#[derive(Debug, Clone, Deserialize)]
-pub(super) struct Attachment {
-    pub(super) ordinal: usize,
-    pub(super) font_extension: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct MediaInfo {
-    pub(crate) duration: f64,
-    #[serde(skip_serializing)]
-    pub(super) start_time: f64,
-    pub(super) video_tracks: Vec<Track>,
-    pub(super) audio_tracks: Vec<Track>,
-    pub(super) subtitle_tracks: Vec<Track>,
-    #[serde(skip_serializing)]
-    pub(super) attachments: Vec<Attachment>,
-}
 
 /// 解析媒体文件并归一化 ffprobe 结果.
 pub(super) async fn probe(path: &Path, processes: &Processes) -> Result<MediaInfo> {
