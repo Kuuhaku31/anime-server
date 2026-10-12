@@ -3,39 +3,15 @@
 use std::{path::{Path, PathBuf}, process::Stdio};
 
 use anyhow::{ensure, Context, Result};
-use serde::{Deserialize, Deserializer};
+use serde::Deserialize;
 use tokio::{io::AsyncWriteExt, process::Command, sync::watch};
 use tracing::warn;
+
+use crate::models::PlaybackRequest;
 
 use super::{assets::RenderAssets, cache::{is_key, ENCODER_PROFILE}, PlaybackVariantConfig,
     fragment::{self, Fragment, Init, Tail}, metadata::{MediaInfo, Track},
     process::{cancelled, check_cancel, checked_output_cancellable, Cancelled, Processes}};
-
-/// 客户端只表达选轨和位置意图, 完整播放配置由服务端构造.
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct PlaybackRequest {
-
-    // 缺省表示服务端选轨, 显式 null 表示关闭, 两者不能混为一谈.
-    #[serde(default, deserialize_with = "track_choice")]
-    pub(crate) audio_stream_index: Option<Option<i32>>,
-    #[serde(default, deserialize_with = "track_choice")]
-    pub(crate) subtitle_stream_index: Option<Option<i32>>,
-    position: Option<f64>,
-}
-
-impl PlaybackRequest {
-    /// 仅将缺省字段补为数据库偏好, 显式 null 仍表示本次关闭对应轨道.
-    pub(crate) fn with_preferences(mut self, audio: Option<i32>, subtitle: Option<i32>) -> Self {
-        if self.audio_stream_index.is_none() { self.audio_stream_index = Some(audio); }
-        if self.subtitle_stream_index.is_none() { self.subtitle_stream_index = Some(subtitle); }
-        self
-    }
-}
-
-fn track_choice<'de, D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Option<Option<i32>>, D::Error> {
-    Option::<i32>::deserialize(deserializer).map(Some)
-}
 
 /// 单次任务的执行参数, 只有 config 参与缓存身份计算, 其余字段用于媒体处理和调度.
 #[derive(Clone)]

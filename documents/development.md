@@ -24,6 +24,9 @@ Serde 序列化和反序列化不依赖字段公开, 不为接口响应字段额
 类型和方法实现保留在子模块中, `video.rs` 的注释集中说明调用链及接口职责.
 随机名称和媒体样本辅助接口仅在测试构建中重导出.
 
+播放请求 `PlaybackRequest` 和创建响应 `PlaybackStart` 定义在 `models.rs`,
+由 `video.rs` 保留重导出入口. 请求选轨的缺省/null 区分及响应 flatten 结构不变.
+
 前端入口是 `frontend/src/main.ts`, 构建结果位于 `frontend/dist/`.
 后端从容器内 `/app/web` 提供静态文件, 前后端使用同源 HTTP 接口通信.
 

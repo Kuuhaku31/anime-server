@@ -196,7 +196,8 @@ mod tests {
     #[test]
     fn initial_track_preferences_match_server_defaults() {
         // 默认轨道由播放配置生成器选择, 扫描模块不再提供独立选择函数.
-        use crate::video::{EncodeSpec, PlaybackRequest};
+        use crate::video::EncodeSpec;
+        use crate::models;
         let (info, request) = crate::video::fixture();
         let spec = EncodeSpec::new(&"a".repeat(32), "video.mkv".into(), info, request, None).unwrap();
         assert_eq!((spec.config.audio_stream, spec.config.subtitle_stream), (Some(1), None));
@@ -212,7 +213,7 @@ mod tests {
             ],
             "attachments": []
         })).unwrap();
-        let spec = EncodeSpec::new(&"a".repeat(32), "video.mkv".into(), info, PlaybackRequest::default(), None).unwrap();
+        let spec = EncodeSpec::new(&"a".repeat(32), "video.mkv".into(), info, models::PlaybackRequest::default(), None).unwrap();
         assert_eq!((spec.config.audio_stream, spec.config.subtitle_stream), (Some(4), Some(3)));
     }
 

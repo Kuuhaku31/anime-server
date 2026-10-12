@@ -16,7 +16,7 @@ use tower_http::services::ServeFile;
 use tracing::warn;
 
 use crate::{
-    AppState, constants::VIDEO_ROOT, db, utils, video,
+    AppState, constants::VIDEO_ROOT, db, models, utils, video,
 };
 
 
@@ -76,7 +76,7 @@ async fn streams(
     State(state): State<AppState>,
     Path(id): Path<String>,
 )-> Result<Json<video::MediaInfo>, ApiError> {
-    Ok(Json(metadata(&state, &id, false).await?.1))
+    Ok(Json(get_metadata(&state, &id, false).await?.1))
 }
 
 /// 重新探测媒体文件.
@@ -84,7 +84,7 @@ async fn probe(
     State(state): State<AppState>,
     Path(id): Path<String>,
 )-> Result<Json<video::MediaInfo>, ApiError> {
-    Ok(Json(metadata(&state, &id, true).await?.1))
+    Ok(Json(get_metadata(&state, &id, true).await?.1))
 }
 
 /// 创建播放会话.
@@ -97,18 +97,18 @@ async fn play(
     State(state): State<AppState>,
     Path(id): Path<String>,
     input: Bytes,
-) -> Result<Json<video::PlaybackStart>, ApiError>
+) -> Result<Json<models::PlaybackStart>, ApiError>
 {
     // 空请求体使用默认配置, 显式 null 仍交由 JSON 反序列化处理.
-    let input = if input.is_empty() { video::PlaybackRequest::default() }
+    let input = if input.is_empty() { models::PlaybackRequest::default() }
     else { serde_json::from_slice(&input).map_err(ApiError::bad)? };
 
-    let (source, info) = metadata(&state, &id, false).await?;
+    // 返回媒体文件路径和元数据
+    let (source, info) = get_metadata(&state, &id, false).await?;
 
-    let progress = db::get_progress(&state.db, &id)
-        .await
-        .map_err(ApiError::internal)?
-        .ok_or_else(|| ApiError::missing("file not found"))?;
+    // 读取数据库中保存的播放进度
+    let progress = db::get_progress(&state.db, &id).await
+    .map_err(ApiError::internal)?.ok_or_else(|| ApiError::missing("file not found"))?;
 
     // 请求显式选择覆盖数据库偏好, 字段缺省才使用扫描或上次手动选择保存的轨道.
     let audio_preference = input.audio_stream_index;
@@ -246,7 +246,7 @@ async fn media(
 
 
 /// 获取媒体文件路径和元数据.
-async fn metadata(
+async fn get_metadata(
     state: &AppState,
     id: &str,
     retry: bool,

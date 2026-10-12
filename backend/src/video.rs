@@ -46,13 +46,6 @@ pub(crate) use metadata::MediaInfo;
 /// `retry = true` 显式绕过已有结果, 探测错误仍向调用方返回.
 pub(crate) use metadata::MetadataCache;
 
-/// 客户端选轨和位置请求, 不接受客户端提供的完整编码配置.
-///
-/// 轨道字段缺省表示使用数据库偏好或服务端默认选择, 显式 null 表示关闭.
-/// `with_preferences(audio, subtitle)` 只补充缺省字段, 保留显式选择.
-/// 位置字段由反序列化读取, 最终合法性由 `EncodeSpec::new` 检查.
-pub(crate) use ffmpeg::PlaybackRequest;
-
 /// 服务端构造的单次播放执行参数.
 ///
 /// `new(id, source, info, request, saved_position)` 校验指纹, 轨道和目标位置,
@@ -88,11 +81,6 @@ pub(crate) use cache::ActiveCache;
 /// ready 表示已有可播放分片, 不保证整个目标位置已经被缓存覆盖.
 /// 外部仅能读取校验目标位置所需的 duration, 其余字段通过序列化提供.
 pub(crate) use sessions::SessionStatus;
-
-/// 创建播放会话的响应, 包含状态快照, 媒体信息和实际选中的轨道.
-///
-/// 状态字段通过 Serde flatten 展开, 不向客户端返回缓存键或执行参数.
-pub(crate) use sessions::PlaybackStart;
 
 /// 不透明播放会话及活动缓存租约的统一入口.
 ///

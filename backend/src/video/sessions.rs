@@ -7,7 +7,9 @@ use serde::Serialize;
 use tokio::{sync::Mutex, time::interval};
 use tracing::warn;
 
-use super::{cache::{random_id, CacheManager}, ActiveCache, ffmpeg::EncodeSpec, metadata::MediaInfo};
+use crate::models::PlaybackStart;
+
+use super::{cache::{random_id, CacheManager}, ActiveCache, ffmpeg::EncodeSpec};
 
 /// 对外只暴露不透明会话和状态快照, 不返回播放配置或 variant-key.
 #[derive(Debug, Clone, Serialize)]
@@ -25,20 +27,6 @@ pub(crate) struct SessionStatus {
     buffered_until: f64,
     encoding_threads: usize,
     error: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct Selection {
-    audio: Option<i32>,
-    subtitle: Option<i32>,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct PlaybackStart {
-    #[serde(flatten)]
-    session: SessionStatus,
-    media: MediaInfo,
-    selection: Selection,
 }
 
 // 会话只记录缓存键和存活时间, 目标位置及媒体状态由活动元素统一维护.
@@ -67,7 +55,7 @@ impl SessionManager {
         let id = random_id()?;
         let key = spec.config.key()?;
         let media = spec.info.clone();
-        let selection = Selection { audio: spec.config.audio_stream, subtitle: spec.config.subtitle_stream };
+        let selection = (spec.config.audio_stream, spec.config.subtitle_stream);
         {
             let mut sessions = self.sessions.lock().await;
             ensure!(!self.cache.stopping(), "server is shutting down");
@@ -80,7 +68,7 @@ impl SessionManager {
             self.status(&id).await
         }.await;
         match result {
-            Ok(session) => Ok(PlaybackStart { session, media, selection }),
+            Ok(session) => Ok(PlaybackStart::new(session, media, selection.0, selection.1)),
             Err(error) => {
                 self.sessions.lock().await.remove(&id);
                 if let Err(cleanup) = self.cache.release(&key, &id).await {
@@ -181,6 +169,9 @@ impl SessionManager {
     }
 }
 
+
+// ========================================================================== //
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,8 +216,14 @@ mod tests {
         let spec = EncodeSpec::new(&"a".repeat(32), "video.mkv".into(), info, request, None).unwrap();
         let key = spec.config.key().unwrap();
         let (first, second) = tokio::join!(manager.create(spec.clone()), manager.create(spec));
-        let first = first.unwrap().session.session_id;
-        let second = second.unwrap().session.session_id;
+        // 从响应 JSON 读取会话 ID, 验证模型迁移后 flatten 及轨道字段保持不变.
+        let first = serde_json::to_value(first.unwrap()).unwrap();
+        let second = serde_json::to_value(second.unwrap()).unwrap();
+        assert!(first.get("session").is_none());
+        assert!(first["media"].is_object());
+        assert_eq!(first["selection"], serde_json::json!({"audio": 1, "subtitle": null}));
+        let first = first["session_id"].as_str().unwrap().to_owned();
+        let second = second["session_id"].as_str().unwrap().to_owned();
         assert_ne!(first, second);
         let output = cache.get(&key).await.unwrap();
         assert!(Arc::ptr_eq(&output, &cache.get(&key).await.unwrap()));

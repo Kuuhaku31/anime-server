@@ -1,10 +1,12 @@
+
+// backend/src/models.rs
 //! 定义数据库记录和接口数据结构.
 
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::{constants::HASH_LIMIT, utils};
+use crate::{constants::HASH_LIMIT, utils, video::{MediaInfo, SessionStatus}};
 
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -79,4 +81,66 @@ pub(crate) struct ScanChanges {
     pub(crate) added: u64,
     pub(crate) removed: u64,
     pub(crate) total: u64, // 所有现存视频路径数
+}
+
+
+// ========================================================================== //
+
+/// 客户端选轨和位置请求, 不接受客户端提供的完整编码配置.
+///
+/// 轨道字段缺省表示使用数据库偏好或服务端默认选择, 显式 null 表示关闭.
+/// `with_preferences(audio, subtitle)` 只补充缺省字段, 保留显式选择.
+/// 位置字段由反序列化读取, 最终合法性由 `EncodeSpec::new` 检查.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PlaybackRequest {
+    // 缺省表示服务端选轨, 显式 null 表示关闭, 两者不能混为一谈.
+    #[serde(default, deserialize_with = "track_choice")]
+    pub(crate) audio_stream_index: Option<Option<i32>>,
+    #[serde(default, deserialize_with = "track_choice")]
+    pub(crate) subtitle_stream_index: Option<Option<i32>>,
+    pub(crate) position: Option<f64>,
+}
+
+/// 创建播放会话的响应, 包含状态快照, 媒体信息和实际选中的轨道.
+///
+/// 状态字段通过 Serde flatten 展开, 不向客户端返回缓存键或执行参数.
+impl PlaybackRequest {
+    /// 仅将缺省字段补为数据库偏好, 显式 null 仍表示本次关闭对应轨道.
+    pub(crate) fn with_preferences(mut self, audio: Option<i32>, subtitle: Option<i32>) -> Self {
+        if self.audio_stream_index.is_none() { self.audio_stream_index = Some(audio); }
+        if self.subtitle_stream_index.is_none() { self.subtitle_stream_index = Some(subtitle); }
+        self
+    }
+}
+
+// 为显式 null 保留外层 Some, 与未提供字段时的 None 区分.
+fn track_choice<'de, D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Option<Option<i32>>, D::Error> {
+    Option::<i32>::deserialize(deserializer).map(Some)
+}
+
+/// 播放响应中的实际音轨和字幕选择, 仅通过序列化向客户端提供.
+#[derive(Debug, Serialize)]
+struct Selection {
+    audio: Option<i32>,
+    subtitle: Option<i32>,
+}
+
+/// 创建播放会话的响应, 包含展开的状态快照, 媒体信息和实际轨道选择.
+#[derive(Debug, Serialize)]
+pub(crate) struct PlaybackStart {
+    #[serde(flatten)]
+    // 会话状态快照.
+    session: SessionStatus,
+    // 媒体信息, 播放开始时间等.
+    media: MediaInfo,
+    // 实际音轨和字幕选择.
+    selection: Selection,
+}
+
+impl PlaybackStart {
+    /// 组装播放响应, 保持响应字段私有及原有 JSON 结构.
+    pub(crate) fn new(session: SessionStatus, media: MediaInfo, audio: Option<i32>, subtitle: Option<i32>) -> Self {
+        Self { session, media, selection: Selection { audio, subtitle } }
+    }
 }
