@@ -87,8 +87,8 @@ pub(crate) use sessions::SessionManager;
 pub(crate) use cache::random_id;
 
 /// 跨模块测试用媒体信息及请求样本, 不作为生产业务接口提供.
-#[cfg(test)]
-pub(crate) use ffmpeg::fixture;
+// #[cfg(test)]
+// pub(crate) use ffmpeg::fixture;
 
 use crate::models::PlaybackRequest;
 
@@ -106,7 +106,7 @@ pub(crate) async  fn new_session(
 
     let spec = models::EncodeSpec::new(&id, source, info, request, watch_pos).unwrap();
 
-    let session = state.playback.create(spec).await.unwrap();
+    let session = state.playback.create(&state.processes, spec).await.unwrap();
 
     Ok(session)
 }

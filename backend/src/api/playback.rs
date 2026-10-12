@@ -83,7 +83,7 @@ async fn streams(
             let path = db::get_a_video_path_by_id(&state.db, id).await.map_err(ApiError::missing)?.ok_or_else(|| ApiError::missing("file not found"))?;
             let info = state
                 .metadata
-                .get(id, &path, false)
+                .get(&state.processes, id, &path, false)
                 .await
                 .map_err(ApiError::media)?;
             Ok((path, info))
@@ -103,7 +103,7 @@ async fn probe(
             let path = db::get_a_video_path_by_id(&state.db, id).await.map_err(ApiError::missing)?.ok_or_else(|| ApiError::missing("file not found"))?;
             let info = state
                 .metadata
-                .get(id, &path, true)
+                .get(&state.processes, id, &path, true)
                 .await
                 .map_err(ApiError::media)?;
             Ok((path, info))
@@ -133,7 +133,7 @@ async fn play(
 
     // 返回媒体文件路径和元数据
     let source = db::get_a_video_path_by_id(&state.db, &id).await.map_err(ApiError::missing)?.ok_or_else(|| ApiError::missing("file not found"))?;
-    let info = state.metadata.get(&id, &source, false).await.map_err(ApiError::media)?;
+    let info = state.metadata.get(&state.processes, &id, &source, false).await.map_err(ApiError::media)?;
 
     // 请求显式选择覆盖数据库偏好, 字段缺省才使用扫描或上次手动选择保存的轨道.
     let audio_preference = input.audio_stream_index;

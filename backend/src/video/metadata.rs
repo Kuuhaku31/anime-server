@@ -51,18 +51,15 @@ pub(crate) struct MediaInfo {
 
 /// 按文件指纹复用探测成功或失败结果, 显式 Retry probe 才绕过旧结果.
 #[derive(Clone)]
-pub(crate) struct MetadataCache {
-    entries: Arc<Mutex<HashMap<String, Result<MediaInfo, String>>>>,
-    processes: Processes,
-}
+pub(crate) struct MetadataCache { entries: Arc<Mutex<HashMap<String, Result<MediaInfo, String>>>> }
 
 impl MetadataCache {
 
-    pub(crate) fn new(processes: Processes) -> Self {
-        Self { entries: Arc::new(Mutex::new(HashMap::new())), processes }
+    pub(crate) fn new() -> Self {
+        Self { entries: Arc::new(Mutex::new(HashMap::new())) }
     }
 
-    pub(crate) async fn get(&self, id: &str, path: &Path, retry: bool) -> Result<MediaInfo, String> {
+    pub(crate) async fn get(&self, processes: &Processes, id: &str, path: &Path, retry: bool) -> Result<MediaInfo, String> {
 
         let mut entries = self.entries.lock().await; // 获取缓存锁
 
@@ -86,7 +83,7 @@ impl MetadataCache {
 
         // 使用 ffprobe 输出的 JSON 数据进行探测结果归一化处理.
 
-        let result = self.ffprobe(path).await.map_err(|e| e.to_string());
+        let result = self.ffprobe(path, processes).await.map_err(|e| e.to_string());
 
         // 成功则缓存结果, 失败则仅记录日志.
         match &result {
@@ -100,7 +97,7 @@ impl MetadataCache {
 
     // ====================================================================== //
 
-    async fn ffprobe(&self, path: &Path) -> Result<MediaInfo, String> {
+    async fn ffprobe(&self, path: &Path, processes: &Processes) -> Result<MediaInfo, String> {
 
         #[derive(Deserialize)]
         struct Probe {
@@ -141,7 +138,7 @@ impl MetadataCache {
 
         let mut command = Command::new("ffprobe");
         command.args(["-v", "error", "-show_streams", "-show_format", "-of", "json"]).arg(path);
-        let probe: Probe = serde_json::from_slice(&self.processes.output(&mut command, 60)
+        let probe: Probe = serde_json::from_slice(&processes.output(&mut command, 60)
         .await.map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
 
         let duration = probe.format.duration.as_deref().ok_or("missing media duration")?.parse::<f64>().map_err(|e| e.to_string())?;
