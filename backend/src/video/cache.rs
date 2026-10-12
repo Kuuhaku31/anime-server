@@ -1,8 +1,9 @@
 //! 管理按播放配置去重的活动缓存和磁盘淘汰.
 
 use std::{
-    collections::{hash_map::Entry, HashMap}, fs::{File, FileTimes}, future::Future, io::Read,
-    path::{Path, PathBuf}, sync::{atomic::{AtomicU64, Ordering}, Arc, Weak},
+    collections::{hash_map::Entry, HashMap},
+    fs::{File, FileTimes}, future::Future, path::{Path, PathBuf},
+    sync::{atomic::{AtomicU64, Ordering}, Arc, Weak},
     time::{Duration, Instant, SystemTime},
 };
 
@@ -10,7 +11,7 @@ use anyhow::{bail, ensure, Context, Result};
 use tokio::{process::Child, sync::{watch, Mutex, Notify, OwnedSemaphorePermit}, task::JoinSet, time::interval};
 use tracing::{info, warn};
 
-use crate::{config::PlaybackConfig, video::metadata::MetadataCache};
+use crate::{config::PlaybackConfig, utils, video::metadata::MetadataCache};
 use super::{
     models::EncodeSpec,
     assets::{self, RenderAssets}, ffmpeg::{self, CachedMedia},
@@ -64,7 +65,7 @@ struct ActiveState {
 /// 防止最后会话释放后 LRU 在文件打开之前删除缓存.
 /// 外部不能直接创建, 查询或修改该对象, 媒体访问仍须经过有效会话.
 /// 同一配置的全部会话共享此元素, 只有其生成任务能发布正式分片.
-pub(crate) struct ActiveCache {
+pub(super) struct ActiveCache {
     key: String,
     directory: PathBuf,
     pub(super) spec: EncodeSpec,
@@ -148,7 +149,7 @@ impl CacheManager {
             let directory = root.join(name);
             tokio::fs::create_dir_all(&directory).await?;
             ensure!(tokio::fs::symlink_metadata(&directory).await?.is_dir(), "unsafe cache directory: {name}");
-            let probe = directory.join(format!(".write-{}", random_id()?));
+            let probe = directory.join(format!(".write-{}", utils::random_id()?));
             tokio::fs::OpenOptions::new().write(true).create_new(true).open(&probe).await
                 .with_context(|| format!("cache directory is not writable: {}", directory.display()))?;
             tokio::fs::remove_file(probe).await?;
@@ -347,7 +348,7 @@ impl CacheManager {
         if resume.video > 0 && !ffmpeg::has_video_after(&output.spec, resume, processes, cancel).await? {
             return self.complete(output).await;
         }
-        let directory = output.directory.join(format!(".work-{}", random_id()?));
+        let directory = output.directory.join(format!(".work-{}", utils::random_id()?));
         let assets = if output.spec.subtitle.as_ref().is_some_and(|track| !track.is_bitmap()) {
             Some(RenderAssets::allocate(&self.inner.root).await?)
         } else { None };
@@ -578,7 +579,7 @@ impl CacheManager {
                 continue;
             }
             let path = self.inner.root.join("playback").join(&key);
-            let trash = self.inner.root.join("playback").join(format!(".evict-{key}-{}", random_id()?));
+            let trash = self.inner.root.join("playback").join(format!(".evict-{key}-{}", utils::random_id()?));
             // 先原子移走不活跃目录, 避免长时间删除文件阻塞其他缓存的状态和释放请求.
             tokio::fs::rename(&path, &trash).await?;
             drop(retired);
@@ -655,23 +656,12 @@ fn disk_usage(root: &Path) -> Result<(u64, Vec<DiskCandidate>)> {
     for entry in std::fs::read_dir(root.join("playback"))? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if is_key(&name) && entry.file_type()?.is_dir() {
+        if utils::check_md5(&name).is_ok() && entry.file_type()?.is_dir() {
             candidates.push((entry.metadata()?.modified()?, name, directory_size(&entry.path())?));
         }
     }
     Ok((total, candidates))
 }
-
-pub(super) fn is_key(value: &str) -> bool {
-    value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-pub(crate) fn random_id() -> Result<String> {
-    let mut bytes = [0_u8; 16];
-    File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
-}
-
 
 
 // ========================================================================== //

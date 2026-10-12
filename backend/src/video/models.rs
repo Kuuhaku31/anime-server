@@ -10,7 +10,7 @@ use anyhow::{Context, Result, ensure};
 use crate::models::PlaybackRequest;
 use std::path::PathBuf;
 
-use super::{cache::{is_key, ENCODER_PROFILE}, metadata::{MediaInfo, Track}};
+use super::{cache::ENCODER_PROFILE, metadata::{MediaInfo, Track}};
 
 
 
@@ -60,7 +60,7 @@ pub(crate) struct EncodeSpec {
 impl EncodeSpec {
     pub(crate) fn new(id: &str, source: PathBuf, info: MediaInfo, request: PlaybackRequest,
         saved_position: Option<f64>) -> Result<Self> {
-        ensure!(is_key(id), "invalid source file ID");
+        ensure!(crate::utils::check_md5_ok(id), "invalid source file ID");
         let saved = saved_position.unwrap_or(0.0);
         ensure!(saved.is_finite() && saved >= 0.0, "invalid saved playback position");
         // 保留原有体验: 已到结尾的观看记录从头播放, 显式换轨位置则严格校验.

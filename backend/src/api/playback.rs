@@ -232,7 +232,7 @@ async fn media(
     request: Request,
 ) -> Result<Response, ApiError> {
     // 持有 lease 直到 ServeFile 完成文件打开, 避免资源目录被提前删除.
-    let (path, mime, _lease) = state
+    let (path, mime) = state
         .playback
         .media_path(&state.cache, &id, &asset)
         .await

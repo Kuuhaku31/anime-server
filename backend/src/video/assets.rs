@@ -5,7 +5,7 @@ use std::{path::{Path, PathBuf}, time::Instant};
 use anyhow::{ensure, Context, Result};
 use tokio::{process::Command, sync::watch};
 
-use super::{cache::{is_key, random_id}, models::EncodeSpec, process::checked_output_cancellable};
+use super::{models::EncodeSpec, process::checked_output_cancellable};
 
 /// 资源只属于本次字幕渲染任务, 不进入持久播放配置或缓存身份.
 pub(super) struct RenderAssets {
@@ -16,7 +16,7 @@ pub(super) struct RenderAssets {
 
 impl RenderAssets {
     pub(super) async fn allocate(root: &Path) -> Result<Self> {
-        let id = random_id()?;
+        let id = crate::utils::random_id()?;
         let subtitle = root.join("subtitles").join(format!("{id}.ass"));
         let fonts = root.join("fonts").join(&id);
         tokio::fs::create_dir(&fonts).await?;
@@ -48,7 +48,7 @@ impl RenderAssets {
         for font in &spec.info.attachments {
             let Some(extension) = &font.font_extension else { continue; };
             // 输出路径由服务端随机命名, 不信任容器内附件的文件名或目录.
-            let path = self.fonts.join(format!("{}.{}", random_id()?, extension));
+            let path = self.fonts.join(format!("{}.{}", crate::utils::random_id()?, extension));
             command.arg(format!("-dump_attachment:t:{}", font.ordinal)).arg(&path);
             paths.push(path);
         }
@@ -87,8 +87,8 @@ pub(super) async fn clean_startup(root: &Path) -> Result<()> {
             let name = entry.file_name();
             let name = name.to_string_lossy();
             let owned = if directory == "subtitles" {
-                name.strip_suffix(".ass").is_some_and(is_key)
-            } else { is_key(&name) };
+                name.strip_suffix(".ass").is_some_and(|s| crate::utils::check_md5(s).is_ok())
+            } else { crate::utils::check_md5(&name).is_ok() };
             if !owned { continue; }
             if entry.file_type().await?.is_dir() {
                 if directory == "fonts" { tokio::fs::remove_dir_all(entry.path()).await?; }

@@ -9,7 +9,7 @@ use tracing::warn;
 
 use crate::{models::PlaybackStart, video::Processes};
 
-use super::{cache::{random_id, CacheManager}, cache::ActiveCache, models::EncodeSpec};
+use super::{cache::{CacheManager}, models::EncodeSpec};
 
 /// 对外只暴露不透明会话和状态快照, 不返回播放配置或 variant-key.
 #[derive(Debug, Clone, Serialize)]
@@ -51,7 +51,7 @@ impl SessionManager {
 
     /// 先预留会话名额再等待缓存加载, 防止并发创建绕过数量上限.
     pub(crate) async fn create(&self, processes: &Processes, cache: &CacheManager, spec: EncodeSpec) -> Result<PlaybackStart> {
-        let id = random_id()?;
+        let id = crate::utils::random_id()?;
         let key = spec.config.key()?;
         let media = spec.info.clone();
         let selection = (spec.config.audio_stream, spec.config.subtitle_stream);
@@ -110,13 +110,13 @@ impl SessionManager {
         self.status(cache, id).await
     }
 
-    pub(crate) async fn media_path(&self, cache: &CacheManager, id: &str, name: &str) -> Result<(PathBuf, &'static str, Arc<ActiveCache>)> {
+    pub(crate) async fn media_path(&self, cache: &CacheManager, id: &str, name: &str) -> Result<(PathBuf, &'static str)> {
         let key = self.key(id).await?;
-        let (path, cache) = cache.media_path(&key, id, name).await?;
+        let (path, _cache) = cache.media_path(&key, id, name).await?;
         let mime = if name.ends_with(".m3u8") { "application/vnd.apple.mpegurl" }
             else if name.ends_with(".m4s") { "video/iso.segment" } else { "video/mp4" };
         // 只在文件打开期间持有额外 Arc, 即使最后一份租约被删除也不会被 LRU 抢先删除.
-        Ok((path, mime, cache))
+        Ok((path, mime))
     }
 
     /// 先移除会话再释放租约, 重复释放和并发过期清理只会有一方实际扣除租约.

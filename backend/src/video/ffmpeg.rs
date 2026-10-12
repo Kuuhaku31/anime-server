@@ -11,9 +11,11 @@ use tracing::warn;
 use crate::{models::PlaybackRequest, video::MediaInfo};
 use crate::video::models::EncodeSpec;
 
-use super::{assets::RenderAssets, cache::is_key,
+use super::{
+    assets::RenderAssets,
     fragment::{self, Fragment, Init, Tail},
-    process::{cancelled, check_cancel, checked_output_cancellable, Cancelled, Processes}};
+    process::{cancelled, check_cancel, checked_output_cancellable, Cancelled, Processes}
+};
 
 
 
@@ -339,7 +341,7 @@ pub(super) async fn recover(directory: &Path, processes: &Processes, cancel: &mu
         let index = name.strip_prefix("segment_").and_then(|name| name.strip_suffix(".m4s"))
             .filter(|index| index.len() == 6 && index.bytes().all(|byte| byte.is_ascii_digit()))
             .and_then(|index| index.parse::<usize>().ok());
-        if name.strip_prefix(".work-").is_some_and(is_key) {
+        if name.strip_prefix(".work-").is_some_and(crate::utils::check_md5_ok) {
             if file.file_type().await?.is_dir() { tokio::fs::remove_dir_all(file.path()).await?; }
             else { tokio::fs::remove_file(file.path()).await?; }
         } else if index.is_some_and(|index| index >= media.segments.len())

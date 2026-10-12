@@ -51,7 +51,6 @@ pub(crate) async fn check_tools() -> Result<()> {
 
 
 /// 检查字符串是否符合预期的文件名 MD5 哈希格式, 自动转换为小写十六进制字符.
-#[allow(dead_code)]
 pub(crate) fn check_md5(input: &str) -> Result<String, String> {
 
     if !(input.len() == 32 && input.bytes().all(|byte| byte.is_ascii_hexdigit())) {
@@ -59,6 +58,14 @@ pub(crate) fn check_md5(input: &str) -> Result<String, String> {
     }
 
     Ok(input.to_ascii_lowercase())
+}
+
+pub(crate) fn check_md5_ok(input: &str) -> bool {
+
+    if !(input.len() == 32 && input.bytes().all(|byte| byte.is_ascii_hexdigit())) {
+        return false;
+    }
+    else { return true; }
 }
 
 /// 检查字符串是否符合预期的文件名 SHA256 哈希格式, 自动转换为小写十六进制字符.
@@ -94,4 +101,11 @@ pub(crate) fn md5_hash_prefix(path: &Path, limit: u64) -> Result<String, String>
     }
 
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+
+pub(crate) fn random_id() -> Result<String> {
+    let mut bytes = [0_u8; 16];
+    File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
