@@ -27,16 +27,16 @@ type EncoderBudget = Option<(OwnedSemaphorePermit, OwnedSemaphorePermit, OwnedSe
 
 /// complete 只描述媒体是否完整, generating 还包括排队和收尾, 两者可以同时为真.
 #[derive(Clone)]
-pub(super) struct CacheStatus {
-    pub(super) complete: bool,
-    pub(super) generating: bool,
-    pub(super) stopping: bool,
-    pub(super) ready: bool,
-    pub(super) buffered_until: f64,
-    pub(super) encoding_threads: usize,
-    pub(super) revision: u64,
-    pub(super) target: f64,
-    pub(super) error: Option<String>,
+pub(crate) struct CacheStatus {
+    pub(crate) complete: bool,
+    pub(crate) generating: bool,
+    pub(crate) stopping: bool,
+    pub(crate) ready: bool,
+    pub(crate) buffered_until: f64,
+    pub(crate) encoding_threads: usize,
+    pub(crate) revision: u64,
+    pub(crate) target: f64,
+    pub(crate) error: Option<String>,
 }
 
 struct ActiveState {
@@ -65,16 +65,16 @@ struct ActiveState {
 /// 防止最后会话释放后 LRU 在文件打开之前删除缓存.
 /// 外部不能直接创建, 查询或修改该对象, 媒体访问仍须经过有效会话.
 /// 同一配置的全部会话共享此元素, 只有其生成任务能发布正式分片.
-pub(super) struct ActiveCache {
+pub(crate) struct ActiveCache {
     key: String,
     directory: PathBuf,
-    pub(super) spec: EncodeSpec,
+    pub(crate) spec: EncodeSpec,
     state: Mutex<ActiveState>,
     changed: Notify,
 }
 
 impl ActiveCache {
-    pub(super) async fn wait_loaded(&self) -> Result<()> {
+    pub(crate) async fn wait_loaded(&self) -> Result<()> {
         // 创建响应必须反映磁盘的真实完成状态, 等待期间不占用全局活动集合锁.
         loop {
             // 先注册通知再检查条件, 避免恢复完成通知落在检查与等待之间.
@@ -90,7 +90,7 @@ impl ActiveCache {
         }
     }
 
-    pub(super) async fn status(&self, id: &str) -> Result<CacheStatus> {
+    pub(crate) async fn status(&self, id: &str) -> Result<CacheStatus> {
         let mut state = self.state.lock().await;
         let target = *state.clients.get(id).context("playback cache lease is no longer active")?;
         state.last_used = SystemTime::now();
@@ -173,10 +173,10 @@ impl CacheManager {
         Ok(manager)
     }
 
-    pub(super) fn stopping(&self) -> bool { *self.inner.stop.borrow() }
+    pub(crate) fn stopping(&self) -> bool { *self.inner.stop.borrow() }
 
     // 查找或创建共享缓存
-    pub(super) async fn acquire(&self, processes: &Processes, spec: EncodeSpec, id: &str) -> Result<Arc<ActiveCache>> {
+    pub(crate) async fn acquire(&self, processes: &Processes, spec: EncodeSpec, id: &str) -> Result<Arc<ActiveCache>> {
         let key = spec.config.key()?;
         loop {
             let mut entries = self.inner.entries.lock().await;
@@ -242,12 +242,12 @@ impl CacheManager {
     }
 
     /// 只查活动集合, 不能靠磁盘目录存在绕过会话租约访问缓存.
-    pub(super) async fn get(&self, key: &str) -> Result<Arc<ActiveCache>> {
+    pub(crate) async fn get(&self, key: &str) -> Result<Arc<ActiveCache>> {
         self.inner.entries.lock().await.get(key).cloned().context("playback cache is no longer active")
     }
 
     /// 更新等待目标但不重建缓存, 运行中的编码进程也不会因此热调线程.
-    pub(super) async fn target(&self, key: &str, id: &str, target: f64) -> Result<()> {
+    pub(crate) async fn target(&self, key: &str, id: &str, target: f64) -> Result<()> {
         let output = self.get(key).await?;
         ensure!(target.is_finite() && target >= 0.0 && target < output.spec.duration, "position must be within the video duration");
         let mut state = output.state.lock().await;
@@ -257,7 +257,7 @@ impl CacheManager {
     }
 
     /// 仅释放仍存在的租约, 重复 DELETE 或过期清理不能重复触发最后客户端停止.
-    pub(super) async fn release(&self, key: &str, id: &str) -> Result<()> {
+    pub(crate) async fn release(&self, key: &str, id: &str) -> Result<()> {
         let mut entries = self.inner.entries.lock().await;
         let Some(output) = entries.get(key).cloned() else { return Ok(()); };
         let mut state = output.state.lock().await;
@@ -279,7 +279,7 @@ impl CacheManager {
     }
 
     /// 只开放正式清单中的已发布资源, 私有工作目录和未验证尾部不能被读取.
-    pub(super) async fn media_path(&self, key: &str, id: &str, name: &str) -> Result<(PathBuf, Arc<ActiveCache>)> {
+    pub(crate) async fn media_path(&self, key: &str, id: &str, name: &str) -> Result<(PathBuf, Arc<ActiveCache>)> {
         ensure!(ffmpeg::media_filename(name), "playback asset not found");
         let output = self.get(key).await?;
         let mut state = output.state.lock().await;
@@ -560,7 +560,7 @@ impl CacheManager {
     }
 
     /// 按磁盘访问时间淘汰非活动缓存, 正在打开媒体文件的旧引用仍受保护.
-    pub(super) async fn maintain(&self) -> Result<()> {
+    pub(crate) async fn maintain(&self) -> Result<()> {
         if let Ok(mut workers) = self.inner.workers.try_lock() {
             while let Some(result) = workers.try_join_next() {
                 if let Err(error) = result { warn!("cache worker failed: {error}"); }

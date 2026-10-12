@@ -48,10 +48,10 @@ impl PlaybackVariantConfig {
 pub(crate) struct EncodeSpec {
     pub(crate) config: PlaybackVariantConfig,
     pub(super) source: PathBuf,
-    pub(super) duration: f64,
+    pub(crate) duration: f64,
     // 容器时间轴原点可能为负数, 视频, 音频和字幕都要按同一原点归零.
     pub(super) source_start: f64,
-    pub(super) info: MediaInfo,
+    pub(crate) info: MediaInfo,
     pub(super) subtitle: Option<Track>,
     pub(super) hdr: bool,
     pub(super) target: f64,

@@ -165,7 +165,7 @@ async fn target(
     let Json(input) = input.map_err(ApiError::bad)?;
 
     let status = state
-        .playback
+        .session_manager
         .status(&state.cache, &id)
         .await
         .map_err(ApiError::missing)?;
@@ -175,7 +175,7 @@ async fn target(
     }
 
     let status = state
-        .playback
+        .session_manager
         .target(&state.cache, &id, input.position)
         .await
         .map_err(ApiError::missing)?;
@@ -190,7 +190,7 @@ async fn status(
 ) -> Result<Json<video::SessionStatus>, ApiError> {
     Ok(Json(
         state
-            .playback
+            .session_manager
             .status(&state.cache, &id)
             .await
             .map_err(ApiError::missing)?,
@@ -203,7 +203,7 @@ async fn heartbeat(
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     state
-        .playback
+        .session_manager
         .heartbeat(&state.cache, &id)
         .await
         .map_err(ApiError::missing)?;
@@ -217,7 +217,7 @@ async fn release(
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     state
-        .playback
+        .session_manager
         .release(&state.cache, &id)
         .await
         .map_err(ApiError::internal)?;
@@ -233,7 +233,7 @@ async fn media(
 ) -> Result<Response, ApiError> {
     // 持有 lease 直到 ServeFile 完成文件打开, 避免资源目录被提前删除.
     let (path, mime) = state
-        .playback
+        .session_manager
         .media_path(&state.cache, &id, &asset)
         .await
         .map_err(ApiError::missing)?;

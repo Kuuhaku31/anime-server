@@ -12,13 +12,12 @@
 //! 活动缓存去重, 分片生成与校验, 停止续接和磁盘淘汰均由内部实现处理.
 
 mod assets;
-mod cache;
+pub(crate) mod cache;
 mod ffmpeg;
 mod fragment;
 mod metadata;
 mod process;
-mod sessions;
-mod models;
+pub(crate) mod models;
 
 use std::path::PathBuf;
 
@@ -56,7 +55,7 @@ pub(crate) use cache::CacheManager;
 /// complete 描述媒体完整性, generating 和 stopping 描述任务运行情况.
 /// ready 表示已有可播放分片, 不保证整个目标位置已经被缓存覆盖.
 /// 外部仅能读取校验目标位置所需的 duration, 其余字段通过序列化提供.
-pub(crate) use sessions::SessionStatus;
+pub(crate) use crate::sessions::SessionStatus;
 
 /// 不透明播放会话及活动缓存租约的统一入口.
 ///
@@ -67,7 +66,7 @@ pub(crate) use sessions::SessionStatus;
 /// `media_path(id, name)` 校验租约和已发布资源, 返回地址, MIME 和保护对象.
 /// `release(id)` 幂等释放租约, 不等待后台编码完成最后一个分片.
 /// `spawn_expiration()` 启动过期清理, `shutdown()` 清空会话并关闭缓存管理器.
-pub(crate) use sessions::SessionManager;
+pub(crate) use crate::sessions::SessionManager;
 
 /// 跨模块测试用随机名称生成器, 不作为生产业务接口提供.
 // #[cfg(test)]
@@ -93,7 +92,7 @@ pub(crate) async  fn new_session(
 
     let spec = models::EncodeSpec::new(&id, source, info, request, watch_pos).unwrap();
 
-    let session = state.playback.create(&state.processes, &state.cache, spec).await.unwrap();
+    let session = state.session_manager.create(&state.processes, &state.cache, spec).await.unwrap();
 
     Ok(session)
 }

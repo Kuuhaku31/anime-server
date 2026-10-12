@@ -17,6 +17,7 @@ mod utils;
 mod constants;
 mod models;
 mod scanner;
+mod sessions;
 
 use config::AppConfig;
 use video::{CacheManager, SessionManager, Processes};
@@ -34,7 +35,7 @@ struct AppState {
     scan_lock: Arc<tokio::sync::Mutex<()>>, // 扫描锁, 防止同时进行多个扫描任务
 
     processes: Processes, // 共享的 FFmpeg 进程池
-    playback: SessionManager, // 播放会话管理
+    session_manager: SessionManager, // 播放会话管理
     cache: CacheManager, // 缓存管理
 }
 
@@ -79,7 +80,7 @@ async fn main() -> Result<()> {
     let state = AppState {
         db: db::initialize_database().await?,
         config: Arc::new(config),
-        playback: playback.clone(),
+        session_manager: playback.clone(),
         scan_lock: Arc::new(tokio::sync::Mutex::new(())),
         processes,
         cache,
@@ -98,7 +99,7 @@ async fn main() -> Result<()> {
             sleep(Duration::from_secs(s.config.scan_interval_seconds)).await;
         }
     });
-    state.playback.spawn_expiration(&state.cache); // 启动一个后台异步任务, 定期回收失去联系的播放会话并维护磁盘缓存
+    state.session_manager.spawn_expiration(&state.cache); // 启动一个后台异步任务, 定期回收失去联系的播放会话并维护磁盘缓存
     info!("background tasks started: video scan and playback session expiration");
 
     // API 和前端静态文件由同一端口提供, 浏览器通过同源相对 URL 访问服务.
