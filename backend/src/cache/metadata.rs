@@ -1,20 +1,64 @@
 //! 探测并缓存媒体轨道元数据.
 
-use std::{collections::HashMap, path::Path};
+use std::{collections::HashMap, path::Path, time::{Duration, SystemTime}};
 
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use serde::Deserialize;
 use tokio::process::Command;
 
 use crate::models::{Attachment, MediaInfo, Track};
-use super::process::Processes;
+use crate::video::Processes;
+use crate::{db, utils};
+use super::CacheManager;
 
 
+// MetadataEntry
+pub(super) struct MetadataEntry {
+    info: MediaInfo,
+    last_access: SystemTime,
+}
 
 
+impl CacheManager {
+
+    // retry 绕过成功缓存, 失败结果不写入 Map.
+    pub(crate) async fn media_info(&self, id: &str, retry: bool) -> Result<MediaInfo> {
+        ensure!(utils::check_md5_ok(id), "invalid source file ID");
+        let now = SystemTime::now();
+        {
+            let mut entries = self.inner.metadata.lock().await;
+            prune_metadata(&mut entries, now);
+            if !retry {
+                if let Some(entry) = entries.get_mut(id) {
+                    entry.last_access = now;
+                    return Ok(entry.info.clone());
+                }
+            }
+        }
+
+        let path = db::get_a_video_path_by_id(&self.inner.database, id).await?
+            .context("video file not found")?;
+        let info = probe(&path, &self.inner.processes).await?;
+        let mut entries = self.inner.metadata.lock().await;
+        entries.insert(id.to_string(), MetadataEntry { info: info.clone(), last_access: now });
+        prune_metadata(&mut entries, SystemTime::now());
+        Ok(info)
+    }
+}
+
+
+fn prune_metadata(entries: &mut HashMap<String, MetadataEntry>, now: SystemTime) {
+    entries.retain(|_, entry| now.duration_since(entry.last_access).unwrap_or_default() < Duration::from_secs(3600));
+    while entries.len() > 1000 {
+        let Some(oldest) = entries.iter().min_by_key(|(_, entry)| entry.last_access).map(|(key, _)| key.clone()) else {
+            break;
+        };
+        entries.remove(&oldest);
+    }
+}
 
 /// 解析媒体文件并归一化 ffprobe 结果.
-pub(super) async fn probe(path: &Path, processes: &Processes) -> Result<MediaInfo> {
+async fn probe(path: &Path, processes: &Processes) -> Result<MediaInfo> {
 
         #[derive(Deserialize)]
         struct Probe {
@@ -102,4 +146,42 @@ pub(super) async fn probe(path: &Path, processes: &Processes) -> Result<MediaInf
         }
         anyhow::ensure!(!info.video_tracks.is_empty(), "media has no playable video stream");
         Ok(info)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn media_info() -> MediaInfo {
+        MediaInfo {
+            duration: 1.0,
+            start_time: 0.0,
+            video_tracks: Vec::new(),
+            audio_tracks: Vec::new(),
+            subtitle_tracks: Vec::new(),
+            attachments: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn metadata_pruning_expires_old_entries_and_caps_capacity() {
+        let now = SystemTime::now();
+        let mut entries = HashMap::new();
+        entries.insert("expired".to_string(), MetadataEntry {
+            info: media_info(),
+            last_access: now - Duration::from_secs(3601),
+        });
+        for index in 0..1001 {
+            entries.insert(format!("item-{index}"), MetadataEntry {
+                info: media_info(),
+                last_access: now - Duration::from_secs(index),
+            });
+        }
+
+        prune_metadata(&mut entries, now);
+
+        assert_eq!(entries.len(), 1000);
+        assert!(!entries.contains_key("expired"));
+        assert!(!entries.contains_key("item-1000"));
+    }
 }

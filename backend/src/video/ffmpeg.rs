@@ -20,7 +20,7 @@ use super::{
 
 
 /// 只向私有工作目录生成 HLS, 正式缓存由 CacheManager 校验后原子追加.
-pub(super) fn command(spec: &EncodeSpec, directory: &Path, assets: Option<&RenderAssets>,
+pub(crate) fn command(spec: &EncodeSpec, directory: &Path, assets: Option<&RenderAssets>,
     resume: Tail, threads: usize) -> Result<Command> {
     let mut command = Command::new("ffmpeg");
     command.current_dir(directory).kill_on_drop(true)
@@ -89,7 +89,7 @@ fn video_timing(spec: &EncodeSpec, resume: Tail) -> String {
         (spec.source_start * 90_000.0).round() as i64, resume.video, resume.video)
 }
 
-pub(super) async fn has_video_after(spec: &EncodeSpec, resume: Tail, processes: &Processes,
+pub(crate) async fn has_video_after(spec: &EncodeSpec, resume: Tail, processes: &Processes,
     cancel: &mut watch::Receiver<bool>) -> Result<bool> {
     let _permit = tokio::select! {
         biased;
@@ -110,14 +110,14 @@ pub(super) async fn has_video_after(spec: &EncodeSpec, resume: Tail, processes: 
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct Playlist {
-    pub(super) segments: Vec<String>,
+pub(crate) struct Playlist {
+    pub(crate) segments: Vec<String>,
     durations: Vec<f64>,
     duration: f64,
-    pub(super) complete: bool,
+    pub(crate) complete: bool,
 }
 
-pub(super) async fn read_playlist(directory: &Path) -> Result<Option<Playlist>> {
+pub(crate) async fn read_playlist(directory: &Path) -> Result<Option<Playlist>> {
     let path = directory.join("index.m3u8");
     let content = match regular_bytes(&path, 16 * 1024 * 1024).await {
         Ok(content) => content,
@@ -160,9 +160,9 @@ fn parse_playlist(content: &str) -> Result<Playlist> {
     Ok(playlist)
 }
 
-pub(super) fn segment_name(index: usize) -> String { format!("segment_{index:06}.m4s") }
+pub(crate) fn segment_name(index: usize) -> String { format!("segment_{index:06}.m4s") }
 
-pub(super) fn media_filename(name: &str) -> bool {
+pub(crate) fn media_filename(name: &str) -> bool {
     name == "index.m3u8" || name == "init.mp4"
         || name.strip_prefix("segment_").and_then(|name| name.strip_suffix(".m4s"))
             .is_some_and(|number| number.len() == 6 && number.bytes().all(|byte| byte.is_ascii_digit()))
@@ -170,16 +170,16 @@ pub(super) fn media_filename(name: &str) -> bool {
 
 /// 只保存已验证的连续前缀, 缓存末端来自样本时间轴, 而不是源视频的估算时长.
 #[derive(Clone, Default)]
-pub(super) struct CachedMedia {
-    pub(super) init: Option<Init>,
-    pub(super) segments: Vec<Fragment>,
-    pub(super) complete: bool,
+pub(crate) struct CachedMedia {
+    pub(crate) init: Option<Init>,
+    pub(crate) segments: Vec<Fragment>,
+    pub(crate) complete: bool,
 }
 
 impl CachedMedia {
-    pub(super) fn tail(&self) -> Tail { self.segments.last().map(|segment| segment.end).unwrap_or_default() }
+    pub(crate) fn tail(&self) -> Tail { self.segments.last().map(|segment| segment.end).unwrap_or_default() }
 
-    pub(super) fn playlist(&self) -> Result<String> {
+    pub(crate) fn playlist(&self) -> Result<String> {
         let mut text = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:5\n#EXT-X-MEDIA-SEQUENCE:0\n\
             #EXT-X-PLAYLIST-TYPE:EVENT\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-MAP:URI=\"init.mp4\"\n".to_string();
         for (index, segment) in self.segments.iter().enumerate() {
@@ -192,7 +192,7 @@ impl CachedMedia {
     }
 }
 
-pub(super) async fn regular_bytes(path: &Path, limit: u64) -> Result<Vec<u8>> {
+pub(crate) async fn regular_bytes(path: &Path, limit: u64) -> Result<Vec<u8>> {
     let metadata = tokio::fs::symlink_metadata(path).await?;
     ensure!(metadata.is_file() && metadata.len() > 0 && metadata.len() <= limit,
         "unsafe, empty or oversized HLS file: {}", path.display());
@@ -211,7 +211,7 @@ pub(super) async fn remove_file(path: &Path) -> Result<()> {
     }
 }
 
-pub(super) async fn atomic_file(directory: &Path, name: &str, content: &[u8]) -> Result<()> {
+pub(crate) async fn atomic_file(directory: &Path, name: &str, content: &[u8]) -> Result<()> {
     // 文件数据和目录项按顺序落盘, 重启只会看到旧版本或完整的新版本.
     let temporary = directory.join(format!("{name}.tmp"));
     let mut file = tokio::fs::File::create(&temporary).await?;
@@ -222,13 +222,13 @@ pub(super) async fn atomic_file(directory: &Path, name: &str, content: &[u8]) ->
     sync_directory(directory).await
 }
 
-pub(super) async fn sync_directory(directory: &Path) -> Result<()> {
+pub(crate) async fn sync_directory(directory: &Path) -> Result<()> {
     let directory = directory.to_owned();
     tokio::task::spawn_blocking(move || std::fs::File::open(directory)?.sync_all()).await??;
     Ok(())
 }
 
-pub(super) async fn write_playlist(directory: &Path, media: &CachedMedia) -> Result<()> {
+pub(crate) async fn write_playlist(directory: &Path, media: &CachedMedia) -> Result<()> {
     if !media.segments.is_empty() {
         atomic_file(directory, "index.m3u8", media.playlist()?.as_bytes()).await?;
     }
@@ -236,7 +236,7 @@ pub(super) async fn write_playlist(directory: &Path, media: &CachedMedia) -> Res
 }
 
 /// 首片额外探测编码参数, 每片都与指定 init 拼接后真实解码全部音视频样本.
-pub(super) async fn validate_segment(directory: &Path, init: &str, segment: &str, audio: bool,
+pub(crate) async fn validate_segment(directory: &Path, init: &str, segment: &str, audio: bool,
     probe: bool, processes: &Processes, cancel: &mut watch::Receiver<bool>) -> Result<()> {
     let _permit = tokio::select! {
         biased;
@@ -278,7 +278,7 @@ pub(super) async fn validate_segment(directory: &Path, init: &str, segment: &str
 }
 
 /// 从 0 恢复最长有效前缀, 修复清单并删除损坏尾部, 不在恢复期间启动续接编码.
-pub(super) async fn recover(directory: &Path, processes: &Processes, cancel: &mut watch::Receiver<bool>) -> Result<CachedMedia> {
+pub(crate) async fn recover(directory: &Path, processes: &Processes, cancel: &mut watch::Receiver<bool>) -> Result<CachedMedia> {
     // 读取磁盘的 I/O 错误直接上报, 不能因权限等问题把已有缓存当作空目录清理.
     let original = match read_playlist(directory).await {
         Ok(playlist) => playlist,

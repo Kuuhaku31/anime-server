@@ -19,26 +19,26 @@ struct Track {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct Init {
+pub(crate) struct Init {
     tracks: Vec<Track>,
 }
 
 /// 视频使用 90 kHz 刻度, 音频使用 48 kHz 刻度, 两条轨道分别累计以避免浮点漂移.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(super) struct Tail {
-    pub(super) video: u64,
+pub(crate) struct Tail {
+    pub(crate) video: u64,
     pub(super) audio: u64,
 }
 
 impl Tail {
-    pub(super) fn seconds(self) -> f64 { self.video as f64 / VIDEO_TIMESCALE as f64 }
+    pub(crate) fn seconds(self) -> f64 { self.video as f64 / VIDEO_TIMESCALE as f64 }
 
     fn get(self, video: bool) -> u64 { if video { self.video } else { self.audio } }
 }
 
 /// 各轨道的半开时间区间, end 必须等于下一分片对应轨道的 start.
 #[derive(Clone, Debug)]
-pub(super) struct Fragment {
+pub(crate) struct Fragment {
     pub(super) start: Tail,
     pub(super) end: Tail,
     pub(super) sequence: u32,
@@ -164,7 +164,7 @@ fn sample_description(data: &[u8], stsd: &Mp4Box, video: bool) -> Result<Vec<u8>
 
 impl Init {
     /// 只接受固定输出轨道和时基, 拒绝会重新映射时间轴的 edit list.
-    pub(super) fn parse(data: &[u8]) -> Result<Self> {
+    pub(crate) fn parse(data: &[u8]) -> Result<Self> {
         let root = boxes(data, 0..data.len())?;
         required(&root, b"ftyp")?;
         let movie = children(data, required(&root, b"moov")?)?;
@@ -207,9 +207,9 @@ impl Init {
         Ok(Self { tracks })
     }
 
-    pub(super) fn audio(&self) -> bool { self.tracks.len() == 2 }
+    pub(crate) fn audio(&self) -> bool { self.tracks.len() == 2 }
 
-    pub(super) fn compatible(&self, other: &Self) -> Result<()> {
+    pub(crate) fn compatible(&self, other: &Self) -> Result<()> {
         ensure!(self == other, "resumed init is incompatible with the existing cached init");
         Ok(())
     }
@@ -307,7 +307,7 @@ pub(super) fn inspect(data: &[u8], init: &Init, expected: Tail, sequence: u32) -
 }
 
 /// offset 固定为本次任务的续接点, expected 随正式分片发布前进, 两者不能混用.
-pub(super) fn normalize(data: &[u8], init: &Init, offset: Tail, expected: Tail, sequence: u32) -> Result<(Vec<u8>, Fragment)> {
+pub(crate) fn normalize(data: &[u8], init: &Init, offset: Tail, expected: Tail, sequence: u32) -> Result<(Vec<u8>, Fragment)> {
     let mut normalized = Vec::with_capacity(data.len());
     // HLS 不依赖 sidx. 移除索引后, 样本仍通过 moof 相对偏移访问, 无需改写媒体负载.
     for item in boxes(data, 0..data.len())? {

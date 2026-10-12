@@ -58,10 +58,15 @@ anime-server/
 |   |   |-- db.rs            # db/ 子模块
 |   |   |-- tasks.rs         # tasks/ 子模块
 |   |   |-- video.rs         # video/ 子模块
+|   |   |-- cache.rs         # 元数据和活动播放缓存管理入口
+|   |   |-- sessions.rs      # 播放会话与共享缓存租约
 |   |   |-- api/
 |   |   |-- db/
 |   |   |-- tasks/
-|   |   `-- video/           # 探测, 烧录, 共享缓存及会话租约
+|   |   |-- cache/
+|   |   |   |-- metadata.rs  # 媒体探测, 成功结果缓存及过期策略
+|   |   |   `-- disk.rs      # 磁盘占用统计及 LRU 访问时间持久化
+|   |   `-- video/           # 编码, 临时字幕字体, 分片校验及进程预算
 |   |-- sql/init.sql
 |   `-- tests/
 |-- frontend/

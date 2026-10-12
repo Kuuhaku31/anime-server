@@ -8,9 +8,9 @@ use tokio::{sync::Mutex, time::interval};
 use tracing::warn;
 
 use crate::models::{MediaInfo, PlaybackRequest, PlaybackStart, PlaybackVariantConfig};
-use crate::video::CachePin;
+use crate::cache::{CacheManager, CachePin};
 
-use crate::video::{playback_target, CacheManager};
+use crate::video::playback_target;
 
 /// 对外只暴露不透明会话和状态快照, 不返回播放配置或 variant-key.
 #[derive(Debug, Clone, Serialize)]
@@ -104,12 +104,13 @@ impl SessionManager {
     pub(crate) async fn status(&self, id: &str) -> Result<SessionStatus> {
         let (key, target) = self.get_session(id).await?;
         let status = self.cache.status(&key).await?;
+        let duration = self.cache.duration(&key).await?;
         Ok(SessionStatus {
-            session_id: id.to_string(), url: format!("/playback/{id}/index.m3u8?revision={}", status.revision),
-            mime_type: "application/vnd.apple.mpegurl", start_time: 0.0, duration: status.duration,
-            position: target, complete: status.complete, generating: status.generating,
-            stopping: status.stopping, ready: status.ready, buffered_until: status.buffered_until,
-            encoding_threads: status.encoding_threads, error: status.error,
+            session_id: id.to_string(), url: format!("/playback/{id}/index.m3u8?revision={}", status.revision()),
+            mime_type: "application/vnd.apple.mpegurl", start_time: 0.0, duration,
+            position: target, complete: status.complete(), generating: status.generating(),
+            stopping: status.stopping(), ready: status.ready(), buffered_until: status.buffered_until(),
+            encoding_threads: status.encoding_threads(), error: status.error().map(str::to_owned),
         })
     }
 

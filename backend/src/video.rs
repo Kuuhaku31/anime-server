@@ -1,19 +1,17 @@
-//! 统一提供媒体探测, 播放会话和缓存管理接口.
+//! 统一提供媒体执行, 分片校验和播放会话接口.
 //!
 //! 外部模块只从 `crate::video` 导入下列接口, 不依赖子模块路径.
 //! 本文件通过重导出保留必要类型, 隐藏具体实现子模块.
-//! 数据库偏好与观看进度仍由 API 层负责, 缓存和媒体路径解析由管理器负责.
+//! 数据库偏好与观看进度仍由 API 层负责, 探测缓存和媒体路径解析由 crate::cache 负责.
 //!
 //! 播放调用链:
 //! `SessionManager::create -> PlaybackVariantConfig::new -> CacheManager`.
 //! 客户端后续通过会话查询状态, 更新目标, 读取媒体或释放租约.
-//! 活动缓存去重, 分片生成与校验, 停止续接和磁盘淘汰均由内部实现处理.
+//! crate::cache 管理活动缓存去重, 停止续接和磁盘淘汰, 本模块提供媒体生成与校验能力.
 
 mod assets;
-mod cache;
 mod ffmpeg;
 mod fragment;
-mod metadata;
 mod process;
 mod models;
 
@@ -31,13 +29,13 @@ pub(crate) use process::Processes;
 pub(crate) use process::checked_output;
 
 
-/// 活动缓存及磁盘播放缓存的管理器.
-///
-/// `new(root, config, database, processes)` 检查现有缓存根目录并取得独占锁,
-/// 初始化临时资源目录及执行磁盘容量维护.
-/// `shutdown()` 拒绝新租约, 请求生成任务边界停止并等待所有写入者退出.
-/// 获取缓存, 分片发布和淘汰接口只供模块内部的会话及生成任务使用.
-pub(crate) use cache::{CacheManager, CachePin};
+// 缓存模块通过这些媒体接口处理生成和校验, 不依赖私有子模块路径.
+pub(crate) use assets::{clean_startup, RenderAssets};
+pub(crate) use models::EncodeSpec;
+pub(crate) use ffmpeg::{CachedMedia, command, has_video_after, recover, read_playlist, media_filename,
+    regular_bytes, atomic_file, segment_name, sync_directory, write_playlist, validate_segment};
+pub(crate) use fragment::{Init, Tail, normalize};
+pub(crate) use process::{cancelled, check_cancel, read_tail, Cancelled};
 
 /// 不可变的播放变体身份配置, 由媒体信息和客户端轨道请求构造.
 pub(crate) use models::playback_target;

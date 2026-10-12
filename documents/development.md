@@ -11,7 +11,7 @@
 | 部署     | 单个 Docker 容器, Docker Compose       |
 
 根目录 `Cargo.toml` 定义 workspace, `backend/Cargo.toml` 定义后端 crate.
-后端入口是 `backend/src/main.rs`. `api.rs`, `db.rs`, `tasks.rs`, `video.rs`
+后端入口是 `backend/src/main.rs`. `api.rs`, `db.rs`, `tasks.rs`, `video.rs`, `cache.rs`
 声明各自同名目录下的子模块, 不使用 `mod.rs`.
 数据库初始化文件是 `backend/sql/init.sql`.
 
@@ -19,10 +19,18 @@ Rust 类型, 字段, 函数和模块默认私有. 仅供 `video` 内部共享的
 `pub(super)`, 必须跨模块使用的接口最高为 `pub(crate)`, 不使用无限制的 `pub`.
 Serde 序列化和反序列化不依赖字段公开, 不为接口响应字段额外扩大可见性.
 
-`video.rs` 是播放模块的统一接口入口, 通过重导出提供媒体探测, 执行参数,
-会话响应及管理器. 外部代码只使用 `crate::video::{...}`, 不导入其私有子模块.
+`video.rs` 是媒体执行模块的统一接口入口, 通过重导出提供执行参数,
+分片生成与校验, 进程预算, 会话响应及管理器. 外部代码只使用 `crate::video::{...}`, 不导入其私有子模块.
 类型和方法实现保留在子模块中, `video.rs` 的注释集中说明调用链及接口职责.
 随机名称和媒体样本辅助接口仅在测试构建中重导出.
+
+`cache.rs` 是 crate 层的缓存入口, 提供 CacheManager, FolderState 只读快照和 CachePin.
+活动缓存共享, 生成生命周期和淘汰编排由入口管理. 私有 `cache/metadata.rs`
+负责 ffprobe 探测, 成功元数据缓存及过期清理; 私有 `cache/disk.rs`
+负责磁盘占用统计和目录访问时间持久化. CacheManager 通过 `crate::video`
+调用媒体执行能力, 不暴露或依赖 video 私有子模块路径.
+`sessions.rs` 保留在 crate 层, 直接使用 `crate::cache` 管理共享缓存租约.
+video 下的编码, 资源, 分片, 进程和执行参数文件保持原位.
 
 播放请求 `PlaybackRequest` 和创建响应 `PlaybackStart` 定义在 `models.rs`,
 由 `video.rs` 保留重导出入口. 请求选轨的缺省/null 区分及响应 flatten 结构不变.
@@ -308,6 +316,8 @@ v2 固定无 B 帧, 视频时间基 90000, 音频时间基 48000, AAC 预热处�
 SessionManager 保存会话到 variant-key 的关联, 各会话目标及保活时间, 并将同一变体的最大目标
 汇总到缓存文件夹. 最后一个会话离开后, 缓存生成停止; worker 收尾且媒体文件打开保护引用释放后,
 维护任务才从活动 Map 移除该文件夹.
+查询播放状态时, CacheManager 返回字段私有的 FolderState 克隆快照, SessionManager 通过只读 getter
+读取状态并构造 SessionStatus. 媒体时长由 CacheManager 独立读取, 不重复保存在 FolderState 中.
 状态和媒体请求必须通过 session 及活动集合, 不支持按客户端提供的缓存键访问磁盘.
 
 最后一个租约离开时, 排队和准备任务立即取消; 编码任务记录当前已提交数量,

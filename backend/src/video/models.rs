@@ -8,15 +8,15 @@ use std::path::PathBuf;
 /// 单次任务的执行参数, 只有 config 参与缓存身份计算, 其余字段用于媒体处理和调度.
 #[derive(Clone)]
 pub(crate) struct EncodeSpec {
-    pub(super) config: PlaybackVariantConfig,
+    pub(crate) config: PlaybackVariantConfig,
     pub(super) source: PathBuf,
-    pub(super) duration: f64,
+    pub(crate) duration: f64,
     // 容器时间轴原点可能为负数, 视频, 音频和字幕都要按同一原点归零.
     pub(super) source_start: f64,
     pub(super) info: MediaInfo,
-    pub(super) subtitle: Option<Track>,
+    pub(crate) subtitle: Option<Track>,
     pub(super) hdr: bool,
-    pub(super) target: f64,
+    pub(crate) target: f64,
 }
 
 fn select(tracks: &[Track], index: Option<i32>, kind: &str) -> Result<Option<Track>> {
@@ -25,7 +25,7 @@ fn select(tracks: &[Track], index: Option<i32>, kind: &str) -> Result<Option<Tra
 }
 
 impl EncodeSpec {
-    pub(super) fn from_config(config: PlaybackVariantConfig, source: PathBuf, info: MediaInfo, target: f64) -> Result<Self> {
+    pub(crate) fn from_config(config: PlaybackVariantConfig, source: PathBuf, info: MediaInfo, target: f64) -> Result<Self> {
         let video = info.video_tracks.iter().find(|track| track.stream_index == config.video_stream())
             .context("configured video track does not exist")?;
         select(&info.audio_tracks, config.audio_stream(), "audio")?;

@@ -8,14 +8,14 @@ use tokio::{process::Command, sync::watch};
 use super::{models::EncodeSpec, process::checked_output_cancellable};
 
 /// 资源只属于本次字幕渲染任务, 不进入持久播放配置或缓存身份.
-pub(super) struct RenderAssets {
+pub(crate) struct RenderAssets {
     id: String,
     subtitle: PathBuf,
     fonts: PathBuf,
 }
 
 impl RenderAssets {
-    pub(super) async fn allocate(root: &Path) -> Result<Self> {
+    pub(crate) async fn allocate(root: &Path) -> Result<Self> {
         let id = crate::utils::random_id()?;
         let subtitle = root.join("subtitles").join(format!("{id}.ass"));
         let fonts = root.join("fonts").join(&id);
@@ -32,7 +32,7 @@ impl RenderAssets {
         format!("subtitles=filename='../../../subtitles/{}.ass':fontsdir='../../../fonts/{}'", self.id, self.id)
     }
 
-    pub(super) async fn prepare(&self, spec: &EncodeSpec, seconds: u64, cancel: &mut watch::Receiver<bool>) -> Result<()> {
+    pub(crate) async fn prepare(&self, spec: &EncodeSpec, seconds: u64, cancel: &mut watch::Receiver<bool>) -> Result<()> {
         let track = spec.subtitle.as_ref().context("text subtitle is missing")?;
         let started = Instant::now();
         // 保留原始字幕时间抽取为 ASS, 续接后仍能烧录在边界之前已开始的字幕.
@@ -67,7 +67,7 @@ impl RenderAssets {
         Ok(())
     }
 
-    pub(super) async fn cleanup(self) -> Result<()> {
+    pub(crate) async fn cleanup(self) -> Result<()> {
         let (subtitle, fonts) = tokio::join!(
             tokio::fs::remove_file(self.subtitle),
             tokio::fs::remove_dir_all(self.fonts),
@@ -80,7 +80,7 @@ impl RenderAssets {
 }
 
 /// 只清理符合本程序随机命名规则的遗留资源, 不处理目录中的其他文件.
-pub(super) async fn clean_startup(root: &Path) -> Result<()> {
+pub(crate) async fn clean_startup(root: &Path) -> Result<()> {
     for directory in ["subtitles", "fonts"] {
         let mut entries = tokio::fs::read_dir(root.join(directory)).await?;
         while let Some(entry) = entries.next_entry().await? {

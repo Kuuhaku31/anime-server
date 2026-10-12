@@ -13,6 +13,7 @@ mod api;
 mod config;
 mod db;
 mod video;
+mod cache;
 mod utils;
 mod constants;
 mod models;
@@ -20,7 +21,8 @@ mod scanner;
 mod sessions;
 
 use config::AppConfig;
-use video::{CacheManager, SessionManager, Processes};
+use cache::CacheManager;
+use video::{SessionManager, Processes};
 
 use tokio::time::{sleep, Duration};
 use tracing::{info, warn};

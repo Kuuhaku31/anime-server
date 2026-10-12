@@ -13,7 +13,7 @@ use tracing::info;
 
 // 正常停止有独立错误类型, 不能顺带吞掉同一时刻发生的磁盘或清理错误.
 #[derive(Debug)]
-pub(super) struct Cancelled;
+pub(crate) struct Cancelled;
 
 impl std::fmt::Display for Cancelled {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -23,7 +23,7 @@ impl std::fmt::Display for Cancelled {
 
 impl std::error::Error for Cancelled {}
 
-pub(super) fn check_cancel(cancel: &watch::Receiver<bool>) -> Result<()> {
+pub(crate) fn check_cancel(cancel: &watch::Receiver<bool>) -> Result<()> {
     if *cancel.borrow() { return Err(Cancelled.into()); }
     Ok(())
 }
@@ -34,8 +34,8 @@ pub(super) fn check_cancel(cancel: &watch::Receiver<bool>) -> Result<()> {
 /// 它不是操作系统进程列表, 也不直接管理所有子进程句柄.
 #[derive(Clone)]
 pub(crate) struct Processes {
-    pub(super) slots: Arc<Semaphore>, // 媒体子进程总数
-    pub(super) encoders: Arc<Semaphore>, // 并行编码任务数, 不能用线程许可替代进程名额
+    pub(crate) slots: Arc<Semaphore>, // 媒体子进程总数
+    pub(crate) encoders: Arc<Semaphore>, // 并行编码任务数, 不能用线程许可替代进程名额
     threads: Arc<Semaphore>, // 编码线程预算, 不能用进程名额替代线程许可
 }
 
@@ -49,7 +49,7 @@ impl Processes {
         }
     }
 
-    pub(super) async fn encoding_threads(&self, base: usize, desired: usize,
+    pub(crate) async fn encoding_threads(&self, base: usize, desired: usize,
         cancel: &mut watch::Receiver<bool>) -> Result<OwnedSemaphorePermit> {
         anyhow::ensure!(base > 0 && desired >= base && desired <= 32, "invalid encoder thread request");
         // 一次取得基础预算, 再非阻塞补充许可, 不持有不足以启动的部分基础预算.
@@ -63,7 +63,7 @@ impl Processes {
     }
 
     /// 只拿当前空闲的额外预算, 不为追求最大线程数阻塞或抢占其他编码任务.
-    pub(super) fn extend_encoding_threads(&self, permit: &mut OwnedSemaphorePermit, desired: usize) -> Result<()> {
+    pub(crate) fn extend_encoding_threads(&self, permit: &mut OwnedSemaphorePermit, desired: usize) -> Result<()> {
         anyhow::ensure!(desired >= permit.num_permits() && desired <= 32, "invalid encoder thread target");
         for _ in permit.num_permits()..desired {
             match self.threads.clone().try_acquire_owned() {
@@ -75,7 +75,7 @@ impl Processes {
         Ok(())
     }
 
-    pub(super) async fn output(&self, command: &mut Command, seconds: u64) -> Result<Vec<u8>> {
+    pub(crate) async fn output(&self, command: &mut Command, seconds: u64) -> Result<Vec<u8>> {
         let _permit = timeout(Duration::from_secs(seconds), self.slots.acquire())
             .await
             .context("timed out waiting for a media process slot")??;
@@ -139,14 +139,14 @@ pub(super) async fn checked_output_cancellable(
 }
 
 /// 发送端消失也视为取消, 避免所有者退出后子任务永久等待.
-pub(super) async fn cancelled(receiver: &mut watch::Receiver<bool>) {
+pub(crate) async fn cancelled(receiver: &mut watch::Receiver<bool>) {
     while !*receiver.borrow_and_update() {
         if receiver.changed().await.is_err() { break; }
     }
 }
 
 /// 持续排空 stderr 但只保留末尾诊断, 防止长时间转码累积无界日志内存.
-pub(super) async fn read_tail(mut reader: impl AsyncRead + Unpin) -> Result<String> {
+pub(crate) async fn read_tail(mut reader: impl AsyncRead + Unpin) -> Result<String> {
     let mut tail = Vec::new();
     let mut buffer = [0_u8; 2048];
     loop {
