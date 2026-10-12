@@ -380,23 +380,30 @@ pub(crate) fn fixture() -> (MediaInfo, PlaybackRequest) {
 
 #[cfg(test)]
 mod tests {
-    use crate::video::{cache::ENCODER_PROFILE, models::EncodeSpec};
+    use crate::video::{cache::ENCODER_PROFILE, models::{playback_target, EncodeSpec, PlaybackVariantConfig}};
 
 use super::*;
+
+    fn make_spec(id: &str, source: &str, info: MediaInfo, request: PlaybackRequest, saved: Option<f64>) -> anyhow::Result<EncodeSpec> {
+        let request = request.with_saved_position(saved);
+        let config = PlaybackVariantConfig::new(id, &info, &request)?;
+        let target = playback_target(&info, &request)?;
+        EncodeSpec::from_config(config, source.into(), info, target)
+    }
 
     #[test]
     fn defaults_explicit_off_and_saved_positions_are_distinct() {
         // file ID 默认请求使用服务端进度和默认轨道, null 仍可关闭音轨.
         let (info, request) = fixture();
-        let spec = EncodeSpec::new(&"a".repeat(32), "video".into(), info.clone(), request, Some(7.375)).unwrap();
+        let spec = make_spec(&"a".repeat(32), "video", info.clone(), request, Some(7.375)).unwrap();
         assert_eq!(spec.target, 7.375);
         assert_eq!(spec.config.audio_stream, Some(1));
         let request = serde_json::from_str(r#"{"audio_stream_index":null,"subtitle_stream_index":2,"position":8.5}"#).unwrap();
-        let changed = EncodeSpec::new(&"a".repeat(32), "video".into(), info.clone(), request, Some(3.0)).unwrap();
+        let changed = make_spec(&"a".repeat(32), "video", info.clone(), request, Some(3.0)).unwrap();
         assert_eq!(changed.target, 8.5);
         assert_eq!(changed.config.audio_stream, None);
         assert_eq!(changed.config.subtitle_stream, Some(2));
-        assert_eq!(EncodeSpec::new(&"a".repeat(32), "video".into(), info, PlaybackRequest::default(), Some(19.0)).unwrap().target, 0.0);
+        assert_eq!(make_spec(&"a".repeat(32), "video", info, PlaybackRequest::default(), Some(19.0)).unwrap().target, 0.0);
     }
 
     #[test]
@@ -408,7 +415,7 @@ use super::*;
 
         let (info, _) = fixture();
         let chosen = PlaybackRequest::default().with_preferences(Some(1), Some(2));
-        let spec = EncodeSpec::new(&"a".repeat(32), "video".into(), info.clone(), chosen, None).unwrap();
+        let spec = make_spec(&"a".repeat(32), "video", info.clone(), chosen, None).unwrap();
         assert_eq!(spec.config.audio_stream, Some(1));
         assert_eq!(spec.config.subtitle_stream, Some(2));
 
@@ -416,7 +423,7 @@ use super::*;
         let resolved = explicit.with_preferences(Some(4), Some(2));
         assert_eq!(resolved.audio_stream_index, Some(None));
         assert_eq!(resolved.subtitle_stream_index, Some(Some(2)));
-        let spec = EncodeSpec::new(&"a".repeat(32), "video".into(), info, resolved, None).unwrap();
+        let spec = make_spec(&"a".repeat(32), "video", info, resolved, None).unwrap();
         assert_eq!(spec.config.audio_stream, None);
         assert_eq!(spec.config.subtitle_stream, Some(2));
     }
@@ -426,7 +433,7 @@ use super::*;
         for position in [-1.0, f64::NAN, f64::INFINITY, 20.0] {
             let (info, mut request) = fixture();
             request.position = Some(position);
-            assert!(EncodeSpec::new(&"a".repeat(32), "video".into(), info, request, None).is_err());
+            assert!(make_spec(&"a".repeat(32), "video", info, request, None).is_err());
         }
         for value in [
             serde_json::json!({"video_stream_index":0}), serde_json::json!({"encoder_profile":ENCODER_PROFILE}),
@@ -437,15 +444,15 @@ use super::*;
         for field in ["audio_stream_index", "subtitle_stream_index"] {
             let (info, _) = fixture();
             let request = serde_json::from_value(serde_json::json!({field:99})).unwrap();
-            assert!(EncodeSpec::new(&"a".repeat(32), "video".into(), info, request, None).is_err());
+            assert!(make_spec(&"a".repeat(32), "video", info, request, None).is_err());
         }
     }
 
     #[test]
     fn positions_threads_and_paths_do_not_enter_the_configuration() {
         let (info, request) = fixture();
-        let spec = EncodeSpec::new(&"a".repeat(32), "video.mp4".into(), info.clone(), request, Some(7.375)).unwrap();
-        let zero = EncodeSpec::new(&"a".repeat(32), "other.mp4".into(), info, PlaybackRequest::default(), None).unwrap();
+        let spec = make_spec(&"a".repeat(32), "video.mp4", info.clone(), request, Some(7.375)).unwrap();
+        let zero = make_spec(&"a".repeat(32), "other.mp4", info, PlaybackRequest::default(), None).unwrap();
         assert_eq!(spec.config, zero.config);
         let command = command(&spec, Path::new("/tmp"), None, Tail::default(), 8).unwrap();
         let args: Vec<_> = command.as_std().get_args().map(|arg| arg.to_str().unwrap()).collect();

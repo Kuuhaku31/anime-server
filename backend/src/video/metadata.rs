@@ -1,11 +1,10 @@
 //! 探测并缓存媒体轨道元数据.
 
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{collections::HashMap, path::Path};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use tokio::{process::Command, sync::Mutex};
-use tracing::{info, warn};
+use tokio::process::Command;
 
 use super::process::Processes;
 
@@ -49,62 +48,8 @@ pub(crate) struct MediaInfo {
     pub(super) attachments: Vec<Attachment>,
 }
 
-/// 按源文件指纹复用探测结果的缓存.
-///
-/// `new(processes)` 使用共享媒体进程名额.
-/// `get(id, path, retry)` 探测服务器文件地址, 同时缓存成功和失败结果.
-/// `retry = true` 显式绕过已有结果, 探测错误仍向调用方返回.
-/// 按文件指纹复用探测成功或失败结果, 显式 Retry probe 才绕过旧结果.
-#[derive(Clone)]
-pub(crate) struct MetadataCache {
-    entries: Arc<Mutex<HashMap<String, Result<MediaInfo, String>>>>
-}
-
-impl MetadataCache {
-
-    pub(crate) fn new() -> Self {
-        Self { entries: Arc::new(Mutex::new(HashMap::new())) }
-    }
-
-    pub(crate) async fn get(&self, processes: &Processes, id: &str, path: &Path, retry: bool) -> Result<MediaInfo, String> {
-
-        let mut entries = self.entries.lock().await; // 获取缓存锁
-
-        // 如果是重试请求, 跳过从缓存中获取探测结果
-        if !retry {
-
-            // 如果缓存中已有结果, 直接返回.
-            if let Some(entry) = entries.get(id) {
-                return match entry {
-                    Ok(info) => Ok(info.clone()),
-                    Err(error) => Err(format!("cached probe failure (use Retry probe): {error}")),
-                };
-            } else {
-                info!("cache miss for media probe: {id}");
-            }
-        }
-
-        // 缓存中没有结果, 执行探测.
-        let mut command = Command::new("ffprobe");
-        command.args(["-v", "error", "-show_streams", "-show_format", "-of", "json"]).arg(path);
-
-        // 使用 ffprobe 输出的 JSON 数据进行探测结果归一化处理.
-
-        let result = self.ffprobe(path, processes).await.map_err(|e| e.to_string());
-
-        // 成功则缓存结果, 失败则仅记录日志.
-        match &result {
-            Ok (i) => { entries.insert(id.to_string(), Ok(i.clone())); }
-            Err(e) => { warn!("media probe failed: {e:#}"); }
-        }
-
-        result
-    }
-
-
-    // ====================================================================== //
-
-    async fn ffprobe(&self, path: &Path, processes: &Processes) -> Result<MediaInfo, String> {
+/// 解析媒体文件并归一化 ffprobe 结果.
+pub(super) async fn probe(path: &Path, processes: &Processes) -> Result<MediaInfo> {
 
         #[derive(Deserialize)]
         struct Probe {
@@ -145,19 +90,18 @@ impl MetadataCache {
 
         let mut command = Command::new("ffprobe");
         command.args(["-v", "error", "-show_streams", "-show_format", "-of", "json"]).arg(path);
-        let probe: Probe = serde_json::from_slice(&processes.output(&mut command, 60)
-        .await.map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        let probe: Probe = serde_json::from_slice(&processes.output(&mut command, 60).await?)?;
 
-        let duration = probe.format.duration.as_deref().ok_or("missing media duration")?.parse::<f64>().map_err(|e| e.to_string())?;
-        if !(duration.is_finite() && duration > 0.0) { return Err("media duration must be finite and positive".to_string()); }
-        let start_time = probe.format.start_time.as_deref().unwrap_or("0").parse::<f64>().map_err(|e| e.to_string())?;
-        if !start_time.is_finite() { return Err("invalid media start time".to_string()); }
+        let duration = probe.format.duration.as_deref().context("missing media duration")?.parse::<f64>()?;
+        anyhow::ensure!(duration.is_finite() && duration > 0.0, "media duration must be finite and positive");
+        let start_time = probe.format.start_time.as_deref().unwrap_or("0").parse::<f64>()?;
+        anyhow::ensure!(start_time.is_finite(), "invalid media start time");
 
         // Matroska 的 duration 是包含正起点偏移的结束时间, 必须减去偏移才得到实际播放时长.
         let duration = if probe.format.format_name.split(',').any(|name| name == "matroska" || name == "webm") {
             duration - start_time.max(0.0)
         } else { duration };
-        if duration <= 0.0 { return Err("media has no duration after its start timestamp".to_string()); }
+        anyhow::ensure!(duration > 0.0, "media has no duration after its start timestamp");
         let mut info = MediaInfo {
             duration, start_time,
             video_tracks: Vec::new(), audio_tracks: Vec::new(), subtitle_tracks: Vec::new(),
@@ -191,43 +135,6 @@ impl MetadataCache {
                 color_transfer: stream.color_transfer,
             });
         }
-        if info.video_tracks.is_empty() { return Err("media has no playable video stream".to_string()); }
+        anyhow::ensure!(!info.video_tracks.is_empty(), "media has no playable video stream");
         Ok(info)
-    }
-
-}
-
-
-
-#[cfg(test)]
-mod tests {
-    // use super::*;
-
-    #[test]
-    fn only_fonts_are_extracted_as_fonts() {
-        // assert_eq!(font_extension("../../font.OTF", None), Some("otf".to_string()));
-        // assert_eq!(font_extension("attachment", Some("application/x-truetype-font")), Some("ttf".to_string()));
-        // assert_eq!(font_extension("cover.jpg", Some("image/jpeg")), None);
-    }
-
-    #[test]
-    fn only_container_stream_indexes_are_exposed() {
-        // let probe = serde_json::from_value(serde_json::json!({
-        //     "format": {"duration": "25", "start_time": "5", "format_name": "matroska,webm"},
-        //     "streams": [
-        //         {"index": 0, "codec_type": "video", "codec_name": "h264"},
-        //         {"index": 3, "codec_type": "subtitle", "codec_name": "ass"},
-        //         {"index": 4, "codec_type": "attachment", "tags": {"filename": "font.ttf"}}
-        //     ]
-        // })).unwrap();
-        // let info = ffprobe(probe).unwrap();
-        // assert_eq!(info.start_time, 5.0);
-        // assert_eq!(info.duration, 20.0);
-        // assert_eq!(info.subtitle_tracks.len(), 1);
-        // assert_eq!(info.subtitle_tracks[0].stream_index, 3);
-        // assert_eq!(info.attachments.len(), 1);
-        // let public = serde_json::to_value(info).unwrap();
-        // assert!(public.get("attachments").is_none());
-        // assert!(public.get("source_version").is_none());
-    }
 }

@@ -268,8 +268,16 @@ VFR 输入按同一恒帧率规则采样, 必要的重复或丢帧来自固定�
 
 ## 数据与资源管理
 
-`/data/main.db` 只保存业务数据和进度. 媒体探测结果及探测错误只放在内存中,
-按文件 ID 缓存, 显式重试或服务重启后可以重新探测.
+`/data/main.db` 只保存业务数据和进度. CacheManager 维护按文件 MD5 索引的媒体元数据 Map,
+只缓存探测成功结果, 最多 1000 项且一小时未访问后过期. 缓存未命中时由 CacheManager
+查询数据库中的源文件路径并运行 ffprobe; 显式 probe 会跳过已有结果, 探测失败不会缓存.
+服务重启后元数据重新探测.
+
+播放请求和媒体文件路径由不同边界管理. API 负责将数据库中的轨道偏好和观看进度合并到
+`PlaybackRequest`; SessionManager 按文件 MD5 向 CacheManager 临时取得 `MediaInfo`,
+构造不可变的 `PlaybackVariantConfig` 并计算 variant-key. CacheManager 接收该配置,
+自行查询源路径并组装编码参数, 活动缓存 Map 仅在相应 variant 被请求时创建条目.
+SessionManager 不保存媒体元数据或文件路径, API 也不直接操作元数据缓存或活动缓存.
 
 Rust `PlaybackVariantConfig` 依次包含 `src_file_pre16mib_md5`, `video_stream`,
 `audio_stream`, `subtitle_stream`, `encoder_profile`.
@@ -296,8 +304,10 @@ v2 固定无 B 帧, 视频时间基 90000, 音频时间基 48000, AAC 预热处�
 
 相同播放配置共享一份缓存及一个生成任务, 不同音轨或字幕配置可以同时存在.
 每个客户端仍获得独立会话 ID 和媒体地址. 最多允许 32 个租约和 32 个排队或生成中的缓存任务.
-运行时 `HashMap<variant-key, Arc<ActiveCache>>` 只保存活动元素.
-session 保存键和保活时间, 客户端目标与租约计数由活动元素中的同一张租约表维护.
+运行时 `HashMap<variant-key, Arc<CacheFolder>>` 只保存活动元素.
+SessionManager 保存会话到 variant-key 的关联, 各会话目标及保活时间, 并将同一变体的最大目标
+汇总到缓存文件夹. 最后一个会话离开后, 缓存生成停止; worker 收尾且媒体文件打开保护引用释放后,
+维护任务才从活动 Map 移除该文件夹.
 状态和媒体请求必须通过 session 及活动集合, 不支持按客户端提供的缓存键访问磁盘.
 
 最后一个租约离开时, 排队和准备任务立即取消; 编码任务记录当前已提交数量,

@@ -34,9 +34,7 @@ struct AppState {
     config: Arc<AppConfig>, // 应用配置
     scan_lock: Arc<tokio::sync::Mutex<()>>, // 扫描锁, 防止同时进行多个扫描任务
 
-    processes: Processes, // 共享的 FFmpeg 进程池
     session_manager: SessionManager, // 播放会话管理
-    cache: CacheManager, // 缓存管理
 }
 
 
@@ -71,22 +69,21 @@ async fn main() -> Result<()> {
 
     // 探测, 资源准备, 编码和解码校验共用进程预算, 防止不同模块各自突破全局上限.
     let processes = Processes::new(config.playback.max_processes, config.playback.max_total_ffmpeg_threads);
-    let cache = CacheManager::new(constants::CACHE_DIR.into(), config.playback.clone()).await?;
+    let database = db::initialize_database().await?;
+    let cache = CacheManager::new(constants::CACHE_DIR.into(), config.playback.clone(), database.clone(), processes.clone()).await?;
 
     info!("cache manager initialized at {}", constants::CACHE_DIR);
 
-    let playback = SessionManager::new(config.playback.idle_timeout_seconds);
+    let playback = SessionManager::new(cache.clone(), config.playback.idle_timeout_seconds);
 
     let state = AppState {
-        db: db::initialize_database().await?,
+        db: database,
         config: Arc::new(config),
         session_manager: playback.clone(),
         scan_lock: Arc::new(tokio::sync::Mutex::new(())),
-        processes,
-        cache,
     };
 
-    // 启动后台扫描任务, 定期扫描视频目录并更新数据库和元数据缓存.
+    // 启动后台扫描任务, 定期扫描视频目录并更新数据库索引.
     let s = state.clone();
     tokio::spawn(async move {
         loop {
@@ -99,12 +96,10 @@ async fn main() -> Result<()> {
             sleep(Duration::from_secs(s.config.scan_interval_seconds)).await;
         }
     });
-    state.session_manager.spawn_expiration(&state.cache); // 启动一个后台异步任务, 定期回收失去联系的播放会话并维护磁盘缓存
+    state.session_manager.spawn_expiration(); // 启动一个后台异步任务, 定期回收失去联系的播放会话并维护磁盘缓存
     info!("background tasks started: video scan and playback session expiration");
 
     // API 和前端静态文件由同一端口提供, 浏览器通过同源相对 URL 访问服务.
-    let processes = state.processes.clone();
-    let cache = state.cache.clone();
     let app = api::router(state)
     .route("/health", get(|| async { Json(serde_json::json!({"status": "ok"})) }))
 
@@ -131,7 +126,7 @@ async fn main() -> Result<()> {
         }
 
         // 等待分片边界落盘并回收子进程, 不依赖容器强制终止来结束转码.
-        if let Err(error) = playback.shutdown(&cache, &processes).await {
+        if let Err(error) = playback.shutdown().await {
             tracing::error!("playback shutdown failed: {error:#}");
         }
     }).await?;

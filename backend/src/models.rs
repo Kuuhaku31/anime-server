@@ -89,8 +89,8 @@ pub(crate) struct ScanChanges {
 /// 客户端选轨和位置请求, 不接受客户端提供的完整编码配置.
 ///
 /// 轨道字段缺省表示使用数据库偏好或服务端默认选择, 显式 null 表示关闭.
-/// `with_preferences(audio, subtitle)` 只补充缺省字段, 保留显式选择.
-/// 位置字段由反序列化读取, 最终合法性由 `EncodeSpec::new` 检查.
+/// `with_preferences` 补充缺省轨道, `with_saved_position` 保存数据库进度.
+/// 位置字段由反序列化读取, 最终合法性由播放配置构造流程检查.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PlaybackRequest {
@@ -100,6 +100,8 @@ pub(crate) struct PlaybackRequest {
     #[serde(default, deserialize_with = "track_choice")]
     pub(crate) subtitle_stream_index: Option<Option<i32>>,
     pub(crate) position: Option<f64>,
+    #[serde(skip)]
+    saved_position: Option<f64>,
 }
 
 /// 创建播放会话的响应, 包含状态快照, 媒体信息和实际选中的轨道.
@@ -111,6 +113,16 @@ impl PlaybackRequest {
         if self.audio_stream_index.is_none() { self.audio_stream_index = Some(audio); }
         if self.subtitle_stream_index.is_none() { self.subtitle_stream_index = Some(subtitle); }
         self
+    }
+
+    /// 合并数据库中的历史进度, 不覆盖请求显式提供的播放位置.
+    pub(crate) fn with_saved_position(mut self, position: Option<f64>) -> Self {
+        self.saved_position = position;
+        self
+    }
+
+    pub(crate) fn saved_position(&self) -> Option<f64> {
+        self.saved_position
     }
 }
 

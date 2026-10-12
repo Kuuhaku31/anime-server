@@ -1,6 +1,5 @@
 
-// backend/src/api/playback.rs
-//! 定义媒体探测, 播放会话及播放资源 API.
+//! 提供媒体探测、播放会话和播放资源的 HTTP API.
 
 use axum::{
     body::{Body, Bytes},
@@ -57,6 +56,11 @@ impl ApiError {
     }
 }
 
+fn media_info_error(error: anyhow::Error) -> ApiError {
+    if error.to_string() == "video file not found" { ApiError::missing(error) }
+    else { ApiError::media(error) }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         warn!(
@@ -76,19 +80,8 @@ async fn streams(
     State(state): State<AppState>,
     Path(id): Path<String>,
 )-> Result<Json<video::MediaInfo>, ApiError> {
-    Ok(Json({
-        let state: &AppState = &state;
-        let id: &str = &id;
-        async move {
-            let path = db::get_a_video_path_by_id(&state.db, id).await.map_err(ApiError::missing)?.ok_or_else(|| ApiError::missing("file not found"))?;
-            let info = state
-                .cache.metadata_cache
-                .get(&state.processes, id, &path, false)
-                .await
-                .map_err(ApiError::media)?;
-            Ok((path, info))
-        }
-    }.await?.1))
+    let info = state.session_manager.media_info(&id, false).await.map_err(media_info_error)?;
+    Ok(Json(info))
 }
 
 /// 重新探测媒体文件.
@@ -96,19 +89,8 @@ async fn probe(
     State(state): State<AppState>,
     Path(id): Path<String>,
 )-> Result<Json<video::MediaInfo>, ApiError> {
-    Ok(Json({
-        let state: &AppState = &state;
-        let id: &str = &id;
-        async move {
-            let path = db::get_a_video_path_by_id(&state.db, id).await.map_err(ApiError::missing)?.ok_or_else(|| ApiError::missing("file not found"))?;
-            let info = state
-                .cache.metadata_cache
-                .get(&state.processes, id, &path, true)
-                .await
-                .map_err(ApiError::media)?;
-            Ok((path, info))
-        }
-    }.await?.1))
+    let info = state.session_manager.media_info(&id, true).await.map_err(media_info_error)?;
+    Ok(Json(info))
 }
 
 /// 创建播放会话.
@@ -131,21 +113,19 @@ async fn play(
     let progress = db::get_progress(&state.db, &id).await
     .map_err(ApiError::internal)?.ok_or_else(|| ApiError::missing("file not found"))?;
 
-    // 返回媒体文件路径和元数据
-    let source = db::get_a_video_path_by_id(&state.db, &id).await.map_err(ApiError::missing)?.ok_or_else(|| ApiError::missing("file not found"))?;
-    let info = state.cache.metadata_cache.get(&state.processes, &id, &source, false).await.map_err(ApiError::media)?;
-
     // 请求显式选择覆盖数据库偏好, 字段缺省才使用扫描或上次手动选择保存的轨道.
     let audio_preference = input.audio_stream_index;
     let subtitle_preference = input.subtitle_stream_index;
-    let request = input.with_preferences(progress.audio_stream_index, progress.subtitle_stream_index);
+    let request = input.with_preferences(progress.audio_stream_index, progress.subtitle_stream_index)
+        .with_saved_position(progress.watch_pos);
 
     // 只保存本次请求显式提交的选择, null 也表示将对应偏好设为关闭.
     db::save_track_preferences(&state.db, &id, audio_preference, subtitle_preference)
     .await.map_err(ApiError::internal)?;
 
     // 创建播放会话并返回结果.
-    let session = video::new_session(&state, &id, source, info, request, progress.watch_pos).await.map_err(ApiError::internal)?;
+    let session = state.session_manager.create(&id, request)
+        .await.map_err(ApiError::internal)?;
 
     Ok(Json(session))
 }
@@ -166,7 +146,7 @@ async fn target(
 
     let status = state
         .session_manager
-        .status(&state.cache, &id)
+        .status(&id)
         .await
         .map_err(ApiError::missing)?;
 
@@ -176,7 +156,7 @@ async fn target(
 
     let status = state
         .session_manager
-        .target(&state.cache, &id, input.position)
+        .target(&id, input.position)
         .await
         .map_err(ApiError::missing)?;
 
@@ -191,7 +171,7 @@ async fn status(
     Ok(Json(
         state
             .session_manager
-            .status(&state.cache, &id)
+            .status(&id)
             .await
             .map_err(ApiError::missing)?,
     ))
@@ -204,7 +184,7 @@ async fn heartbeat(
 ) -> Result<StatusCode, ApiError> {
     state
         .session_manager
-        .heartbeat(&state.cache, &id)
+        .heartbeat(&id)
         .await
         .map_err(ApiError::missing)?;
 
@@ -218,7 +198,7 @@ async fn release(
 ) -> Result<StatusCode, ApiError> {
     state
         .session_manager
-        .release(&state.cache, &id)
+        .release(&id)
         .await
         .map_err(ApiError::internal)?;
 
@@ -232,9 +212,9 @@ async fn media(
     request: Request,
 ) -> Result<Response, ApiError> {
     // 持有 lease 直到 ServeFile 完成文件打开, 避免资源目录被提前删除.
-    let (path, mime) = state
+    let (path, mime, _pin) = state
         .session_manager
-        .media_path(&state.cache, &id, &asset)
+        .media_path(&id, &asset)
         .await
         .map_err(ApiError::missing)?;
 

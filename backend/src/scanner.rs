@@ -1,5 +1,3 @@
-
-// backend/src/scanner.rs
 //! 扫描媒体目录并同步文件索引.
 
 use std::{collections::HashSet, path::{Path, PathBuf}};
@@ -146,76 +144,26 @@ fn is_video(path: &Path) -> bool {
 mod tests {
     use super::*;
 
-    // #[tokio::test]
-    // async fn scanned_files_rehash_content_and_preserve_other_paths() {
-    //     // 隔离文件构造和数据库更新测试, 不调用已删除的可配置根目录扫描辅助函数.
-    //     let root = std::env::temp_dir().join(format!("anime-single-scan-{}", crate::video::random_id().unwrap()));
-    //     std::fs::create_dir(&root).unwrap();
-    //     let path = root.join("episode.mkv");
-    //     std::fs::write(&path, b"first").unwrap();
-    //     let first = ScannedFile::new(&path).unwrap();
-    //     let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1)
-    //         .connect("sqlite::memory:").await.unwrap();
-    //     sqlx::raw_sql(include_str!("../sql/init.sql")).execute(&pool).await.unwrap();
-    //     db::upsert_file(&pool, &first).await.unwrap();
-    //     let old_id = first.pre16mib_md5().to_owned();
-    //     db::save_progress(&pool, &old_id, 12.5).await.unwrap();
-    //     // 另一个内容相同的副本不应被该地址的强制扫描删除.
-    //     let sibling = root.join("copy.mkv");
-    //     std::fs::write(&sibling, b"first").unwrap();
-    //     db::upsert_file(&pool, &ScannedFile::new(&sibling).unwrap()).await.unwrap();
-    //     #[cfg(unix)]
-    //     {
-    //         // 文件构造保留符号链接原地址, 不替换为目标地址.
-    //         let link = root.join("link.mkv");
-    //         std::os::unix::fs::symlink(&sibling, &link).unwrap();
-    //         let linked = ScannedFile::new(&link).unwrap();
-    //         assert_eq!(linked.path(), &link);
-    //         std::fs::remove_file(link).unwrap();
-    //     }
-    //     assert_eq!(first.path(), &path);
-    //     std::fs::write(&path, b"replaced media").unwrap();
-    //     let second = ScannedFile::new(&path).unwrap();
-    //     assert_ne!(first.pre16mib_md5(), second.pre16mib_md5());
-    //     assert_eq!(second.size(), 14);
-    //     db::upsert_file(&pool, &second).await.unwrap();
-    //     assert_eq!(db::get_video_paths_by_id(&pool, &old_id).await.unwrap(), vec![sibling.clone()]);
-    //     assert_eq!(db::get_progress(&pool, &old_id).await.unwrap().unwrap().watch_pos, Some(12.5));
-    //     let new_id = second.pre16mib_md5();
-    //     assert_eq!(db::get_video_paths_by_id(&pool, new_id).await.unwrap(), vec![path.clone()]);
-    //     std::fs::remove_file(&path).unwrap();
-    //     // 文件已消失时构造失败, 独立删除数据库地址仍保留业务记录.
-    //     assert!(ScannedFile::new(&path).is_err());
-    //     db::delete_path(&pool, &path).await.unwrap();
-    //     assert_eq!(db::get_paths_and_size(&pool).await.unwrap().into_keys().collect::<Vec<_>>(), vec![sibling.clone()]);
-    //     assert!(db::get_progress(&pool, new_id).await.unwrap().is_some());
-    //     std::fs::remove_file(sibling).unwrap();
-    //     std::fs::remove_dir(&root).unwrap();
-    // }
-
     #[test]
     fn initial_track_preferences_match_server_defaults() {
-        // 默认轨道由播放配置生成器选择, 扫描模块不再提供独立选择函数.
-        todo!();
-        // use crate::video::EncodeSpec;
-        // use crate::models;
-        // let (info, request) = crate::video::fixture();
-        // let spec = EncodeSpec::new(&"a".repeat(32), "video.mkv".into(), info, request, None).unwrap();
-        // assert_eq!((spec.config.audio_stream, spec.config.subtitle_stream), (Some(1), None));
-        // let info = serde_json::from_value(serde_json::json!({
-        //     "duration": 20.0, "start_time": 0.0,
-        //     "video_tracks": [{"stream_index": 0, "codec_name": "h264", "is_default": true, "is_forced": false}],
-        //     "audio_tracks": [
-        //         {"stream_index": 1, "codec_name": "aac", "is_default": false, "is_forced": false},
-        //         {"stream_index": 4, "codec_name": "aac", "is_default": true, "is_forced": false}
-        //     ],
-        //     "subtitle_tracks": [
-        //         {"stream_index": 3, "codec_name": "ass", "is_default": false, "is_forced": true}
-        //     ],
-        //     "attachments": []
-        // })).unwrap();
-        // let spec = EncodeSpec::new(&"a".repeat(32), "video.mkv".into(), info, models::PlaybackRequest::default(), None).unwrap();
-        // assert_eq!((spec.config.audio_stream, spec.config.subtitle_stream), (Some(4), Some(3)));
+        let info: crate::video::MediaInfo = serde_json::from_value(serde_json::json!({
+            "duration": 20.0, "start_time": 0.0,
+            "video_tracks": [{"stream_index": 0, "codec_name": "h264", "is_default": true, "is_forced": false}],
+            "audio_tracks": [
+                {"stream_index": 1, "codec_name": "aac", "is_default": false, "is_forced": false},
+                {"stream_index": 4, "codec_name": "aac", "is_default": true, "is_forced": false}
+            ],
+            "subtitle_tracks": [
+                {"stream_index": 3, "codec_name": "ass", "is_default": false, "is_forced": true}
+            ],
+            "attachments": []
+        })).unwrap();
+        let config = crate::video::PlaybackVariantConfig::new(
+            &"a".repeat(32),
+            &info,
+            &crate::models::PlaybackRequest::default(),
+        ).unwrap();
+        assert_eq!(config.selection(), (Some(4), Some(3)));
     }
 
     #[test]
@@ -230,40 +178,4 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn scan_entry_points_report_errors_without_touching_real_media() {
-        // // 构造完整隔离状态, 固定 /media 入口只测试拒绝路径和数据库读取失败.
-        // use std::sync::Arc;
-        // use crate::{config::AppConfig, video::{CacheManager, MetadataCache,
-        //     Processes, SessionManager}};
-        // let root = std::env::temp_dir().join(format!("anime-scan-state-{}", crate::video::random_id().unwrap()));
-        // std::fs::create_dir(&root).unwrap();
-        // let config: AppConfig = serde_json::from_str("{}").unwrap();
-        // let processes = Processes::new(2, 16);
-        // let cache = CacheManager::new(root.clone(), config.playback.clone(), processes.clone()).await.unwrap();
-        // let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1)
-        //     .connect("sqlite::memory:").await.unwrap();
-        // sqlx::raw_sql(include_str!("../sql/init.sql")).execute(&pool).await.unwrap();
-        // let state = AppState {
-        //     db: pool, config: Arc::new(config), metadata: MetadataCache::new(processes),
-        //     playback: SessionManager::new(cache, 60), scan_lock: Arc::new(tokio::sync::Mutex::new(())),
-        // };
-        // let root_error = std::fs::canonicalize(constants::video_root_path()).err();
-        // for path in ["episode.mkv", "/media/../outside.mkv", "/media/ignored.txt"] {
-        //     let error = scan_file(&state, Path::new(path)).await.err().unwrap();
-        //     if let Some(root_error) = &root_error {
-        //         assert_eq!(error, format!("cannot resolve media directory: {root_error}"));
-        //     } else {
-        //         assert!(error.starts_with("invalid media file path:"));
-        //     }
-        // }
-        // assert!(db::get_paths_and_size(&state.db).await.unwrap().is_empty());
-        // // 关闭数据库确保全目录入口在读取路径时失败, 不遍历或更新真实媒体.
-        // state.db.close().await;
-        // assert!(scan_root(&state).await.err().unwrap().starts_with("failed to read paths and sizes from database:"));
-        // assert!(state.scan_lock.try_lock().is_ok());
-        // state.playback.shutdown().await.unwrap();
-        // drop(state);
-        // std::fs::remove_dir_all(root).unwrap();
-    }
 }

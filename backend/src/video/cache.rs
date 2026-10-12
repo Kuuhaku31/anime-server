@@ -3,7 +3,7 @@
 use std::{
     collections::{hash_map::Entry, HashMap},
     fs::{File, FileTimes}, future::Future, path::{Path, PathBuf},
-    sync::{atomic::{AtomicU64, Ordering}, Arc, Weak},
+    sync::{atomic::{AtomicU64, Ordering}, Arc},
     time::{Duration, Instant, SystemTime},
 };
 
@@ -11,9 +11,12 @@ use anyhow::{bail, ensure, Context, Result};
 use tokio::{process::Child, sync::{watch, Mutex, Notify, OwnedSemaphorePermit}, task::JoinSet, time::interval};
 use tracing::{info, warn};
 
-use crate::{config::PlaybackConfig, utils, video::metadata::MetadataCache};
+use sqlx::SqlitePool;
+
+use crate::{config::PlaybackConfig, db, utils};
 use super::{
-    models::EncodeSpec,
+    metadata::{self, MediaInfo},
+    models::{EncodeSpec, PlaybackVariantConfig},
     assets::{self, RenderAssets}, ffmpeg::{self, CachedMedia},
     fragment::{self, Init, Tail}, process::{cancelled, check_cancel, read_tail, Cancelled, Processes}};
 
@@ -28,6 +31,7 @@ type EncoderBudget = Option<(OwnedSemaphorePermit, OwnedSemaphorePermit, OwnedSe
 /// complete 只描述媒体是否完整, generating 还包括排队和收尾, 两者可以同时为真.
 #[derive(Clone)]
 pub(crate) struct CacheStatus {
+    pub(crate) duration: f64,
     pub(crate) complete: bool,
     pub(crate) generating: bool,
     pub(crate) stopping: bool,
@@ -35,16 +39,14 @@ pub(crate) struct CacheStatus {
     pub(crate) buffered_until: f64,
     pub(crate) encoding_threads: usize,
     pub(crate) revision: u64,
-    pub(crate) target: f64,
     pub(crate) error: Option<String>,
 }
 
-struct ActiveState {
+struct FolderState {
     media: CachedMedia,
     // 恢复完成前的空 media 只是占位, 不能作为创建响应返回.
     loaded: bool,
-    // 租约表是 client_count 和等待目标的唯一来源, 重复释放不会重复减计数.
-    clients: HashMap<String, f64>,
+    target: Option<f64>,
     // worker 覆盖整个任务生命周期, encoding 仅表示编码进程仍在运行.
     worker_active: bool,
     encoding: bool,
@@ -65,16 +67,20 @@ struct ActiveState {
 /// 防止最后会话释放后 LRU 在文件打开之前删除缓存.
 /// 外部不能直接创建, 查询或修改该对象, 媒体访问仍须经过有效会话.
 /// 同一配置的全部会话共享此元素, 只有其生成任务能发布正式分片.
-pub(crate) struct ActiveCache {
+struct CacheFolder {
     key: String,
     directory: PathBuf,
-    pub(crate) spec: EncodeSpec,
-    state: Mutex<ActiveState>,
+    spec: EncodeSpec,
+    state: Mutex<FolderState>,
     changed: Notify,
 }
 
-impl ActiveCache {
-    pub(crate) async fn wait_loaded(&self) -> Result<()> {
+pub(crate) struct CachePin {
+    _folder: Arc<CacheFolder>,
+}
+
+impl CacheFolder {
+    async fn wait_loaded(&self) -> Result<()> {
         // 创建响应必须反映磁盘的真实完成状态, 等待期间不占用全局活动集合锁.
         loop {
             // 先注册通知再检查条件, 避免恢复完成通知落在检查与等待之间.
@@ -90,20 +96,21 @@ impl ActiveCache {
         }
     }
 
-    pub(crate) async fn status(&self, id: &str) -> Result<CacheStatus> {
+    async fn status(&self) -> Result<CacheStatus> {
         let mut state = self.state.lock().await;
-        let target = *state.clients.get(id).context("playback cache lease is no longer active")?;
+        state.target.context("playback cache has no active session")?;
         state.last_used = SystemTime::now();
         Ok(CacheStatus {
+            duration: self.spec.duration,
             complete: state.media.complete, generating: state.worker_active,
             stopping: state.stop_after.is_some() || state.finalizing,
             ready: !state.media.segments.is_empty(), buffered_until: state.media.tail().seconds(),
-            encoding_threads: state.encoding_threads, revision: state.revision, target,
+            encoding_threads: state.encoding_threads, revision: state.revision,
             error: state.error.clone(),
         })
     }
 
-    fn stop(state: &mut ActiveState) {
+    fn stop(state: &mut FolderState) {
         if state.encoding {
             // 只允许再提交一个分片. 已在私有目录生成的更远内容也不能越过此边界发布.
             state.stop_after.get_or_insert(state.media.segments.len() + 1);
@@ -117,10 +124,11 @@ impl ActiveCache {
 struct CacheInner {
     root: PathBuf,
     config: PlaybackConfig,
+    database: SqlitePool,
+    processes: Processes,
+    metadata: Mutex<HashMap<String, MetadataEntry>>,
     // 同时访问集合和元素时先锁 entries 再锁 state, 创建与回收必须保持相同顺序.
-    entries: Mutex<HashMap<String, Arc<ActiveCache>>>,
-    // 弱引用只保护尚未完成文件打开的旧请求, 不构成集合外的可访问缓存索引.
-    retired: Mutex<Vec<Weak<ActiveCache>>>,
+    entries: Mutex<HashMap<String, Arc<CacheFolder>>>,
     workers: Mutex<JoinSet<()>>,
     maintenance: Mutex<()>,
     stop: watch::Sender<bool>,
@@ -130,11 +138,25 @@ struct CacheInner {
 #[derive(Clone)]
 pub(crate) struct CacheManager {
     inner: Arc<CacheInner>,
-    pub(crate) metadata_cache: MetadataCache,
+}
+
+struct MetadataEntry {
+    info: MediaInfo,
+    last_access: SystemTime,
+}
+
+fn prune_metadata(entries: &mut HashMap<String, MetadataEntry>, now: SystemTime) {
+    entries.retain(|_, entry| now.duration_since(entry.last_access).unwrap_or_default() < Duration::from_secs(3600));
+    while entries.len() > 1000 {
+        let Some(oldest) = entries.iter().min_by_key(|(_, entry)| entry.last_access).map(|(key, _)| key.clone()) else {
+            break;
+        };
+        entries.remove(&oldest);
+    }
 }
 
 impl CacheManager {
-    pub(crate) async fn new(root: PathBuf, config: PlaybackConfig) -> Result<Self> {
+    pub(crate) async fn new(root: PathBuf, config: PlaybackConfig, database: SqlitePool, processes: Processes) -> Result<Self> {
 
         info!("开始初始化缓存管理器, 检查配置和磁盘目录...");
 
@@ -160,11 +182,11 @@ impl CacheManager {
         let (stop, _) = watch::channel(false);
         let manager = Self {
             inner: Arc::new(CacheInner {
-                root, config, entries: Mutex::new(HashMap::new()), retired: Mutex::new(Vec::new()),
+                root, config, database, processes, metadata: Mutex::new(HashMap::new()),
+                entries: Mutex::new(HashMap::new()),
                 workers: Mutex::new(JoinSet::new()), maintenance: Mutex::new(()), stop,
                 _directory_lock: directory_lock,
             }),
-            metadata_cache: MetadataCache::new(),
         };
         manager.maintain().await?;
         info!("缓存管理器初始化完成, 根目录: {}, 最大缓存容量: {} MiB, 最大并发编码线程数: {}",
@@ -175,18 +197,41 @@ impl CacheManager {
 
     pub(crate) fn stopping(&self) -> bool { *self.inner.stop.borrow() }
 
+    pub(crate) async fn media_info(&self, id: &str, retry: bool) -> Result<MediaInfo> {
+        ensure!(utils::check_md5_ok(id), "invalid source file ID");
+        let now = SystemTime::now();
+        {
+            let mut entries = self.inner.metadata.lock().await;
+            prune_metadata(&mut entries, now);
+            if !retry {
+                if let Some(entry) = entries.get_mut(id) {
+                    entry.last_access = now;
+                    return Ok(entry.info.clone());
+                }
+            }
+        }
+
+        let path = db::get_a_video_path_by_id(&self.inner.database, id).await?
+            .context("video file not found")?;
+        let info = metadata::probe(&path, &self.inner.processes).await?;
+        let mut entries = self.inner.metadata.lock().await;
+        entries.insert(id.to_string(), MetadataEntry { info: info.clone(), last_access: now });
+        prune_metadata(&mut entries, SystemTime::now());
+        Ok(info)
+    }
+
     // 查找或创建共享缓存
-    pub(crate) async fn acquire(&self, processes: &Processes, spec: EncodeSpec, id: &str) -> Result<Arc<ActiveCache>> {
-        let key = spec.config.key()?;
+    pub(crate) async fn acquire(&self, config: &PlaybackVariantConfig) -> Result<()> {
+        let key = config.key()?;
         loop {
-            let mut entries = self.inner.entries.lock().await;
+            let entries = self.inner.entries.lock().await;
             ensure!(!self.stopping(), "server is shutting down");
             if let Some(output) = entries.get(&key).cloned() {
                 let notified = output.changed.notified();
                 tokio::pin!(notified);
                 notified.as_mut().enable();
                 let mut state = output.state.lock().await;
-                ensure!(output.spec.config == spec.config, "playback configuration hash collision");
+                ensure!(output.spec.config == *config, "playback configuration hash collision");
                 if state.finalizing || (state.worker_active && *state.cancel.borrow()) {
                     // 已开始回收的任务不可复活, 等待旧写入者退出后再从磁盘加载.
                     drop(state);
@@ -194,9 +239,8 @@ impl CacheManager {
                     notified.await;
                     continue;
                 }
-                ensure!(!state.clients.contains_key(id), "duplicate playback lease");
-                state.clients.insert(id.to_string(), spec.target);
                 state.last_used = SystemTime::now();
+                state.target = Some(0.0);
                 state.stop_after = None;
                 state.stop_deadline = None;
                 if !state.media.complete && !state.worker_active {
@@ -204,16 +248,25 @@ impl CacheManager {
                     state.error = None;
                     state.cancel = watch::channel(false).0;
                     state.revision = REVISION.fetch_add(1, Ordering::Relaxed);
-                    self.spawn(processes, &output).await;
+                    self.spawn(&output).await;
                 }
                 drop(state);
-                return Ok(output.clone());
+                return Ok(());
             }
             ensure!(entries.len() < 32, "too many active playback configurations");
-            let output = Arc::new(ActiveCache {
+            drop(entries);
+            let info = self.media_info(&config.src_file_pre16mib_md5, false).await?;
+            let source = db::get_a_video_path_by_id(&self.inner.database, &config.src_file_pre16mib_md5).await?
+                .context("video file not found")?;
+            let spec = EncodeSpec::from_config(config.clone(), source, info, 0.0)?;
+            let mut entries = self.inner.entries.lock().await;
+            ensure!(!self.stopping(), "server is shutting down");
+            if entries.contains_key(&key) { continue; }
+            ensure!(entries.len() < 32, "too many active playback configurations");
+            let output = Arc::new(CacheFolder {
                 key: key.clone(), directory: self.inner.root.join("playback").join(&key), spec: spec.clone(),
-                state: Mutex::new(ActiveState {
-                    media: CachedMedia::default(), loaded: false, clients: HashMap::from([(id.to_string(), spec.target)]),
+                state: Mutex::new(FolderState {
+                    media: CachedMedia::default(), loaded: false, target: Some(spec.target),
                     worker_active: true, encoding: false, finalizing: false, encoding_threads: 0,
                     stop_after: None, stop_deadline: None, cancel: watch::channel(false).0,
                     revision: REVISION.fetch_add(1, Ordering::Relaxed), last_used: SystemTime::now(), error: None,
@@ -225,15 +278,15 @@ impl CacheManager {
                 Entry::Vacant(entry) => { entry.insert(output.clone()); },
                 Entry::Occupied(_) => bail!("playback activation raced while holding its lock"),
             }
-            self.spawn(processes, &output).await;
-            return Ok(output);
+            self.spawn(&output).await;
+            return Ok(());
         }
     }
 
-    async fn spawn(&self, processes: &Processes, output: &Arc<ActiveCache>) {
+    async fn spawn(&self, output: &Arc<CacheFolder>) {
         let manager = self.clone();
         let output = output.clone();
-        let processes = processes.clone();
+        let processes = self.inner.processes.clone();
         self.inner.workers.lock().await.spawn(async move {
             manager.generate(&processes, &output).await;
             drop(output);
@@ -241,37 +294,41 @@ impl CacheManager {
         });
     }
 
-    /// 只查活动集合, 不能靠磁盘目录存在绕过会话租约访问缓存.
-    pub(crate) async fn get(&self, key: &str) -> Result<Arc<ActiveCache>> {
+    async fn get(&self, key: &str) -> Result<Arc<CacheFolder>> {
         self.inner.entries.lock().await.get(key).cloned().context("playback cache is no longer active")
     }
 
+    pub(crate) async fn wait_loaded(&self, key: &str) -> Result<()> {
+        self.get(key).await?.wait_loaded().await
+    }
+
+    pub(crate) async fn status(&self, key: &str) -> Result<CacheStatus> {
+        self.get(key).await?.status().await
+    }
+
     /// 更新等待目标但不重建缓存, 运行中的编码进程也不会因此热调线程.
-    pub(crate) async fn target(&self, key: &str, id: &str, target: f64) -> Result<()> {
+    pub(crate) async fn target(&self, key: &str, target: f64) -> Result<()> {
         let output = self.get(key).await?;
         ensure!(target.is_finite() && target >= 0.0 && target < output.spec.duration, "position must be within the video duration");
         let mut state = output.state.lock().await;
-        *state.clients.get_mut(id).context("playback cache lease is no longer active")? = target;
+        state.target = Some(target);
         state.last_used = SystemTime::now();
         Ok(())
     }
 
-    /// 仅释放仍存在的租约, 重复 DELETE 或过期清理不能重复触发最后客户端停止.
-    pub(crate) async fn release(&self, key: &str, id: &str) -> Result<()> {
-        let mut entries = self.inner.entries.lock().await;
+    /// 最后一个会话离开时解除目标并停止缓存生成.
+    pub(crate) async fn release(&self, key: &str) -> Result<()> {
+        let entries = self.inner.entries.lock().await;
         let Some(output) = entries.get(key).cloned() else { return Ok(()); };
         let mut state = output.state.lock().await;
-        if state.clients.remove(id).is_none() { return Ok(()); }
+        if state.target.take().is_none() { return Ok(()); }
         state.last_used = SystemTime::now();
-        if !state.clients.is_empty() { return Ok(()); }
         if state.worker_active {
-            ActiveCache::stop(&mut state);
+            CacheFolder::stop(&mut state);
         } else {
             let persisted = persist_used(&output.directory, state.last_used).await;
-            self.inner.retired.lock().await.push(Arc::downgrade(&output));
-            entries.remove(key);
             output.changed.notify_waiters();
-            // 落盘失败仍须退出活动集合, 不能留下已无 session 的永久占位.
+            // 即使时间戳落盘失败, 后续维护也会清除无会话的文件夹记录.
             persisted?;
         }
         // 不等待 FFmpeg 完成当前分片. 回收和 LRU 由生成任务或定期维护完成.
@@ -279,11 +336,11 @@ impl CacheManager {
     }
 
     /// 只开放正式清单中的已发布资源, 私有工作目录和未验证尾部不能被读取.
-    pub(crate) async fn media_path(&self, key: &str, id: &str, name: &str) -> Result<(PathBuf, Arc<ActiveCache>)> {
+    pub(crate) async fn media_path(&self, key: &str, name: &str) -> Result<(PathBuf, CachePin)> {
         ensure!(ffmpeg::media_filename(name), "playback asset not found");
         let output = self.get(key).await?;
         let mut state = output.state.lock().await;
-        ensure!(state.clients.contains_key(id), "playback cache lease is no longer active");
+        ensure!(state.target.is_some(), "playback cache has no active session");
         ensure!(!state.media.segments.is_empty(), "playback output is not ready");
         if let Some(index) = name.strip_prefix("segment_").and_then(|name| name.strip_suffix(".m4s")) {
             ensure!(index.parse::<usize>()? < state.media.segments.len(), "playback segment is not published");
@@ -293,18 +350,18 @@ impl CacheManager {
         let file = tokio::fs::symlink_metadata(&path).await.context("cached media file is missing")?;
         ensure!(file.is_file() && file.len() > 0, "unsafe or empty cached media file");
         drop(state);
-        Ok((path, output))
+        Ok((path, CachePin { _folder: output }))
     }
 
-    // 成功, 失败和取消统一收尾, 有客户端时保留错误快照, 无客户端时退出活动集合.
-    async fn generate(&self, processes: &Processes, output: &Arc<ActiveCache>) {
+    // 成功, 失败和取消统一收尾, 有会话时保留错误快照.
+    async fn generate(&self, processes: &Processes, output: &Arc<CacheFolder>) {
         let mut cancel = output.state.lock().await.cancel.subscribe();
         let result = self.run(processes, output, &mut cancel).await;
-        let mut entries = self.inner.entries.lock().await;
+        let _entries = self.inner.entries.lock().await;
         let mut state = output.state.lock().await;
         state.finalizing = true;
         if let Err(error) = result {
-            if !error.is::<Cancelled>() || !state.clients.is_empty() {
+            if !error.is::<Cancelled>() || state.target.is_some() {
                 state.error = Some(format!("{error:#}"));
                 warn!(variant_key = output.key, "cache generation failed: {error:#}");
             }
@@ -318,16 +375,12 @@ impl CacheManager {
             warn!(variant_key = output.key, "cache timestamp update failed: {error:#}");
             state.error = Some(format!("cache timestamp update failed: {error:#}"));
         }
-        if state.clients.is_empty() {
-            self.inner.retired.lock().await.push(Arc::downgrade(output));
-            entries.remove(&output.key);
-        }
         state.finalizing = false;
         output.changed.notify_waiters();
     }
 
     // 先恢复有效磁盘前缀, 再决定复用完整缓存, 确认 EOF 或从尾部继续生成.
-    async fn run(&self, processes: &Processes, output: &Arc<ActiveCache>, cancel: &mut watch::Receiver<bool>) -> Result<()> {
+    async fn run(&self, processes: &Processes, output: &Arc<CacheFolder>, cancel: &mut watch::Receiver<bool>) -> Result<()> {
         match tokio::fs::create_dir(&output.directory).await {
             Ok(()) => {},
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists =>
@@ -372,7 +425,7 @@ impl CacheManager {
         result
     }
 
-    async fn render(&self, processes: &Processes, output: &Arc<ActiveCache>, directory: &Path, assets: Option<&RenderAssets>,
+    async fn render(&self, processes: &Processes, output: &Arc<CacheFolder>, directory: &Path, assets: Option<&RenderAssets>,
         resume: Tail, cancel: &mut watch::Receiver<bool>) -> Result<()> {
         let seconds = self.inner.config.startup_timeout_seconds;
         if let Some(assets) = assets {
@@ -399,8 +452,8 @@ impl CacheManager {
         let mut child = {
             let mut state = output.state.lock().await;
             check_cancel(cancel)?;
-            ensure!(!state.clients.is_empty(), "cache generation has no active lease");
-            let desired = if state.clients.values().any(|target| *target >= state.media.tail().seconds()) {
+            ensure!(state.target.is_some(), "cache generation has no active session");
+            let desired = if state.target.is_some_and(|target| target >= state.media.tail().seconds()) {
                 self.inner.config.max_variant_threads
             } else { base };
             processes.extend_encoding_threads(&mut threads, desired)?;
@@ -424,7 +477,7 @@ impl CacheManager {
         result.with_context(|| if tail.is_empty() { "FFmpeg generation ended".to_string() } else { format!("FFmpeg: {tail}") })
     }
 
-    async fn check_worker(&self, output: &ActiveCache, child: &mut Child,
+    async fn check_worker(&self, output: &CacheFolder, child: &mut Child,
         budget: &mut EncoderBudget, started: Instant, published: usize, cancel: &watch::Receiver<bool>) -> Result<()> {
         // 发布 future 可能正持锁等待落盘, 监控分支不能再等待同一把锁而停止轮询它.
         let Ok(mut state) = output.state.try_lock() else { return Ok(()); };
@@ -445,7 +498,7 @@ impl CacheManager {
     }
 
     // 长耗时校验与编码监控同时推进, 保证等待校验时仍能响应停止和启动超时.
-    async fn checked_step<T>(&self, output: &ActiveCache, child: &mut Child, budget: &mut EncoderBudget, started: Instant,
+    async fn checked_step<T>(&self, output: &CacheFolder, child: &mut Child, budget: &mut EncoderBudget, started: Instant,
         published: usize, cancel: &watch::Receiver<bool>, step: impl Future<Output = Result<T>>) -> Result<T> {
         let stop = output.state.lock().await.cancel.clone();
         tokio::pin!(step);
@@ -471,7 +524,7 @@ impl CacheManager {
     }
 
     // 顺序消费私有清单, 编码进程退出不代表待发布分片已全部处理完.
-    async fn monitor(&self, processes: &Processes, output: &ActiveCache, directory: &Path, resume: Tail,
+    async fn monitor(&self, processes: &Processes, output: &CacheFolder, directory: &Path, resume: Tail,
         child: &mut Child, budget: &mut EncoderBudget, cancel: &mut watch::Receiver<bool>) -> Result<()> {
         let started = Instant::now();
         let mut published = 0;
@@ -507,7 +560,7 @@ impl CacheManager {
     }
 
     // 新分片必须通过 init 兼容, 时间轴和真实解码校验, 不能覆盖任何已发布字节.
-    async fn publish(&self, processes: &Processes, output: &ActiveCache, directory: &Path, name: &str, resume: Tail,
+    async fn publish(&self, processes: &Processes, output: &CacheFolder, directory: &Path, name: &str, resume: Tail,
         first: bool, cancel: &mut watch::Receiver<bool>) -> Result<()> {
         let init_bytes = ffmpeg::regular_bytes(&directory.join("init.mp4"), 4 * 1024 * 1024).await?;
         let init = Init::parse(&init_bytes)?;
@@ -546,7 +599,7 @@ impl CacheManager {
     }
 
     // 先提交 ENDLIST 再写空标记, 中途崩溃可由恢复流程重新确认完整性.
-    async fn complete(&self, output: &ActiveCache) -> Result<()> {
+    async fn complete(&self, output: &CacheFolder) -> Result<()> {
         let mut state = output.state.lock().await;
         ensure!(!state.media.segments.is_empty(), "cannot complete an empty playback cache");
         let mut media = state.media.clone();
@@ -567,22 +620,31 @@ impl CacheManager {
             }
         }
         let _maintenance = self.inner.maintenance.lock().await;
+        {
+            let mut entries = self.inner.entries.lock().await;
+            let mut removable = Vec::new();
+            for (key, folder) in entries.iter() {
+                if Arc::strong_count(folder) != 1 { continue; }
+                let state = folder.state.lock().await;
+                if state.target.is_none() && !state.worker_active && !state.finalizing {
+                    removable.push(key.clone());
+                }
+            }
+            for key in removable { entries.remove(&key); }
+        }
         let root = self.inner.root.clone();
         let (mut total, mut candidates) = tokio::task::spawn_blocking(move || disk_usage(&root)).await??;
         candidates.sort_by_key(|candidate| candidate.0);
         for (_, key, size) in candidates {
             if total <= self.inner.config.cache_max_bytes { break; }
             let entries = self.inner.entries.lock().await;
-            let mut retired = self.inner.retired.lock().await;
-            retired.retain(|entry| entry.strong_count() > 0);
-            if entries.contains_key(&key) || retired.iter().filter_map(Weak::upgrade).any(|entry| entry.key == key) {
+            if entries.contains_key(&key) {
                 continue;
             }
             let path = self.inner.root.join("playback").join(&key);
             let trash = self.inner.root.join("playback").join(format!(".evict-{key}-{}", utils::random_id()?));
             // 先原子移走不活跃目录, 避免长时间删除文件阻塞其他缓存的状态和释放请求.
             tokio::fs::rename(&path, &trash).await?;
-            drop(retired);
             drop(entries);
             tokio::fs::remove_dir_all(trash).await?;
             total = total.saturating_sub(size);
@@ -592,14 +654,14 @@ impl CacheManager {
     }
 
     /// 先拒绝新租约并请求边界停止, 等全部写入者退出后才关闭媒体进程许可.
-    pub(crate) async fn shutdown(&self, processes: &Processes) -> Result<()> {
+    pub(crate) async fn shutdown(&self) -> Result<()> {
         self.inner.stop.send_replace(true);
         {
             let entries = self.inner.entries.lock().await;
             for output in entries.values() {
                 let mut state = output.state.lock().await;
-                state.clients.clear();
-                if state.worker_active { ActiveCache::stop(&mut state); }
+                state.target = None;
+                if state.worker_active { CacheFolder::stop(&mut state); }
             }
         }
         let mut errors = Vec::new();
@@ -610,8 +672,8 @@ impl CacheManager {
             }
         }
         self.inner.entries.lock().await.clear();
-        processes.slots.close();
-        processes.encoders.close();
+        self.inner.processes.slots.close();
+        self.inner.processes.encoders.close();
         if let Err(error) = self.maintain().await { errors.push(format!("{error:#}")); }
         ensure!(errors.is_empty(), "cache shutdown failed: {}", errors.join("; "));
         Ok(())
@@ -648,9 +710,7 @@ fn directory_size(path: &Path) -> Result<u64> {
     Ok(size)
 }
 
-type DiskCandidate = (SystemTime, String, u64);
-
-fn disk_usage(root: &Path) -> Result<(u64, Vec<DiskCandidate>)> {
+fn disk_usage(root: &Path) -> Result<(u64, Vec<(SystemTime, String, u64)>)> {
     let total = directory_size(root)?;
     let mut candidates = Vec::new();
     for entry in std::fs::read_dir(root.join("playback"))? {
@@ -667,6 +727,45 @@ fn disk_usage(root: &Path) -> Result<(u64, Vec<DiskCandidate>)> {
 // ========================================================================== //
 // ========================================================================== //
 // ========================================================================== //
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn media_info() -> MediaInfo {
+        MediaInfo {
+            duration: 1.0,
+            start_time: 0.0,
+            video_tracks: Vec::new(),
+            audio_tracks: Vec::new(),
+            subtitle_tracks: Vec::new(),
+            attachments: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn metadata_pruning_expires_old_entries_and_caps_capacity() {
+        let now = SystemTime::now();
+        let mut entries = HashMap::new();
+        entries.insert("expired".to_string(), MetadataEntry {
+            info: media_info(),
+            last_access: now - Duration::from_secs(3601),
+        });
+        for index in 0..1001 {
+            entries.insert(format!("item-{index}"), MetadataEntry {
+                info: media_info(),
+                last_access: now - Duration::from_secs(index),
+            });
+        }
+
+        prune_metadata(&mut entries, now);
+
+        assert_eq!(entries.len(), 1000);
+        assert!(!entries.contains_key("expired"));
+        assert!(!entries.contains_key("item-1000"));
+    }
+}
+
 
 // #[cfg(test)]
 // mod tests {
