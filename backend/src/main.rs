@@ -1,3 +1,5 @@
+
+// backend/src/main.rs
 //! 启动 Web 服务并组装应用依赖.
 
 use std::{net::SocketAddr, path::Path, sync::Arc};
@@ -12,7 +14,7 @@ use tower_http::{services::ServeDir, trace::TraceLayer};
 mod api;
 mod config;
 mod db;
-mod video;
+mod process;
 mod cache;
 mod utils;
 mod constants;
@@ -22,7 +24,8 @@ mod sessions;
 
 use config::AppConfig;
 use cache::CacheManager;
-use video::{SessionManager, Processes};
+use process::ProcessManager;
+use sessions::SessionManager;
 
 use tokio::time::{sleep, Duration};
 use tracing::{info, warn};
@@ -38,6 +41,8 @@ struct AppState {
 
     session_manager: SessionManager, // 播放会话管理
     cache_manager: CacheManager, // 媒体元数据和播放缓存
+    #[allow(dead_code)] // 预留给 API 读取 ProcessUsage 资源快照
+    process_manager: ProcessManager, // 媒体子进程与执行资源管理
 }
 
 
@@ -71,7 +76,7 @@ async fn main() -> Result<()> {
 
 
     // 探测, 资源准备, 编码和解码校验共用进程预算, 防止不同模块各自突破全局上限.
-    let processes = Processes::new(config.playback.max_processes, config.playback.max_total_ffmpeg_threads);
+    let processes = ProcessManager::new(config.playback.max_processes, config.playback.max_total_ffmpeg_threads);
     let database = db::initialize_database().await?;
     let cache = CacheManager::new(constants::CACHE_DIR.into(), config.playback.clone(), database.clone(), processes.clone()).await?;
 
@@ -84,6 +89,7 @@ async fn main() -> Result<()> {
         config: Arc::new(config),
         session_manager: playback.clone(),
         cache_manager: cache.clone(),
+        process_manager: processes.clone(),
         scan_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
 

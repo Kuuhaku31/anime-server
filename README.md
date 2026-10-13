@@ -57,17 +57,21 @@ anime-server/
 |   |   |-- main.rs
 |   |   |-- api.rs           # 业务路由及 api/ 子模块
 |   |   |-- db.rs            # db/ 子模块
-|   |   |-- tasks.rs         # tasks/ 子模块
-|   |   |-- video.rs         # video/ 子模块
-|   |   |-- cache.rs         # 元数据和活动播放缓存管理入口
+|   |   |-- scanner.rs       # 媒体目录扫描与索引同步
 |   |   |-- sessions.rs      # 播放会话与共享缓存租约
+|   |   |-- cache.rs         # 元数据和活动播放缓存管理入口
+|   |   |-- process.rs       # ProcessManager 及 process/ 子模块
 |   |   |-- api/
 |   |   |-- db/
-|   |   |-- tasks/
 |   |   |-- cache/
 |   |   |   |-- metadata.rs  # 媒体探测, 成功结果缓存及过期策略
-|   |   |   `-- disk.rs      # 磁盘占用统计及 LRU 访问时间持久化
-|   |   `-- video/           # 编码, 临时字幕字体, 分片校验及进程预算
+|   |   |   |-- disk.rs      # 磁盘占用统计及 LRU 访问时间持久化
+|   |   |   `-- tests.rs     # 缓存测试
+|   |   `-- process/
+|   |       |-- ffmpeg.rs    # FFmpeg 命令, HLS 读写, 恢复及解码校验
+|   |       |-- assets.rs    # 临时字幕与字体资源
+|   |       |-- fragment.rs  # fMP4 分片校验与时间轴归一化
+|   |       `-- models.rs    # EncodeSpec 等媒体执行参数
 |   |-- sql/init.sql
 |   `-- tests/
 |-- frontend/
@@ -157,6 +161,7 @@ Compose 为正常关闭预留 40 秒, 覆盖 30 秒分片停止期限和清理�
 | 文档                                       | 内容                                             |
 | ------------------------------------------ | ------------------------------------------------ |
 | [development.md](documents/development.md) | 开发, 调试, 编译, 部署, 验证和故障排查 |
+| [architecture.md](documents/architecture.md) | 六个核心后端模块的职责与调用关系 |
 | [api.md](documents/api.md)                 | 全部 HTTP API, 请求响应示例和错误码 |
 | [database.md](documents/database.md)       | 数据库结构, 文件标识和进度持久化                 |
 | [playback-cache.md](plan/playback-cache.md) | 活动缓存, 顺序续接和线程分配约定                 |

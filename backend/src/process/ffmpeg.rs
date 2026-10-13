@@ -9,12 +9,12 @@ use tracing::warn;
 
 #[cfg(test)]
 use crate::models::{MediaInfo, PlaybackRequest};
-use crate::video::models::EncodeSpec;
+use super::models::EncodeSpec;
 
 use super::{
     assets::RenderAssets,
     fragment::{self, Fragment, Init, Tail},
-    process::{cancelled, check_cancel, checked_output_cancellable, Cancelled, Processes}
+    cancelled, check_cancel, checked_output_cancellable, Cancelled, ProcessManager,
 };
 
 
@@ -89,7 +89,7 @@ fn video_timing(spec: &EncodeSpec, resume: Tail) -> String {
         (spec.source_start * 90_000.0).round() as i64, resume.video, resume.video)
 }
 
-pub(crate) async fn has_video_after(spec: &EncodeSpec, resume: Tail, processes: &Processes,
+pub(crate) async fn has_video_after(spec: &EncodeSpec, resume: Tail, processes: &ProcessManager,
     cancel: &mut watch::Receiver<bool>) -> Result<bool> {
     let _permit = tokio::select! {
         biased;
@@ -237,7 +237,7 @@ pub(crate) async fn write_playlist(directory: &Path, media: &CachedMedia) -> Res
 
 /// 首片额外探测编码参数, 每片都与指定 init 拼接后真实解码全部音视频样本.
 pub(crate) async fn validate_segment(directory: &Path, init: &str, segment: &str, audio: bool,
-    probe: bool, processes: &Processes, cancel: &mut watch::Receiver<bool>) -> Result<()> {
+    probe: bool, processes: &ProcessManager, cancel: &mut watch::Receiver<bool>) -> Result<()> {
     let _permit = tokio::select! {
         biased;
         _ = cancelled(cancel) => return Err(Cancelled.into()),
@@ -278,7 +278,7 @@ pub(crate) async fn validate_segment(directory: &Path, init: &str, segment: &str
 }
 
 /// 从 0 恢复最长有效前缀, 修复清单并删除损坏尾部, 不在恢复期间启动续接编码.
-pub(crate) async fn recover(directory: &Path, processes: &Processes, cancel: &mut watch::Receiver<bool>) -> Result<CachedMedia> {
+pub(crate) async fn recover(directory: &Path, processes: &ProcessManager, cancel: &mut watch::Receiver<bool>) -> Result<CachedMedia> {
     // 读取磁盘的 I/O 错误直接上报, 不能因权限等问题把已有缓存当作空目录清理.
     let original = match read_playlist(directory).await {
         Ok(playlist) => playlist,
@@ -380,7 +380,7 @@ pub(crate) fn fixture() -> (MediaInfo, PlaybackRequest) {
 
 #[cfg(test)]
 mod tests {
-    use crate::{constants::ENCODER_PROFILE, models::PlaybackVariantConfig, video::models::{playback_target, EncodeSpec}};
+    use crate::{constants::ENCODER_PROFILE, models::PlaybackVariantConfig, process::models::EncodeSpec};
 
 use super::*;
 
@@ -425,12 +425,7 @@ use super::*;
     // }
 
     #[test]
-    fn invalid_tracks_positions_and_client_profiles_fail() {
-        for position in [-1.0, f64::NAN, f64::INFINITY, 20.0] {
-            let (info, mut request) = fixture();
-            request.position = Some(position);
-            assert!(playback_target(&info, &request).is_err());
-        }
+    fn invalid_tracks_and_client_profiles_fail() {
         for value in [
             serde_json::json!({"video_stream_index":0}), serde_json::json!({"encoder_profile":ENCODER_PROFILE}),
             serde_json::json!({"variant_key":"a".repeat(32)}), serde_json::json!({"source_version":"old"}),

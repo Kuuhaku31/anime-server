@@ -1,8 +1,9 @@
-//! 管理媒体子进程的限流和生命周期.
+//! 统一管理媒体子进程、资源限流与执行流水线.
 
 use std::{process::Stdio, sync::Arc, time::Duration};
 
 use anyhow::{bail, Context, Result};
+use serde::Serialize;
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
     process::Command,
@@ -10,6 +11,41 @@ use tokio::{
     time::timeout,
 };
 use tracing::info;
+
+pub(crate) mod assets;
+pub(crate) mod ffmpeg;
+pub(crate) mod fragment;
+pub(crate) mod models;
+
+pub(crate) use assets::{clean_startup, RenderAssets};
+pub(crate) use ffmpeg::{
+    atomic_file, command, has_video_after, media_filename, read_playlist, recover,
+    regular_bytes, segment_name, sync_directory, validate_segment, write_playlist, CachedMedia,
+};
+#[cfg(test)]
+pub(crate) use ffmpeg::fixture;
+pub(crate) use fragment::{normalize, Init, Tail};
+pub(crate) use models::EncodeSpec;
+
+/// 进程或线程资源的使用快照.
+// 预留给 API 资源监视, 当前尚未开放 HTTP 路由.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct ResourceUsage {
+    pub(crate) total: usize,
+    pub(crate) used: usize,
+    pub(crate) available: usize,
+}
+
+/// 媒体子进程, 编码器与线程预算的使用情况快照.
+// 预留给 API 资源监视, 当前尚未开放 HTTP 路由.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct ProcessUsage {
+    pub(crate) process_slots: ResourceUsage,
+    pub(crate) encoder_slots: ResourceUsage,
+    pub(crate) thread_permits: ResourceUsage,
+}
 
 // 正常停止有独立错误类型, 不能顺带吞掉同一时刻发生的磁盘或清理错误.
 #[derive(Debug)]
@@ -23,29 +59,70 @@ impl std::fmt::Display for Cancelled {
 
 impl std::error::Error for Cancelled {}
 
+/// 检查取消信号, 并在已收到取消时返回 Cancelled 错误.
 pub(crate) fn check_cancel(cancel: &watch::Receiver<bool>) -> Result<()> {
     if *cancel.borrow() { return Err(Cancelled.into()); }
     Ok(())
 }
 
+/// 发送端消失也视为取消, 避免所有者退出后子任务永久等待.
+pub(crate) async fn cancelled(receiver: &mut watch::Receiver<bool>) {
+    while !*receiver.borrow_and_update() {
+        if receiver.changed().await.is_err() { break; }
+    }
+}
 
-/// 媒体任务的共享资源限流器, 用来控制 FFmpeg 和 ffprobe 的并发量,
-/// 防止多个播放配置同时生成缓存时耗尽资源.
-/// 它不是操作系统进程列表, 也不直接管理所有子进程句柄.
+/// 媒体任务的共享资源管理器, 用来控制 FFmpeg 和 ffprobe 的并发量与资源预算.
 #[derive(Clone)]
-pub(crate) struct Processes {
+pub(crate) struct ProcessManager {
     pub(crate) slots: Arc<Semaphore>, // 媒体子进程总数
     pub(crate) encoders: Arc<Semaphore>, // 并行编码任务数, 不能用线程许可替代进程名额
     threads: Arc<Semaphore>, // 编码线程预算, 不能用进程名额替代线程许可
+    #[allow(dead_code)] // 仅供 usage 快照计算总量
+    total_slots: usize,
+    #[allow(dead_code)]
+    total_encoders: usize,
+    #[allow(dead_code)]
+    total_threads: usize,
 }
 
-impl Processes {
+impl ProcessManager {
     pub(crate) fn new(total: usize, thread_budget: usize) -> Self {
+        let total_encoders = total.saturating_sub(1);
         Self {
             slots: Arc::new(Semaphore::new(total)),
             // 至少空出一个媒体名额, 避免编码进程全部等待各自的解码校验.
-            encoders: Arc::new(Semaphore::new(total.saturating_sub(1))),
+            encoders: Arc::new(Semaphore::new(total_encoders)),
             threads: Arc::new(Semaphore::new(thread_budget)),
+            total_slots: total,
+            total_encoders,
+            total_threads: thread_budget,
+        }
+    }
+
+    /// 获取只读使用量快照.
+    // 预留给 API 资源监视, 当前尚未开放 HTTP 路由.
+    #[allow(dead_code)]
+    pub(crate) fn usage(&self) -> ProcessUsage {
+        let available_slots = self.slots.available_permits();
+        let available_encoders = self.encoders.available_permits();
+        let available_threads = self.threads.available_permits();
+        ProcessUsage {
+            process_slots: ResourceUsage {
+                total: self.total_slots,
+                used: self.total_slots.saturating_sub(available_slots),
+                available: available_slots,
+            },
+            encoder_slots: ResourceUsage {
+                total: self.total_encoders,
+                used: self.total_encoders.saturating_sub(available_encoders),
+                available: available_encoders,
+            },
+            thread_permits: ResourceUsage {
+                total: self.total_threads,
+                used: self.total_threads.saturating_sub(available_threads),
+                available: available_threads,
+            },
         }
     }
 
@@ -94,7 +171,6 @@ pub(crate) async fn checked_output(command: &mut Command, seconds: u64) -> Resul
     }
 }
 
-
 /// 通用的异步子进程执行器, 用它运行 ffmpeg, ffprobe 等命令.
 /// 等待命令结束, 负责限时等待, 处理取消信号, 收集输出和诊断信息, 并在退出前回收子进程.
 pub(super) async fn checked_output_cancellable(
@@ -138,13 +214,6 @@ pub(super) async fn checked_output_cancellable(
     Ok(output)
 }
 
-/// 发送端消失也视为取消, 避免所有者退出后子任务永久等待.
-pub(crate) async fn cancelled(receiver: &mut watch::Receiver<bool>) {
-    while !*receiver.borrow_and_update() {
-        if receiver.changed().await.is_err() { break; }
-    }
-}
-
 /// 持续排空 stderr 但只保留末尾诊断, 防止长时间转码累积无界日志内存.
 pub(crate) async fn read_tail(mut reader: impl AsyncRead + Unpin) -> Result<String> {
     let mut tail = Vec::new();
@@ -178,18 +247,27 @@ mod tests {
     #[tokio::test]
     async fn weighted_threads_start_at_base_and_return_every_permit() {
         // 多个任务不能因分别占有半份基础预算而互相等待.
-        let processes = Processes::new(3, 10);
+        let manager = ProcessManager::new(3, 10);
         let (_sender, mut cancel) = watch::channel(false);
-        let fast = processes.encoding_threads(2, 8, &mut cancel).await.unwrap();
+        let fast = manager.encoding_threads(2, 8, &mut cancel).await.unwrap();
         assert_eq!(fast.num_permits(), 8);
-        let base = processes.encoding_threads(2, 8, &mut cancel).await.unwrap();
+        let base = manager.encoding_threads(2, 8, &mut cancel).await.unwrap();
         assert_eq!(base.num_permits(), 2);
         let (stop, mut cancelled_waiter) = watch::channel(false);
         stop.send_replace(true);
-        assert!(processes.encoding_threads(2, 8, &mut cancelled_waiter).await.is_err());
+        assert!(manager.encoding_threads(2, 8, &mut cancelled_waiter).await.is_err());
         drop(fast);
         drop(base);
-        assert_eq!(processes.threads.available_permits(), 10);
-        assert_eq!(processes.encoders.available_permits(), 2);
+        assert_eq!(manager.threads.available_permits(), 10);
+        assert_eq!(manager.encoders.available_permits(), 2);
+    }
+
+    #[test]
+    fn process_usage_snapshot_reflects_current_permits() {
+        let manager = ProcessManager::new(4, 16);
+        let usage = manager.usage();
+        assert_eq!(usage.process_slots, ResourceUsage { total: 4, used: 0, available: 4 });
+        assert_eq!(usage.encoder_slots, ResourceUsage { total: 3, used: 0, available: 3 });
+        assert_eq!(usage.thread_permits, ResourceUsage { total: 16, used: 0, available: 16 });
     }
 }

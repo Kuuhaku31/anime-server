@@ -11,32 +11,41 @@
 | 部署     | 单个 Docker 容器, Docker Compose       |
 
 根目录 `Cargo.toml` 定义 workspace, `backend/Cargo.toml` 定义后端 crate.
-后端入口是 `backend/src/main.rs`. `api.rs`, `db.rs`, `tasks.rs`, `video.rs`, `cache.rs`
+后端入口是 `backend/src/main.rs`. `api.rs`, `db.rs`, `cache.rs`, `process.rs`
 声明各自同名目录下的子模块, 不使用 `mod.rs`.
 数据库初始化文件是 `backend/sql/init.sql`.
+六个核心模块 (API, Scanner, DB, SessionManager, CacheManager, Process) 的职责和调用白名单
+见 [architecture.md](architecture.md).
 
-Rust 类型, 字段, 函数和模块默认私有. 仅供 `video` 内部共享的接口使用
+Rust 类型, 字段, 函数和模块默认私有. 仅供父模块内部共享的接口使用
 `pub(super)`, 必须跨模块使用的接口最高为 `pub(crate)`, 不使用无限制的 `pub`.
 Serde 序列化和反序列化不依赖字段公开, 不为接口响应字段额外扩大可见性.
+源文件中 crate 内可见的类型和方法写在前面, 私有辅助函数写在后面.
 
-`video.rs` 是媒体执行模块的统一接口入口, 通过重导出提供执行参数,
-分片生成与校验, 进程预算, 会话响应及管理器. 外部代码只使用 `crate::video::{...}`, 不导入其私有子模块.
-类型和方法实现保留在子模块中, `video.rs` 的注释集中说明调用链及接口职责.
+`process.rs` 是媒体进程模块入口, 提供 ProcessManager 并统一管理 FFmpeg/ffprobe 调用,
+子进程许可, 编码线程预算, 取消, 超时和子进程回收. 私有子模块 `process/ffmpeg.rs`
+负责命令构造, HLS 读写, 缓存媒体恢复和解码校验; `process/assets.rs` 管理临时字幕和字体;
+`process/fragment.rs` 校验 fMP4 分片并归一化时间轴; `process/models.rs` 保存 EncodeSpec.
+外部代码只使用 `crate::process::{...}` 的重导出接口, 不导入其私有子模块.
+`ProcessManager::usage` 返回 process slots, encoder slots 和 thread permits 的只读快照,
+预留给 API 资源监视, 当前不提供 HTTP 路由.
 随机名称和媒体样本辅助接口仅在测试构建中重导出.
 
 `cache.rs` 是 crate 层的缓存入口, 提供 CacheManager 和 CacheSnapshot.
 活动缓存共享, 生成生命周期和淘汰编排由入口管理. 私有 `cache/metadata.rs`
 负责 ffprobe 探测, 成功元数据缓存及过期清理; 私有 `cache/disk.rs`
-负责磁盘占用统计和目录访问时间持久化. CacheManager 通过 `crate::video`
-调用媒体执行能力, 不暴露或依赖 video 私有子模块路径.
-`sessions.rs` 保留在 crate 层, 直接使用 `crate::cache` 管理共享缓存租约.
-video 下的编码, 资源, 分片, 进程和执行参数文件保持原位.
-`cache.rs` 将 crate 内可见类型和方法放在前面, 私有生成流程, 状态类型及工具定义放在后面.
-入口文件中的缓存测试集中到私有 `cache/tests.rs`, 仅在测试构建时加载,
-保留原有测试的注释禁用状态. 元数据子模块的内部测试仍就近维护.
+负责磁盘占用统计和目录访问时间持久化. CacheManager 通过 `crate::process`
+调用媒体执行能力, 并使用自己的 JoinSet 管理 load/generate Tokio worker.
+ProcessManager 只管理外部媒体进程, 两类 worker 生命周期不合并.
+入口文件中的缓存测试集中到私有 `cache/tests.rs`, 仅在测试构建时加载.
+元数据子模块的内部测试仍就近维护.
 
-播放请求 `PlaybackRequest` 和创建响应 `PlaybackStart` 定义在 `models.rs`,
-由 `video.rs` 保留重导出入口. 请求选轨的缺省/null 区分及响应 flatten 结构不变.
+`sessions.rs` 保留在 crate 层, 提供 SessionManager 和 SessionStatus,
+负责播放目标位置计算, 心跳和共享缓存租约. SessionManager 不持有 CacheManager,
+由 API 显式传入 `&CacheManager`.
+
+播放请求 `PlaybackRequest` 和创建响应 `PlaybackStart` 定义在 `models.rs`.
+请求选轨的缺省/null 区分及响应 flatten 结构不变.
 
 前端入口是 `frontend/src/main.ts`, 构建结果位于 `frontend/dist/`.
 后端从容器内 `/app/web` 提供静态文件, 前后端使用同源 HTTP 接口通信.
@@ -294,7 +303,7 @@ API 的 streams 和 probe 路由直接向 CacheManager 请求详细 `MediaInfo`;
 创建播放时 API 将 `&CacheManager`, file ID 和合并数据库偏好/观看进度后的 `PlaybackRequest`
 显式传给 `SessionManager::create`. SessionManager 按文件 MD5 查询 MediaInfo,
 构造不可变的 `PlaybackVariantConfig` 并计算 variant-key.
-创建、状态、心跳、目标位置、资源读取和释放等协调方法都显式接收 CacheManager,
+创建, 状态, 心跳, 目标位置, 资源读取和释放等协调方法都显式接收 CacheManager,
 由 SessionManager 管理会话并按 position 决定线程数, 再调用 CacheManager 操作缓存.
 CacheManager 接收配置, 自行查询源路径并组装编码参数, 活动缓存 Map 仅在相应 variant
 被请求时创建条目. API 负责业务偏好和进度; 两个 Manager 的实例由 main 组装和关闭.

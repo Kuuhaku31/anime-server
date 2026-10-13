@@ -7,7 +7,7 @@ use serde::Deserialize;
 use tokio::process::Command;
 
 use crate::{constants, models::{Attachment, MediaInfo, Track}};
-use crate::video::Processes;
+use crate::process::ProcessManager;
 use crate::db;
 use super::CacheManager;
 
@@ -86,7 +86,7 @@ impl CacheManager {
 
 
 /// 解析媒体文件并归一化 ffprobe 结果.
-async fn probe(path: &Path, processes: &Processes) -> Result<MediaInfo> {
+async fn probe(path: &Path, processes: &ProcessManager) -> Result<MediaInfo> {
 
         #[derive(Deserialize)]
         struct Probe {

@@ -15,7 +15,7 @@ use tower_http::services::ServeFile;
 use tracing::warn;
 
 use crate::{
-    AppState, db, models::{self, MediaInfo}, video,
+    AppState, db, models::{self, MediaInfo}, sessions::SessionStatus,
 };
 
 
@@ -142,7 +142,7 @@ async fn target(
     State(s) : State<AppState>,
     Path (session_id) : Path<String>,
     input    : Result<Json<TargetRequest>, JsonRejection>
-) -> Result<Json<video::SessionStatus>, ApiError>
+) -> Result<Json<SessionStatus>, ApiError>
 {
 
     let session     = s.session_manager;
@@ -164,7 +164,7 @@ async fn target(
 
 /// 获取播放会话状态.
 async fn status(State(s): State<AppState>, Path(session_id): Path<String>)
-    -> Result<Json<video::SessionStatus>, ApiError>
+    -> Result<Json<SessionStatus>, ApiError>
 {
     let session = s.session_manager;
     let cache   = s.cache_manager;

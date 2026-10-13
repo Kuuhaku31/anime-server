@@ -1,7 +1,7 @@
 //! 集中保存缓存状态, 生命周期及磁盘淘汰测试, 保持原有注释禁用状态.
 
 use super::{CacheFolder, CacheManager, CachePhase, CachedMedia, FolderPhase, FolderState};
-use crate::{config::PlaybackConfig, models::PlaybackVariantConfig, video::{self, EncodeSpec, Processes}};
+use crate::{config::PlaybackConfig, models::PlaybackVariantConfig, process::{self, EncodeSpec, ProcessManager}};
 use std::{path::PathBuf, sync::Arc, time::{Duration, SystemTime}};
 use tokio::sync::{Mutex, Notify};
 
@@ -15,7 +15,7 @@ fn state() -> FolderState {
 }
 
 fn folder() -> CacheFolder {
-    let (info, request) = video::fixture();
+    let (info, request) = process::fixture();
     let config = PlaybackVariantConfig::new(&"a".repeat(32), &info, &request).unwrap();
     CacheFolder {
         variant_key: config.variant_key().to_owned(),
@@ -110,7 +110,7 @@ async fn acquire_reports_concurrent_activation_without_replacing_folder() {
     sqlx::query("INSERT INTO file_path (path, pre16mib_md5) VALUES ('/media/test.mkv', ?)")
         .bind(file_id).execute(&manager.inner.database).await.unwrap();
     let mut metadata = manager.inner.metadata.lock().await;
-    metadata.insert(file_id.to_owned(), super::metadata::test_entry(video::fixture().0));
+    metadata.insert(file_id.to_owned(), super::metadata::test_entry(process::fixture().0));
     let acquiring = manager.acquire(&config);
     tokio::pin!(acquiring);
     // 锁住元数据使 acquire 必然停在初次 Map 未命中之后, 无需调度时序猜测.
@@ -133,7 +133,7 @@ async fn manager_fixture() -> (CacheManager, PathBuf) {
     let database = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1)
         .connect("sqlite::memory:").await.unwrap();
     let manager = CacheManager::new(
-        root.clone(), PlaybackConfig::default(), database, Processes::new(2, 16),
+        root.clone(), PlaybackConfig::default(), database, ProcessManager::new(2, 16),
     ).await.unwrap();
     (manager, root)
 }
@@ -183,7 +183,7 @@ async fn manager_fixture() -> (CacheManager, PathBuf) {
 //     let root = std::env::temp_dir().join(format!("anime-state-snapshot-{}", utils::random_id().unwrap()));
 //     tokio::fs::create_dir(&root).await.unwrap();
 //     let database = sqlx::sqlite::SqlitePoolOptions::new().connect("sqlite::memory:").await.unwrap();
-//     let manager = CacheManager::new(root.clone(), PlaybackConfig::default(), database, Processes::new(2, 16)).await.unwrap();
+//     let manager = CacheManager::new(root.clone(), PlaybackConfig::default(), database, ProcessManager::new(2, 16)).await.unwrap();
 //     let folder = Arc::new(folder());
 //     let variant_key = folder.variant_key.clone();
 //     manager.inner.entries.lock().await.insert(variant_key.clone(), folder);
@@ -198,7 +198,7 @@ async fn manager_fixture() -> (CacheManager, PathBuf) {
 
 // // 构造已恢复的缓存文件夹, 不启动媒体进程或访问真实视频.
 // fn folder() -> CacheFolder {
-//     let (info, request) = video::fixture();
+//     let (info, request) = process::fixture();
 //     let config = PlaybackVariantConfig::new(&"a".repeat(32), &info, &request).unwrap();
 //     CacheFolder {
 //         variant_key: config.variant_key().to_owned(),
@@ -207,7 +207,7 @@ async fn manager_fixture() -> (CacheManager, PathBuf) {
 //         state: Mutex::new(FolderState {
 //             media: CachedMedia {
 //                 complete: true, init: None,
-//                 segments: vec![video::Fragment {
+//                 segments: vec![process::fragment::Fragment {
 //                     start: Tail::default(), end: Tail { video: 360000, audio: 192000 }, sequence: 1,
 //                 }],
 //             },
@@ -224,7 +224,7 @@ async fn manager_fixture() -> (CacheManager, PathBuf) {
 // #[cfg(test)]
 // mod tests {
 //     use super::*;
-//     use crate::video::models::PlaybackVariantConfig;
+//     use crate::models::PlaybackVariantConfig;
 //
 //     #[test]
 //     fn configuration_serialization_is_canonical_and_excludes_runtime_fields() {
@@ -253,7 +253,7 @@ async fn manager_fixture() -> (CacheManager, PathBuf) {
 //         // 测试负责创建缓存挂载目录, 管理器要求根目录已经存在.
 //         tokio::fs::create_dir(&root).await.unwrap();
 //         let config = PlaybackConfig { cache_max_bytes: 80, ..PlaybackConfig::default() };
-//         let manager = CacheManager::new(root.clone(), config, Processes::new(2, 16)).await.unwrap();
+//         let manager = CacheManager::new(root.clone(), config, ProcessManager::new(2, 16)).await.unwrap();
 //         for (name, age) in [('a', 1), ('b', 2)] {
 //             let directory = root.join("playback").join(name.to_string().repeat(32));
 //             tokio::fs::create_dir(&directory).await.unwrap();
@@ -265,7 +265,7 @@ async fn manager_fixture() -> (CacheManager, PathBuf) {
 //         manager.maintain().await.unwrap();
 //         assert!(!root.join("playback").join("a".repeat(32)).exists());
 //         assert!(root.join("playback").join("b".repeat(32)).exists());
-//         assert!(CacheManager::new(root.clone(), PlaybackConfig::default(), Processes::new(2, 16)).await.is_err());
+//         assert!(CacheManager::new(root.clone(), PlaybackConfig::default(), ProcessManager::new(2, 16)).await.is_err());
 //         manager.shutdown().await.unwrap();
 //         tokio::fs::remove_dir_all(root).await.unwrap();
 //     }
@@ -278,7 +278,7 @@ async fn manager_fixture() -> (CacheManager, PathBuf) {
 //         // 测试负责创建缓存挂载目录, 管理器要求根目录已经存在.
 //         tokio::fs::create_dir(&root).await.unwrap();
 //         let config = PlaybackConfig { cache_max_bytes: 1, ..PlaybackConfig::default() };
-//         let manager = CacheManager::new(root.clone(), config, Processes::new(2, 16)).await.unwrap();
+//         let manager = CacheManager::new(root.clone(), config, ProcessManager::new(2, 16)).await.unwrap();
 //         let (info, request) = ffmpeg::fixture();
 //         let spec = EncodeSpec::new(&"a".repeat(32), "video.mkv".into(), info, request, None).unwrap();
 //         let variant_key = spec.config.variant_key();
@@ -326,7 +326,7 @@ async fn manager_fixture() -> (CacheManager, PathBuf) {
 //         let root = std::env::temp_dir().join(format!("anime-reactivate-{}", random_id().unwrap()));
 //         // 测试负责创建缓存挂载目录, 管理器要求根目录已经存在.
 //         tokio::fs::create_dir(&root).await.unwrap();
-//         let processes = Processes::new(2, 16);
+//         let processes = ProcessManager::new(2, 16);
 //         let held = processes.slots.acquire_many(2).await.unwrap();
 //         let manager = CacheManager::new(root.clone(), PlaybackConfig::default(), processes.clone()).await.unwrap();
 //         let (info, request) = ffmpeg::fixture();
@@ -373,7 +373,7 @@ async fn manager_fixture() -> (CacheManager, PathBuf) {
 //         let root = std::env::temp_dir().join(format!("anime-activation-failure-{}", random_id().unwrap()));
 //         // 测试负责创建缓存挂载目录, 管理器要求根目录已经存在.
 //         tokio::fs::create_dir(&root).await.unwrap();
-//         let manager = CacheManager::new(root.clone(), PlaybackConfig::default(), Processes::new(2, 16)).await.unwrap();
+//         let manager = CacheManager::new(root.clone(), PlaybackConfig::default(), ProcessManager::new(2, 16)).await.unwrap();
 //         let playback = root.join("playback");
 //         tokio::fs::remove_dir(&playback).await.unwrap();
 //         tokio::fs::write(&playback, b"not a directory").await.unwrap();
@@ -395,7 +395,7 @@ async fn manager_fixture() -> (CacheManager, PathBuf) {
 //         let root = std::env::temp_dir().join(format!("anime-publication-{}", random_id().unwrap()));
 //         // 测试负责创建缓存挂载目录, 管理器要求根目录已经存在.
 //         tokio::fs::create_dir(&root).await.unwrap();
-//         let processes = Processes::new(2, 16);
+//         let processes = ProcessManager::new(2, 16);
 //         let held = processes.slots.acquire_many(2).await.unwrap();
 //         let manager = CacheManager::new(root.clone(), PlaybackConfig::default(), processes.clone()).await.unwrap();
 //         let (info, request) = ffmpeg::fixture();

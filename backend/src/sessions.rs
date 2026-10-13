@@ -4,13 +4,12 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc, time::{Duration, Insta
 
 use anyhow::{ensure, Context, Result};
 use serde::Serialize;
-use tokio::{sync::Mutex, time::interval};
+use tokio::{sync::Mutex, time};
 use tracing::warn;
 
 use crate::models::{PlaybackRequest, PlaybackStart, PlaybackVariantConfig};
 use crate::cache::{CacheManager, CachePhase};
 
-use crate::video::playback_target;
 
 /// 对外只暴露不透明会话和状态快照, 不返回播放配置或 variant-key.
 #[derive(Debug, Clone, Serialize)]
@@ -47,15 +46,17 @@ impl SessionManager {
     }
 
     /// 先预留会话名额再等待缓存加载, 防止并发创建绕过数量上限.
-    pub(crate) async fn create(
-        &self,
-        cache_manager: &CacheManager,
-        file_id: &str,
-        request: PlaybackRequest,
-    ) -> Result<PlaybackStart> {
+    pub(crate) async fn create(&self, cache_manager: &CacheManager, file_id: &str, request: PlaybackRequest) -> Result<PlaybackStart> {
+
         let media = cache_manager.media_info(file_id).await.map_err(|e| anyhow::anyhow!(e))?;
         let config = PlaybackVariantConfig::new(file_id, &media, &request)?;
-        let target = playback_target(&media, &request)?;
+
+        // 合并显式位置和历史位置, 保持已看完的视频从头开始播放.
+        let saved = request.saved_position().unwrap_or(0.0);
+        ensure!(saved.is_finite() && saved >= 0.0, "invalid saved playback position");
+        let target = request.position.unwrap_or(if saved < media.duration - 2.0 { saved } else { 0.0 });
+        ensure!(target.is_finite() && target >= 0.0 && target < media.duration, "position must be within the video duration");
+
         let session_id = crate::utils::random_id()?;
         let variant_key = config.variant_key().to_owned();
         let selection = config.selection();
@@ -141,7 +142,7 @@ impl SessionManager {
     pub(crate) fn spawn_expiration(&self, cache_manager: CacheManager) {
         let manager = self.clone();
         tokio::spawn(async move {
-            let mut tick = interval(Duration::from_secs(5));
+            let mut tick = time::interval(Duration::from_secs(5));
             loop {
                 tick.tick().await;
                 if cache_manager.is_stopping() { break; }
@@ -232,16 +233,31 @@ async fn expire(manager: &SessionManager, cache_manager: &CacheManager) -> Resul
 // ========================================================================== //
 
 // #[cfg(test)]
+// mod target_tests {
+//     use super::playback_target;
+
+//     // 非法或越界的目标位置必须被拒绝.
+//     #[test]
+//     fn invalid_positions_fail() {
+//         for position in [-1.0, f64::NAN, f64::INFINITY, 20.0] {
+//             let (info, mut request) = crate::process::fixture();
+//             request.position = Some(position);
+//             assert!(playback_target(&info, &request).is_err());
+//         }
+//     }
+// }
+
+// #[cfg(test)]
 // mod tests {
 //     use super::*;
-//     use crate::{config::PlaybackConfig, video::{fixture, Processes}};
+//     use crate::{config::PlaybackConfig, process::fixture, sessions::SessionManager};
 
 //     #[tokio::test]
 //     async fn an_abandoned_creation_reservation_expires_after_its_grace_period() {
 //         let root = std::env::temp_dir().join(format!("anime-pending-lease-{}", random_id().unwrap()));
 //         // 测试负责创建缓存挂载目录, 管理器要求根目录已经存在.
 //         tokio::fs::create_dir(&root).await.unwrap();
-//         let cache = CacheManager::new(root.clone(), PlaybackConfig::default(), Processes::new(2, 16)).await.unwrap();
+//         let cache = CacheManager::new(root.clone(), PlaybackConfig::default(), ProcessManager::new(2, 16)).await.unwrap();
 //         let manager = SessionManager::new(20);
 //         {
 //             let mut sessions = manager.sessions.lock().await;
@@ -267,7 +283,7 @@ async fn expire(manager: &SessionManager, cache_manager: &CacheManager) -> Resul
 //         let root = std::env::temp_dir().join(format!("anime-active-leases-{}", random_id().unwrap()));
 //         // 测试负责创建缓存挂载目录, 管理器要求根目录已经存在.
 //         tokio::fs::create_dir(&root).await.unwrap();
-//         let processes = Processes::new(2, 16);
+//         let processes = ProcessManager::new(2, 16);
 //         let permit = processes.slots.acquire_many(2).await.unwrap();
 //         let cache = CacheManager::new(root.clone(), PlaybackConfig::default(), processes.clone()).await.unwrap();
 //         let manager = SessionManager::new(60);

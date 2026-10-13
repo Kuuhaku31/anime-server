@@ -22,9 +22,9 @@ mod metadata;
 mod tests;
 
 use disk::{disk_usage, persist_used};
-use crate::video::{
-    self, CachedMedia, EncodeSpec, RenderAssets,
-    Init, Tail, cancelled, check_cancel, read_tail, Cancelled, Processes,
+use crate::process::{
+    self, cancelled, check_cancel, read_tail, Cancelled, CachedMedia, EncodeSpec,
+    Init, ProcessManager, RenderAssets, Tail,
 };
 use crate::models::PlaybackVariantConfig;
 
@@ -117,7 +117,7 @@ pub(crate) struct CacheManager {
 
 impl CacheManager {
 
-    pub(crate) async fn new(root: PathBuf, config: PlaybackConfig, database: SqlitePool, processes: Processes) -> Result<Self> {
+    pub(crate) async fn new(root: PathBuf, config: PlaybackConfig, database: SqlitePool, processes: ProcessManager) -> Result<Self> {
 
         info!("开始初始化缓存管理器, 检查配置和磁盘目录...");
 
@@ -137,7 +137,7 @@ impl CacheManager {
                 .with_context(|| format!("cache directory is not writable: {}", directory.display()))?;
             tokio::fs::remove_file(probe).await?;
         }
-        crate::video::clean_startup(&root).await?; // 清理上次异常退出遗留的临时字幕和字体目录, 避免占用磁盘空间和干扰新任务.
+        crate::process::clean_startup(&root).await?; // 清理上次异常退出遗留的临时字幕和字体目录, 避免占用磁盘空间和干扰新任务.
         info!("缓存管理器配置和磁盘目录检查通过, 开始恢复磁盘缓存和启动后台维护任务...");
 
         let (stop, _) = watch::channel(false);
@@ -339,7 +339,7 @@ impl CacheManager {
     /// 只开放正式清单中的已发布资源, 私有工作目录和未验证尾部不能被读取.
     pub(crate) async fn media_path(&self, variant_key: &str, asset_name: &str) -> Result<PathBuf> {
 
-        ensure!(video::media_filename(asset_name), "playback asset not found");
+        ensure!(process::media_filename(asset_name), "playback asset not found");
         let output = self.get(variant_key).await?;
         let mut state = output.state.lock().await;
         ensure!(!matches!(&state.phase, FolderPhase::Stopping { .. }), "playback cache is stopping");
@@ -469,7 +469,7 @@ impl CacheManager {
         self.inner.entries.lock().await.get(variant_key).cloned().context("playback cache is no longer active")
     }
 
-    async fn load(&self, processes: &Processes, output: &Arc<CacheFolder>) {
+    async fn load(&self, processes: &ProcessManager, output: &Arc<CacheFolder>) {
         let mut cancel = {
             let state = output.state.lock().await;
             let Some(cancel) = state.phase.cancel() else { return; };
@@ -502,7 +502,7 @@ impl CacheManager {
         output.changed.notify_waiters();
     }
 
-    async fn generate(&self, processes: &Processes, output: &Arc<CacheFolder>) {
+    async fn generate(&self, processes: &ProcessManager, output: &Arc<CacheFolder>) {
         let mut cancel = {
             let state = output.state.lock().await;
             let Some(cancel) = state.phase.cancel() else { return; };
@@ -541,26 +541,26 @@ impl CacheManager {
     }
 
     // 恢复并校验已有磁盘前缀, 返回可继续编码的媒体状态.
-    async fn recover(&self, processes: &Processes, output: &Arc<CacheFolder>, cancel: &mut watch::Receiver<bool>) -> Result<CachedMedia> {
+    async fn recover(&self, processes: &ProcessManager, output: &Arc<CacheFolder>, cancel: &mut watch::Receiver<bool>) -> Result<CachedMedia> {
         match tokio::fs::create_dir(&output.directory).await {
             Ok(()) => {},
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists =>
                 ensure!(tokio::fs::symlink_metadata(&output.directory).await?.is_dir(), "unsafe cache directory"),
             Err(error) => return Err(error.into()),
         }
-        let media = video::recover(&output.directory, processes, cancel).await?;
+        let media = process::recover(&output.directory, processes, cancel).await?;
         check_cancel(cancel)?;
         Ok(media)
     }
 
-    async fn run_generation(&self, processes: &Processes, output: &Arc<CacheFolder>, cancel: &mut watch::Receiver<bool>) -> Result<()> {
+    async fn run_generation(&self, processes: &ProcessManager, output: &Arc<CacheFolder>, cancel: &mut watch::Receiver<bool>) -> Result<()> {
         let (resume, complete) = {
             let state = output.state.lock().await;
             (state.media.tail(), state.media.complete)
         };
         if complete { return Ok(()); }
         check_cancel(cancel)?;
-        if resume.video > 0 && !video::has_video_after(&output.spec, resume, processes, cancel).await? {
+        if resume.video > 0 && !process::has_video_after(&output.spec, resume, processes, cancel).await? {
             return self.complete(output).await;
         }
         let directory = output.directory.join(format!(".work-{}", utils::random_id()?));
@@ -587,7 +587,7 @@ impl CacheManager {
         result
     }
 
-    async fn render(&self, processes: &Processes, output: &Arc<CacheFolder>, directory: &Path, assets: Option<&RenderAssets>,
+    async fn render(&self, processes: &ProcessManager, output: &Arc<CacheFolder>, directory: &Path, assets: Option<&RenderAssets>,
         resume: Tail, cancel: &mut watch::Receiver<bool>) -> Result<()> {
         let seconds = self.inner.config.startup_timeout_seconds;
         if let Some(assets) = assets {
@@ -617,7 +617,7 @@ impl CacheManager {
             let FolderPhase::Running { desired_threads, encoding_threads, .. } = &mut state.phase
                 else { bail!("cache generation is no longer running"); };
             processes.extend_encoding_threads(&mut threads, *desired_threads)?;
-            let child = video::command(&output.spec, directory, assets, resume, threads.num_permits())?
+            let child = process::command(&output.spec, directory, assets, resume, threads.num_permits())?
                 .spawn().context("failed to start FFmpeg")?;
             *encoding_threads = threads.num_permits();
             child
@@ -693,7 +693,7 @@ impl CacheManager {
     }
 
     // 顺序消费私有清单, 编码进程退出不代表待发布分片已全部处理完.
-    async fn monitor(&self, processes: &Processes, output: &CacheFolder, directory: &Path, resume: Tail,
+    async fn monitor(&self, processes: &ProcessManager, output: &CacheFolder, directory: &Path, resume: Tail,
         child: &mut Child, budget: &mut EncoderBudget, cancel: &mut watch::Receiver<bool>) -> Result<()> {
         let started = Instant::now();
         let mut published = 0;
@@ -702,7 +702,7 @@ impl CacheManager {
             self.check_worker(output, child, budget, started, published, cancel).await?;
             // 先确认进程退出再读最终清单, 不能拿校验前的旧快照误判缺少 ENDLIST.
             let finished = child.try_wait()?.is_some_and(|exit| exit.success());
-            let playlist = video::read_playlist(directory).await?;
+            let playlist = process::read_playlist(directory).await?;
             if let Some(playlist) = playlist {
                 if published < playlist.segments.len() {
                     let mut validation_cancel = cancel.clone();
@@ -736,38 +736,38 @@ impl CacheManager {
     }
 
     // 新分片必须通过 init 兼容, 时间轴和真实解码校验, 不能覆盖任何已发布字节.
-    async fn publish(&self, processes: &Processes, output: &CacheFolder, directory: &Path, source_name: &str, resume: Tail,
+    async fn publish(&self, processes: &ProcessManager, output: &CacheFolder, directory: &Path, source_name: &str, resume: Tail,
         first: bool, cancel: &mut watch::Receiver<bool>) -> Result<()> {
-        let init_bytes = video::regular_bytes(&directory.join("init.mp4"), 4 * 1024 * 1024).await?;
+        let init_bytes = process::regular_bytes(&directory.join("init.mp4"), 4 * 1024 * 1024).await?;
         let init = Init::parse(&init_bytes)?;
         ensure!(init.audio() == output.spec.config.audio_stream().is_some(), "unexpected generated audio track");
         let (expected, count) = {
             let mut state = output.state.lock().await;
             if let Some(existing) = &state.media.init { existing.compatible(&init)?; }
             else {
-                video::atomic_file(&output.directory, "init.mp4", &init_bytes).await?;
+                process::atomic_file(&output.directory, "init.mp4", &init_bytes).await?;
                 state.media.init = Some(init.clone());
             }
             (state.media.tail(), state.media.segments.len())
         };
         ensure!(count < 1_000_000, "too many cached HLS segments");
-        let data = video::regular_bytes(&directory.join(source_name), 256 * 1024 * 1024).await?;
-        let (data, fragment) = video::normalize(&data, &init, resume, expected, count as u32 + 1)?;
-        video::atomic_file(directory, "ready.m4s", &data).await?;
+        let data = process::regular_bytes(&directory.join(source_name), 256 * 1024 * 1024).await?;
+        let (data, fragment) = process::normalize(&data, &init, resume, expected, count as u32 + 1)?;
+        process::atomic_file(directory, "ready.m4s", &data).await?;
         // 与正式 init 联合解码, 不能只证明分片配合本次临时 init 能播放.
-        video::validate_segment(directory, "../init.mp4", "ready.m4s", init.audio(), first,
+        process::validate_segment(directory, "../init.mp4", "ready.m4s", init.audio(), first,
             processes, cancel).await?;
         let mut state = output.state.lock().await;
         check_cancel(cancel)?;
         let mut media = state.media.clone();
         media.segments.push(fragment);
         media.playlist()?;
-        let path = output.directory.join(video::segment_name(count));
+        let path = output.directory.join(process::segment_name(count));
         ensure!(!tokio::fs::try_exists(&path).await?, "refusing to overwrite a published cache segment");
         // 先落盘分片再替换清单, 最后推进内存末端, 不向客户端暴露尚不存在的 URI.
         tokio::fs::rename(directory.join("ready.m4s"), path).await?;
-        video::sync_directory(&output.directory).await?;
-        video::write_playlist(&output.directory, &media).await?;
+        process::sync_directory(&output.directory).await?;
+        process::write_playlist(&output.directory, &media).await?;
         state.media = media;
         // 已提交的原始临时分片不再占用双份空间, 正式分片今后只读.
         tokio::fs::remove_file(directory.join(source_name)).await?;
@@ -780,8 +780,8 @@ impl CacheManager {
         ensure!(!state.media.segments.is_empty(), "cannot complete an empty playback cache");
         let mut media = state.media.clone();
         media.complete = true;
-        video::write_playlist(&output.directory, &media).await?;
-        video::atomic_file(&output.directory, "complete", b"").await?;
+        process::write_playlist(&output.directory, &media).await?;
+        process::atomic_file(&output.directory, "complete", b"").await?;
         state.media = media;
         state.phase = FolderPhase::Complete;
         state.revision = REVISION.fetch_add(1, Ordering::Relaxed);
@@ -797,7 +797,7 @@ struct CacheInner {
     root: PathBuf,
     config: PlaybackConfig,
     database: SqlitePool,
-    processes: Processes,
+    processes: ProcessManager,
     metadata: Mutex<HashMap<String, MetadataEntry>>,
     // 同时访问集合和元素时先锁 entries 再锁 state, 创建与回收必须保持相同顺序.
     entries: Mutex<HashMap<String, Arc<CacheFolder>>>,
