@@ -26,12 +26,12 @@ export function jsonRequest<T>(url: string, body: unknown, method = "POST", sign
 }
 
 // 页面卸载时用 keepalive 尽力发送释放请求, 未送达的租约仍由服务端超时回收.
-export function releaseSession(id: string, keepalive = false): Promise<void> {
-  return request(`/api/playback/${id}`, { method: "DELETE", keepalive });
+export function releaseSession(sessionId: string, keepalive = false): Promise<void> {
+  return request(`/api/playback/${sessionId}`, { method: "DELETE", keepalive });
 }
 
-export function saveProgress(id: string, position: number, keepalive = false): Promise<void> {
-  return request(`/api/files/${id}/progress`, {
+export function saveProgress(fileId: string, position: number, keepalive = false): Promise<void> {
+  return request(`/api/files/${fileId}/progress`, {
     method: "PUT", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ position }), keepalive,
   });

@@ -24,7 +24,7 @@ Serde 序列化和反序列化不依赖字段公开, 不为接口响应字段额
 类型和方法实现保留在子模块中, `video.rs` 的注释集中说明调用链及接口职责.
 随机名称和媒体样本辅助接口仅在测试构建中重导出.
 
-`cache.rs` 是 crate 层的缓存入口, 提供 CacheManager, FolderState 只读快照和 CachePin.
+`cache.rs` 是 crate 层的缓存入口, 提供 CacheManager, CacheSnapshot 和 CachePin.
 活动缓存共享, 生成生命周期和淘汰编排由入口管理. 私有 `cache/metadata.rs`
 负责 ffprobe 探测, 成功元数据缓存及过期清理; 私有 `cache/disk.rs`
 负责磁盘占用统计和目录访问时间持久化. CacheManager 通过 `crate::video`
@@ -288,13 +288,16 @@ VFR 输入按同一恒帧率规则采样, 必要的重复或丢帧来自固定�
 查询数据库中的源文件路径并运行 ffprobe; 显式 probe 会跳过已有结果, 探测失败不会缓存.
 服务重启后元数据重新探测.
 
-播放请求和媒体文件路径由不同边界管理. CacheManager 的活动状态只表示 variant 是否仍有会话,
-等待 position 仅保存在 SessionManager. 创建时由 SessionManager 决定期望线程数,
-并在恢复完成后调用 CacheManager 启动未完成缓存. API 负责将数据库中的轨道偏好和观看进度合并到
-`PlaybackRequest`; SessionManager 按文件 MD5 向 CacheManager 临时取得 `MediaInfo`,
-构造不可变的 `PlaybackVariantConfig` 并计算 variant-key. CacheManager 接收该配置,
-自行查询源路径并组装编码参数, 活动缓存 Map 仅在相应 variant 被请求时创建条目.
-SessionManager 不保存媒体元数据或文件路径, API 也不直接操作元数据缓存或活动缓存.
+播放请求和媒体文件路径由不同边界管理. `AppState` 分别持有 `SessionManager` 和 `CacheManager`,
+SessionManager 只保存会话 Map 和过期时间, 不持有 CacheManager.
+API 的 streams 和 probe 路由直接向 CacheManager 请求详细 `MediaInfo`;
+创建播放时 API 将 `&CacheManager`, file ID 和合并数据库偏好/观看进度后的 `PlaybackRequest`
+显式传给 `SessionManager::create`. SessionManager 按文件 MD5 查询 MediaInfo,
+构造不可变的 `PlaybackVariantConfig` 并计算 variant-key.
+创建、状态、心跳、目标位置、资源读取和释放等协调方法都显式接收 CacheManager,
+由 SessionManager 管理会话并按 position 决定线程数, 再调用 CacheManager 操作缓存.
+CacheManager 接收配置, 自行查询源路径并组装编码参数, 活动缓存 Map 仅在相应 variant
+被请求时创建条目. API 负责业务偏好和进度; 两个 Manager 的实例由 main 组装和关闭.
 
 Rust `PlaybackVariantConfig` 依次包含 `src_file_pre16mib_md5`, `video_stream`,
 `audio_stream`, `subtitle_stream`, `encoder_profile`.

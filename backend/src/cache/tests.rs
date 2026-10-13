@@ -18,7 +18,7 @@ fn folder() -> CacheFolder {
     let (info, request) = video::fixture();
     let config = PlaybackVariantConfig::new(&"a".repeat(32), &info, &request).unwrap();
     CacheFolder {
-        key: config.key().to_owned(),
+        variant_key: config.variant_key().to_owned(),
         directory: PathBuf::new(),
         spec: EncodeSpec::from_config(config, PathBuf::new(), info).unwrap(),
         state: Mutex::new(state()),
@@ -120,13 +120,13 @@ async fn cache_snapshot_exposes_only_session_status_fields() {
 //     let database = sqlx::sqlite::SqlitePoolOptions::new().connect("sqlite::memory:").await.unwrap();
 //     let manager = CacheManager::new(root.clone(), PlaybackConfig::default(), database, Processes::new(2, 16)).await.unwrap();
 //     let folder = Arc::new(folder());
-//     let key = folder.key.clone();
-//     manager.inner.entries.lock().await.insert(key.clone(), folder);
-//     assert_eq!(manager.duration(&key).await.unwrap(), 20.0);
-//     assert_eq!(manager.status(&key).await.unwrap().revision(), 42);
-//     manager.inner.entries.lock().await.remove(&key);
-//     assert!(manager.duration(&key).await.is_err());
-//     assert!(manager.status(&key).await.is_err());
+//     let variant_key = folder.variant_key.clone();
+//     manager.inner.entries.lock().await.insert(variant_key.clone(), folder);
+//     assert_eq!(manager.duration(&variant_key).await.unwrap(), 20.0);
+//     assert_eq!(manager.status(&variant_key).await.unwrap().revision(), 42);
+//     manager.inner.entries.lock().await.remove(&variant_key);
+//     assert!(manager.duration(&variant_key).await.is_err());
+//     assert!(manager.status(&variant_key).await.is_err());
 //     drop(manager);
 //     tokio::fs::remove_dir_all(root).await.unwrap();
 // }
@@ -136,7 +136,7 @@ async fn cache_snapshot_exposes_only_session_status_fields() {
 //     let (info, request) = video::fixture();
 //     let config = PlaybackVariantConfig::new(&"a".repeat(32), &info, &request).unwrap();
 //     CacheFolder {
-//         key: config.key().to_owned(),
+//         variant_key: config.variant_key().to_owned(),
 //         directory: PathBuf::new(),
 //         spec: EncodeSpec::from_config(config, "video.mkv".into(), info).unwrap(),
 //         state: Mutex::new(FolderState {
@@ -168,16 +168,16 @@ async fn cache_snapshot_exposes_only_session_status_fields() {
 //             video_stream: 0, audio_stream: Some(1), subtitle_stream: Some(3),
 //             encoder_profile: "h264-high-yuv420p-aac-fmp4-v1".to_string(),
 //         };
-//         assert_eq!(config.key().unwrap(), "bc892e2d4aa401399639fe22ee897b43");
+//         assert_eq!(config.variant_key(), "bc892e2d4aa401399639fe22ee897b43");
 //         let mut updated = config.clone();
 //         updated.encoder_profile = ENCODER_PROFILE.to_string();
-//         assert_ne!(updated.key().unwrap(), config.key().unwrap());
+//         assert_ne!(updated.variant_key(), config.variant_key());
 //         updated.audio_stream = None;
 //         updated.subtitle_stream = None;
 //         assert!(String::from_utf8(serde_json::to_vec(&updated).unwrap()).unwrap()
 //             .contains("\"audio_stream\":null,\"subtitle_stream\":null"));
-//         for key in ["../main.db", "ABCDEF0123456789ABCDEF0123456789", "a", ""] {
-//             assert!(!is_key(key));
+//         for variant_key in ["../main.db", "ABCDEF0123456789ABCDEF0123456789", "a", ""] {
+//             assert!(!is_variant_key(variant_key));
 //         }
 //     }
 //
@@ -216,12 +216,13 @@ async fn cache_snapshot_exposes_only_session_status_fields() {
 //         let manager = CacheManager::new(root.clone(), config, Processes::new(2, 16)).await.unwrap();
 //         let (info, request) = ffmpeg::fixture();
 //         let spec = EncodeSpec::new(&"a".repeat(32), "video.mkv".into(), info, request, None).unwrap();
-//         let key = spec.config.key().unwrap();
-//         let directory = root.join("playback").join(&key);
+//         let variant_key = spec.config.variant_key();
+//         let directory = root.join("playback").join(variant_key);
 //         tokio::fs::create_dir(&directory).await.unwrap();
 //         tokio::fs::write(directory.join("init.mp4"), b"file-open fixture").await.unwrap();
 //         let output = Arc::new(ActiveCache {
-//             key: key.clone(), directory: directory.clone(), spec: spec.clone(), changed: Notify::new(),
+//             variant_key: variant_key.to_string(), directory: directory.clone(),
+//             spec: spec.clone(), changed: Notify::new(),
 //             state: Mutex::new(ActiveState {
 //                 media: CachedMedia { complete: true, init: None, segments: vec![fragment::Fragment {
 //                     start: Tail::default(), end: Tail { video: 360000, audio: 192000 }, sequence: 1,
@@ -232,18 +233,18 @@ async fn cache_snapshot_exposes_only_session_status_fields() {
 //                 revision: 1, last_used: SystemTime::now(), error: None,
 //             }),
 //         });
-//         manager.inner.entries.lock().await.insert(key.clone(), output);
+//         manager.inner.entries.lock().await.insert(variant_key.to_string(), output);
 //         let shared = manager.acquire(spec, "second").await.unwrap();
 //         assert_eq!(shared.state.lock().await.clients.len(), 2);
 //         manager.maintain().await.unwrap();
 //         assert!(directory.exists());
-//         let (path, pin) = manager.media_path(&key, "second", "init.mp4").await.unwrap();
-//         manager.release(&key, "first").await.unwrap();
-//         manager.release(&key, "first").await.unwrap();
+//         let (path, pin) = manager.media_path(variant_key, "second", "init.mp4").await.unwrap();
+//         manager.release(variant_key, "first").await.unwrap();
+//         manager.release(variant_key, "first").await.unwrap();
 //         assert_eq!(shared.state.lock().await.clients.len(), 1);
 //         drop(shared);
-//         manager.release(&key, "second").await.unwrap();
-//         assert!(manager.get(&key).await.is_err());
+//         manager.release(variant_key, "second").await.unwrap();
+//         assert!(manager.get(variant_key).await.is_err());
 //         assert!(pin.status("second").await.is_err());
 //         manager.maintain().await.unwrap();
 //         assert!(directory.exists());
@@ -272,7 +273,7 @@ async fn cache_snapshot_exposes_only_session_status_fields() {
 //         let output = manager.acquire(spec.clone(), "first").await.unwrap();
 //         output.wait_loaded().await.unwrap();
 //         output.state.lock().await.encoding = true;
-//         manager.release(&output.key, "first").await.unwrap();
+//         manager.release(&output.variant_key, "first").await.unwrap();
 //         let deadline = {
 //             let mut state = output.state.lock().await;
 //             assert_eq!(state.stop_after, Some(1));
@@ -295,11 +296,11 @@ async fn cache_snapshot_exposes_only_session_status_fields() {
 //         let waiting = manager.acquire(spec, "third");
 //         tokio::pin!(waiting);
 //         assert!(tokio::time::timeout(Duration::from_millis(30), &mut waiting).await.is_err());
-//         manager.release(&output.key, "second").await.unwrap();
+//         manager.release(&output.variant_key, "second").await.unwrap();
 //         let next = tokio::time::timeout(Duration::from_secs(2), waiting).await.unwrap().unwrap();
 //         assert!(!Arc::ptr_eq(&output, &next));
 //         assert_eq!(manager.inner.entries.lock().await.len(), 1);
-//         manager.release(&next.key, "third").await.unwrap();
+//         manager.release(&next.variant_key, "third").await.unwrap();
 //         manager.shutdown().await.unwrap();
 //         drop(held);
 //         tokio::fs::remove_dir_all(root).await.unwrap();
@@ -319,8 +320,8 @@ async fn cache_snapshot_exposes_only_session_status_fields() {
 //         let spec = EncodeSpec::new(&"a".repeat(32), "video.mkv".into(), info, request, None).unwrap();
 //         let output = manager.acquire(spec, "failed").await.unwrap();
 //         assert!(output.wait_loaded().await.is_err());
-//         assert!(manager.release(&output.key, "failed").await.is_err());
-//         assert!(manager.get(&output.key).await.is_err());
+//         assert!(manager.release(&output.variant_key, "failed").await.is_err());
+//         assert!(manager.get(&output.variant_key).await.is_err());
 //         tokio::fs::remove_file(&playback).await.unwrap();
 //         tokio::fs::create_dir(&playback).await.unwrap();
 //         manager.shutdown().await.unwrap();
@@ -350,7 +351,7 @@ async fn cache_snapshot_exposes_only_session_status_fields() {
 //             manager.checked_step(&output, &mut child, &mut None, Instant::now(), 0, &cancel, step)).await;
 //         child.kill().await.unwrap();
 //         child.wait().await.unwrap();
-//         manager.release(&output.key, "test").await.unwrap();
+//         manager.release(&output.variant_key, "test").await.unwrap();
 //         manager.shutdown().await.unwrap();
 //         drop(held);
 //         tokio::fs::remove_dir_all(root).await.unwrap();

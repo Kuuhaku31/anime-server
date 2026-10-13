@@ -7,7 +7,7 @@
 本文示例使用 `http://localhost:56080`, 实际地址取决于宿主机端口映射.
 接口没有用户鉴权, 不应直接暴露到公网. JSON 请求使用 `Content-Type: application/json`.
 
-- `{file_id}` 是源文件前 16 MiB 的 MD5, 对应代码中的 `{pre16mib_md5}` 或文件接口中的 `{id}`.
+- `{file_id}` 是源文件前 16 MiB 的 MD5, 对应代码中的 `{pre16mib_md5}`.
 - `{session_id}` 是创建播放会话时返回的不透明 ID, 与文件 ID 和缓存键不同.
 - 播放配置和缓存键由服务端生成, 客户端不能提供媒体路径或直接访问缓存目录.
 
@@ -30,7 +30,7 @@
 | `POST`   | `/api/playback/{session_id}/heartbeat` | 显式保活                            |
 | `POST`   | `/api/playback/{session_id}/target`    | 更新会话目标位置                    |
 | `DELETE` | `/api/playback/{session_id}`           | 释放会话租约                        |
-| `GET`    | `/playback/{session_id}/{asset}`       | 获取已发布的 HLS 资源               |
+| `GET`    | `/playback/{session_id}/{asset_name}`  | 获取已发布的 HLS 资源               |
 | `GET`    | `/health`                              | 检查 HTTP 服务存活                  |
 
 ## 文件查询与识别
@@ -266,7 +266,7 @@ curl -X POST http://localhost:56080/api/playback/SESSION_ID/target \
 最后一个租约离开会触发后台停止, HTTP 响应不等待编码器完成最后一个分片.
 释放租约不会立即删除磁盘缓存, 也不会删除观看记录.
 
-`GET /playback/{session_id}/{asset}` 只允许有效会话读取已发布资源:
+`GET /playback/{session_id}/{asset_name}` 只允许有效会话读取已发布资源:
 
 | 资源                                | MIME 类型                       |
 | ----------------------------------- | ------------------------------- |

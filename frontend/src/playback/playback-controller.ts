@@ -151,11 +151,11 @@ export class PlaybackController extends EventTarget {
     // 已生成范围直接 seek, 网络缓冲由 HLS 负责, 不必重新创建会话.
     if (this.session && this.loaded && !this.pending
       && rangeReady(target, this.session.buffered_until)) {
-      const id = this.session.session_id;
+      const sessionId = this.session.session_id;
       this.video.currentTime = target;
       this.savedPosition = target;
       Promise.all([this.persist(), this.updateTarget(target)]).catch((error) => {
-        if (this.session?.session_id === id) this.fatal(error);
+        if (this.session?.session_id === sessionId) this.fatal(error);
       });
       this.changed();
     } else {
@@ -285,13 +285,13 @@ export class PlaybackController extends EventTarget {
   private async loadRange(position: number, autoplay: boolean, signal: AbortSignal, notify = true): Promise<void> {
     if (!this.session) throw new Error("Playback session is missing");
     if (notify) await this.updateTarget(position, signal);
-    const id = this.session.session_id;
+    const sessionId = this.session.session_id;
     let deadline = Date.now() + 180_000;
     let generated = this.session.buffered_until;
     let activity = this.activity(this.session);
     while (true) {
       signal.throwIfAborted();
-      if (!this.session || this.session.session_id !== id) throw new Error("Playback session changed");
+      if (!this.session || this.session.session_id !== sessionId) throw new Error("Playback session changed");
       if (rangeReady(position, this.session.buffered_until)) break;
       if (this.session.phase === "complete") throw new Error("Cached video does not cover the requested position.");
       // 超时只限制持续无进展, 生成前进或调度状态变化都会刷新等待期限.
@@ -308,7 +308,7 @@ export class PlaybackController extends EventTarget {
       this.message = `${phaseLabel}: ${formatTime(this.session.buffered_until)} / ${formatTime(this.duration)}. Waiting for ${formatTime(position)}...`;
       this.changed();
       await wait(500, signal);
-      const status: PlaybackSession = await request<PlaybackSession>(`/api/playback/${id}/status`, { signal });
+      const status: PlaybackSession = await request<PlaybackSession>(`/api/playback/${sessionId}/status`, { signal });
       signal.throwIfAborted();
       this.session = status;
     }
@@ -334,15 +334,15 @@ export class PlaybackController extends EventTarget {
   }
 
   private updateTarget(position: number, signal?: AbortSignal): Promise<void> {
-    const id = this.session?.session_id;
-    if (!id) return Promise.reject(new Error("Playback session is missing"));
+    const sessionId = this.session?.session_id;
+    if (!sessionId) return Promise.reject(new Error("Playback session is missing"));
     // 连续拖动按顺序发送目标, 避免较旧的请求最后到达服务端.
     const task = this.targeting.then(async () => {
       signal?.throwIfAborted();
-      if (this.session?.session_id !== id) return;
-      const status = await jsonRequest<PlaybackSession>(`/api/playback/${id}/target`, { position }, "POST", signal);
+      if (this.session?.session_id !== sessionId) return;
+      const status = await jsonRequest<PlaybackSession>(`/api/playback/${sessionId}/target`, { position }, "POST", signal);
       signal?.throwIfAborted();
-      if (this.session?.session_id === id) this.session = status;
+      if (this.session?.session_id === sessionId) this.session = status;
     });
     this.targeting = task.catch((error) => {
       if (!isAbort(error)) console.error("Playback target update failed", error);
@@ -361,24 +361,24 @@ export class PlaybackController extends EventTarget {
   private persist(keepalive = false): Promise<void> {
     if (!this.file || !this.info) return Promise.resolve();
     // 入队时捕获文件和位置, 避免执行前换片而把旧进度写到新文件.
-    const id = this.file.pre16mib_md5;
+    const fileId = this.file.pre16mib_md5;
     const position = this.position;
     // 普通保存串行发送, 卸载请求绕过队列以尽力在页面关闭前发出.
-    if (keepalive) return saveProgress(id, position, true);
+    if (keepalive) return saveProgress(fileId, position, true);
     const task = this.saving.catch((error) => console.error("Previous progress save failed", error))
-      .then(() => saveProgress(id, position));
+      .then(() => saveProgress(fileId, position));
     this.saving = task;
     return task;
   }
 
   private async report(): Promise<void> {
     if (this.reporting || this.pending || !this.session) return;
-    const id = this.session.session_id;
+    const sessionId = this.session.session_id;
     this.reporting = true;
     try {
-      const status = await request<PlaybackSession>(`/api/playback/${id}/status`);
+      const status = await request<PlaybackSession>(`/api/playback/${sessionId}/status`);
       // 响应返回前可能已换轨或进入拖动等待, 旧响应不能覆盖当前操作状态.
-      if (this.session?.session_id !== id || this.pending) return;
+      if (this.session?.session_id !== sessionId || this.pending) return;
       this.session = status;
       if (status.phase === "failed" && rangeReady(this.position, status.buffered_until)) {
         this.error = "";
@@ -386,7 +386,7 @@ export class PlaybackController extends EventTarget {
       }
       this.changed();
     } catch (error) {
-      if (this.session?.session_id === id && !this.pending) this.fatal(error);
+      if (this.session?.session_id === sessionId && !this.pending) this.fatal(error);
     } finally { this.reporting = false; }
   }
 }

@@ -5,7 +5,8 @@
 //! 数据库偏好与观看进度仍由 API 层负责, 探测缓存和媒体路径解析由 crate::cache 负责.
 //!
 //! 播放调用链:
-//! `SessionManager::create -> PlaybackVariantConfig::new -> CacheManager`.
+//! API 分别持有 SessionManager 和 CacheManager, 调用 create 时显式传入 CacheManager.
+//! SessionManager 根据 file ID 和请求构造 PlaybackVariantConfig, 再委托缓存管理器获取状态.
 //! 客户端后续通过会话查询状态, 更新目标, 读取媒体或释放租约.
 //! crate::cache 管理活动缓存去重, 停止续接和磁盘淘汰, 本模块提供媒体生成与校验能力.
 
@@ -45,18 +46,13 @@ pub(crate) use models::playback_target;
 
 /// 单个播放会话的状态快照, 可序列化为客户端响应.
 ///
-/// complete 描述媒体完整性, generating 和 stopping 描述任务运行情况.
-/// ready 表示已有可播放分片, 不保证整个目标位置已经被缓存覆盖.
+/// phase 描述缓存文件夹生命周期, buffered_until 描述已验证媒体范围.
 /// 外部仅能读取校验目标位置所需的 duration, 其余字段通过序列化提供.
 pub(crate) use crate::sessions::SessionStatus;
 
 /// 不透明播放会话及活动缓存租约的统一入口.
 ///
-/// `new(cache, idle_seconds)` 关联缓存管理器并设置会话心跳超时.
-/// `create(file_id, request)` 生成配置并获取共享缓存.
-/// `status(id)` 和 `heartbeat(id)` 查询或刷新存活时间.
-/// `target(id, target)` 更新等待位置, 不保存数据库进度或重建缓存.
-/// `media_path(id, name)` 校验租约和已发布资源, 返回地址, MIME 和保护对象.
-/// `release(id)` 幂等释放租约, 不等待后台编码完成最后一个分片.
-/// `spawn_expiration()` 启动过期清理, `shutdown()` 清空会话并关闭缓存管理器.
+/// `new(idle_seconds)` 设置会话心跳超时, 不持有 CacheManager.
+/// 缓存协调方法通过参数显式接收 CacheManager, create 仍以 file_id 和 request 为业务输入.
+/// `spawn_expiration(cache_manager)` 启动过期清理, `shutdown()` 只清空会话.
 pub(crate) use crate::sessions::SessionManager;

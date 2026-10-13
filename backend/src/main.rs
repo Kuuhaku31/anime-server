@@ -37,6 +37,7 @@ struct AppState {
     scan_lock: Arc<tokio::sync::Mutex<()>>, // 扫描锁, 防止同时进行多个扫描任务
 
     session_manager: SessionManager, // 播放会话管理
+    cache_manager: CacheManager, // 媒体元数据和播放缓存
 }
 
 
@@ -76,12 +77,13 @@ async fn main() -> Result<()> {
 
     info!("cache manager initialized at {}", constants::CACHE_DIR);
 
-    let playback = SessionManager::new(cache.clone(), config.playback.idle_timeout_seconds);
+    let playback = SessionManager::new(config.playback.idle_timeout_seconds);
 
     let state = AppState {
         db: database,
         config: Arc::new(config),
         session_manager: playback.clone(),
+        cache_manager: cache.clone(),
         scan_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
 
@@ -98,7 +100,7 @@ async fn main() -> Result<()> {
             sleep(Duration::from_secs(s.config.scan_interval_seconds)).await;
         }
     });
-    state.session_manager.spawn_expiration(); // 启动一个后台异步任务, 定期回收失去联系的播放会话并维护磁盘缓存
+    state.session_manager.spawn_expiration(cache.clone()); // 定期回收失去联系的播放会话并维护磁盘缓存.
     info!("background tasks started: video scan and playback session expiration");
 
     // API 和前端静态文件由同一端口提供, 浏览器通过同源相对 URL 访问服务.
@@ -128,8 +130,9 @@ async fn main() -> Result<()> {
         }
 
         // 等待分片边界落盘并回收子进程, 不依赖容器强制终止来结束转码.
-        if let Err(error) = playback.shutdown().await {
-            tracing::error!("playback shutdown failed: {error:#}");
+        playback.shutdown().await;
+        if let Err(error) = cache.shutdown().await {
+            tracing::error!("playback cache shutdown failed: {error:#}");
         }
     }).await?;
 

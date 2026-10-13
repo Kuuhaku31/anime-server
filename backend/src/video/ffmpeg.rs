@@ -384,9 +384,9 @@ mod tests {
 
 use super::*;
 
-    fn make_spec(id: &str, source: &str, info: MediaInfo, request: PlaybackRequest, saved: Option<f64>) -> anyhow::Result<EncodeSpec> {
+    fn make_spec(file_id: &str, source: &str, info: MediaInfo, request: PlaybackRequest, saved: Option<f64>) -> anyhow::Result<EncodeSpec> {
         let request = request.with_saved_position(saved);
-        let config = PlaybackVariantConfig::new(id, &info, &request)?;
+        let config = PlaybackVariantConfig::new(file_id, &info, &request)?;
         EncodeSpec::from_config(config, source.into(), info)
     }
 

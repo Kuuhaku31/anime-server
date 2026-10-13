@@ -10,7 +10,7 @@ const AUDIO_TIMESCALE: u32 = 48_000;
 /// 提取共享 init 的解码契约, 无关的编码器名称和码率提示不参与兼容性比较.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Track {
-    id: u32,
+    track_id: u32,
     timescale: u32,
     video: bool,
     description: Vec<u8>,
@@ -174,7 +174,7 @@ impl Init {
             let track = children(data, track)?;
             ensure!(!track.iter().any(|item| item.kind == *b"edts"), "cache init must not reset track timelines with edit lists");
             let header = required(&track, b"tkhd")?;
-            let id = number(data, version_offset(data, header, 12, 20)?)?;
+            let track_id = number(data, version_offset(data, header, 12, 20)?)?;
             let media = children(data, required(&track, b"mdia")?)?;
             let header = required(&media, b"mdhd")?;
             let timescale = number(data, version_offset(data, header, 12, 20)?)?;
@@ -182,7 +182,7 @@ impl Init {
             let kind = handler.get(8..12).context("truncated MP4 handler")?;
             let video = kind == b"vide";
             ensure!(video || kind == b"soun", "unexpected cached MP4 track");
-            ensure!(id == if video { 1 } else { 2 }, "unexpected MP4 track identifier");
+            ensure!(track_id == if video { 1 } else { 2 }, "unexpected MP4 track identifier");
             ensure!(timescale == if video { VIDEO_TIMESCALE } else { AUDIO_TIMESCALE }, "unexpected MP4 timescale");
             let information = children(data, required(&media, b"minf")?)?;
             let table = children(data, required(&information, b"stbl")?)?;
@@ -191,7 +191,7 @@ impl Init {
             for extension in extensions.iter().filter(|item| item.kind == *b"trex") {
                 let payload = &data[extension.payload.clone()];
                 ensure!(payload.len() == 24 && number(payload, 0)? == 0, "invalid MP4 track defaults");
-                if number(payload, 4)? == id {
+                if number(payload, 4)? == track_id {
                     ensure!(defaults.is_none(), "duplicate MP4 track defaults");
                     defaults = Some([number(payload, 8)?, number(payload, 12)?,
                         number(payload, 16)?, number(payload, 20)?]);
@@ -199,10 +199,10 @@ impl Init {
             }
             let defaults = defaults.context("missing MP4 track defaults")?;
             ensure!(defaults[0] == 1, "unexpected default sample description");
-            ensure!(!tracks.iter().any(|track: &Track| track.id == id), "duplicate MP4 track");
-            tracks.push(Track { id, timescale, video, description, defaults });
+            ensure!(!tracks.iter().any(|track: &Track| track.track_id == track_id), "duplicate MP4 track");
+            tracks.push(Track { track_id, timescale, video, description, defaults });
         }
-        tracks.sort_by_key(|track| track.id);
+        tracks.sort_by_key(|track| track.track_id);
         ensure!(!tracks.is_empty() && tracks[0].video && tracks.len() <= 2, "invalid cached MP4 track layout");
         Ok(Self { tracks })
     }
@@ -233,8 +233,9 @@ fn analyze(data: &[u8], init: &Init) -> Result<(Fragment, Vec<(usize, bool)>, us
         let tfhd = &data[required(&track_boxes, b"tfhd")?.payload.clone()];
         let flags = number(tfhd, 0)?;
         ensure!(flags & !0x02003a == 0 && flags & 0x020000 != 0, "fragment must use moof-relative addressing");
-        let id = number(tfhd, 4)?;
-        let track = init.tracks.iter().find(|track| track.id == id).context("fragment references an unknown track")?;
+        let track_id = number(tfhd, 4)?;
+        let track = init.tracks.iter().find(|track| track.track_id == track_id)
+            .context("fragment references an unknown track")?;
         ensure!(!timestamps.iter().any(|(_, video)| *video == track.video), "duplicate fragment track");
         let mut cursor = 8;
         if flags & 2 != 0 {
@@ -349,8 +350,8 @@ mod tests {
     fn init_fixture(noise: u8, audio: bool) -> Vec<u8> {
         let mut tracks = Vec::new();
         let mut extensions = Vec::new();
-        for id in 1..=if audio { 2 } else { 1 } {
-            let video = id == 1;
+        for track_id in 1..=if audio { 2 } else { 1 } {
+            let video = track_id == 1;
             let mut fields = vec![0; if video { 78 } else { 28 }];
             fields[7] = 1;
             let properties = if video {
@@ -375,8 +376,8 @@ mod tests {
                 atom(b"hdlr", [words(&[0, 0]), if video { b"vide".to_vec() } else { b"soun".to_vec() }].concat()),
                 atom(b"minf", table),
             ].concat());
-            tracks.push(atom(b"trak", [atom(b"tkhd", words(&[0, 0, 0, id])), media].concat()));
-            extensions.push(atom(b"trex", words(&[0, id, 1, 0, 0, 0])));
+            tracks.push(atom(b"trak", [atom(b"tkhd", words(&[0, 0, 0, track_id])), media].concat()));
+            extensions.push(atom(b"trex", words(&[0, track_id, 1, 0, 0, 0])));
         }
         tracks.push(atom(b"mvex", extensions.concat()));
         [atom(b"ftyp", b"iso6".to_vec()), atom(b"moov", tracks.concat())].concat()
@@ -385,12 +386,12 @@ mod tests {
     fn fragment_fixture(audio: bool) -> Vec<u8> {
         let build = |video_offset, audio_offset| {
             let mut tracks = vec![atom(b"mfhd", words(&[0, 1]))];
-            for id in 1..=if audio { 2 } else { 1 } {
-                let duration = if id == 1 { 3000 } else { 1024 };
+            for track_id in 1..=if audio { 2 } else { 1 } {
+                let duration = if track_id == 1 { 3000 } else { 1024 };
                 tracks.push(atom(b"traf", [
-                    atom(b"tfhd", words(&[0x020000, id])),
+                    atom(b"tfhd", words(&[0x020000, track_id])),
                     atom(b"tfdt", [words(&[0x01000000]), 0_u64.to_be_bytes().to_vec()].concat()),
-                    atom(b"trun", words(&[0x305, 2, if id == 1 { video_offset } else { audio_offset },
+                    atom(b"trun", words(&[0x305, 2, if track_id == 1 { video_offset } else { audio_offset },
                         0x02000000, duration, 4, duration, 4])),
                 ].concat()));
             }

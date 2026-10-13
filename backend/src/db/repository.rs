@@ -32,9 +32,11 @@ pub(crate) async fn get_video_files(p: &SqlitePool) -> Result<Vec<VideoFile>, sq
 }
 
 /// 获取指定文件指纹的数据库记录.
-pub(crate) async fn get_video_by_id(p: &SqlitePool, id: &str) -> Result<Option<VideoFile>, sqlx::Error> {
+pub(crate) async fn get_video_by_file_id(
+    p: &SqlitePool, file_id: &str,
+) -> Result<Option<VideoFile>, sqlx::Error> {
     let query = format!("{VIDEO_SELECT} WHERE f.pre16mib_md5 = ? ORDER BY fp.path LIMIT 1");
-    let mut file = sqlx::query_as::<_, VideoFile>(&query).bind(id).fetch_optional(p).await?;
+    let mut file = sqlx::query_as::<_, VideoFile>(&query).bind(file_id).fetch_optional(p).await?;
     if let Some(file) = &mut file { set_display_name(file)?; }
     Ok(file)
 }
@@ -46,15 +48,19 @@ fn set_display_name(file: &mut VideoFile) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
-pub(crate) async fn get_video_paths_by_id(p: &SqlitePool, id: &str) -> Result<Vec<PathBuf>, sqlx::Error> {
+pub(crate) async fn get_video_paths_by_file_id(
+    p: &SqlitePool, file_id: &str,
+) -> Result<Vec<PathBuf>, sqlx::Error> {
     sqlx::query_scalar::<_, String>("SELECT path FROM file_path WHERE pre16mib_md5 = ? ORDER BY path")
-        .bind(id).fetch_all(p).await
+        .bind(file_id).fetch_all(p).await
         .map(|paths| paths.into_iter().map(PathBuf::from).collect())
 }
 
-pub(crate) async fn get_a_video_path_by_id(p: &SqlitePool, id: &str) -> Result<Option<PathBuf>, sqlx::Error> {
+pub(crate) async fn get_a_video_path_by_file_id(
+    p: &SqlitePool, file_id: &str,
+) -> Result<Option<PathBuf>, sqlx::Error> {
     sqlx::query_scalar::<_, String>("SELECT path FROM file_path WHERE pre16mib_md5 = ? ORDER BY path LIMIT 1")
-        .bind(id).fetch_optional(p).await
+        .bind(file_id).fetch_optional(p).await
         .map(|opt| opt.map(PathBuf::from))
 }
 
@@ -268,7 +274,7 @@ mod tests {
     //     let rowid: i64 = sqlx::query_scalar("SELECT rowid FROM file_path").fetch_one(&pool).await.unwrap();
     //     sqlx::query("UPDATE file SET size = 0").execute(&pool).await.unwrap();
     //     upsert_file(&pool, &first).await.unwrap();
-    //     let video = get_video_by_id(&pool, old_id).await.unwrap().unwrap();
+    //     let video = get_video_by_file_id(&pool, old_file_id).await.unwrap().unwrap();
     //     assert_eq!(video.size, first.size());
     //     assert_eq!(video.watch_pos, Some(12.5));
     //     assert_eq!(video.audio_stream_index, Some(1));
@@ -309,7 +315,7 @@ mod tests {
             let pool = SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
             sqlx::raw_sql(include_str!("../../sql/init.sql")).execute(&pool).await.unwrap();
             let scanned = ScannedFile::new(&first).unwrap();
-            let id = scanned.pre16mib_md5().to_owned();
+            let file_id = scanned.pre16mib_md5().to_owned();
             upsert_file(&pool, &scanned).await.unwrap();
             upsert_file(&pool, &ScannedFile::new(&second).unwrap()).await.unwrap();
             assert_eq!(get_paths(&pool).await.unwrap().len(), 2);
@@ -319,7 +325,7 @@ mod tests {
             for path in [&first, &second] {
                 assert!(videos.iter().any(|video| {
                     std::path::Path::new(&video.path) == *path
-                        && video.pre16mib_md5 == id
+                        && video.pre16mib_md5 == file_id
                 }));
             }
             assert!(get_paths(&pool).await.unwrap().contains(&first));
@@ -329,9 +335,9 @@ mod tests {
             upsert_file(&pool, &scanned).await.unwrap();
             assert_eq!(sqlx::query_scalar::<_, i64>("SELECT rowid FROM file_path WHERE path = ?").bind(first.to_str().unwrap())
                 .fetch_one(&pool).await.unwrap(), rowid);
-            save_progress(&pool, &id, 12.5).await.unwrap();
-            save_track_preferences(&pool, &id, Some(Some(1)), Some(Some(3))).await.unwrap();
-            set_mock_identification(&pool, &id).await.unwrap();
+            save_progress(&pool, &file_id, 12.5).await.unwrap();
+            save_track_preferences(&pool, &file_id, Some(Some(1)), Some(Some(3))).await.unwrap();
+            set_mock_identification(&pool, &file_id).await.unwrap();
             let moved = root.join("renamed.mp4");
             std::fs::rename(&first, &moved).unwrap();
             delete_path(&pool, &first).await.unwrap();
@@ -339,18 +345,21 @@ mod tests {
             upsert_file(&pool, &ScannedFile::new(&moved).unwrap()).await.unwrap();
             assert!(get_paths(&pool).await.unwrap().contains(&second));
             assert!(get_paths(&pool).await.unwrap().contains(&moved));
-            let progress = get_progress(&pool, &id).await.unwrap().unwrap();
+            let progress = get_progress(&pool, &file_id).await.unwrap().unwrap();
             assert_eq!(progress.watch_pos, Some(12.5));
             assert_eq!(progress.audio_stream_index, Some(1));
             assert_eq!(progress.subtitle_stream_index, Some(3));
-            assert_eq!(get_video_by_id(&pool, &id).await.unwrap().unwrap().ddp_epi_id, Some(1));
+            assert_eq!(
+                get_video_by_file_id(&pool, &file_id).await.unwrap().unwrap().ddp_epi_id,
+                Some(1),
+            );
             delete_path(&pool, &second).await.unwrap();
             delete_path(&pool, &moved).await.unwrap();
             assert!(get_paths(&pool).await.unwrap().is_empty());
-            assert!(get_progress(&pool, &id).await.unwrap().is_some());
+            assert!(get_progress(&pool, &file_id).await.unwrap().is_some());
             // 全部路径删除后重新登记同内容文件, 仍恢复原业务记录.
             upsert_file(&pool, &ScannedFile::new(&second).unwrap()).await.unwrap();
-            let restored = get_video_by_id(&pool, &id).await.unwrap().unwrap();
+            let restored = get_video_by_file_id(&pool, &file_id).await.unwrap().unwrap();
             assert_eq!(restored.watch_pos, Some(12.5));
             assert_eq!(restored.audio_stream_index, Some(1));
             assert_eq!(restored.subtitle_stream_index, Some(3));

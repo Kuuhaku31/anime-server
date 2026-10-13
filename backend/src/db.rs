@@ -11,10 +11,10 @@ mod repository;
 
 pub(crate) use repository::get_progress;
 pub(crate) use repository::save_track_preferences;
-pub(crate) use repository::get_video_paths_by_id;
-pub(crate) use repository::get_a_video_path_by_id;
+pub(crate) use repository::get_video_paths_by_file_id;
+pub(crate) use repository::get_a_video_path_by_file_id;
 pub(crate) use repository::get_video_files;
-pub(crate) use repository::get_video_by_id;
+pub(crate) use repository::get_video_by_file_id;
 pub(crate) use repository::save_progress;
 pub(crate) use repository::set_mock_identification;
 pub(crate) use repository::get_paths_and_size;

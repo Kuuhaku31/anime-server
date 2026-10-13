@@ -57,7 +57,7 @@ pub(crate) struct MediaInfo {
 
 /// 稳定的缓存身份配置, 不等同于客户端播放请求.
 ///
-/// `key()` 按字段声明顺序序列化, 保留可选轨道的 null, 再计算 MD5.
+/// `variant_key()` 按字段声明顺序序列化, 保留可选轨道的 null, 再计算 MD5.
 /// 配置只包含源文件指纹, 视频/音频/字幕流索引和编码契约.
 /// 不应将文件路径, 会话 ID, 播放位置或动态线程数加入配置.
 /// 缓存身份只由源文件指纹, 全局流索引和编码契约决定, 不包含路径或播放位置.
@@ -71,7 +71,7 @@ pub(crate) struct PlaybackVariantConfig {
     encoder_profile: String,
 
     #[serde(skip)]
-    key: String,
+    variant_key: String,
 }
 
 fn select(tracks: &[Track], index: Option<i32>, kind: &str) -> Result<Option<Track>> {
@@ -82,8 +82,8 @@ fn select(tracks: &[Track], index: Option<i32>, kind: &str) -> Result<Option<Tra
 impl PlaybackVariantConfig {
 
     /// 根据媒体信息和播放请求固定所选轨道及编码契约.
-    pub(crate) fn new(id: &str, info: &MediaInfo, request: &PlaybackRequest) -> Result<Self> {
-        ensure!(crate::utils::check_md5_ok(id), "invalid source file ID");
+    pub(crate) fn new(file_id: &str, info: &MediaInfo, request: &PlaybackRequest) -> Result<Self> {
+        ensure!(crate::utils::check_md5_ok(file_id), "invalid source file ID");
         let video = info.video_tracks.first().context("media has no playable video stream")?;
         let audio_index = request.audio_stream_index.unwrap_or_else(|| {
             info.audio_tracks.iter().find(|track| track.is_default)
@@ -96,21 +96,21 @@ impl PlaybackVariantConfig {
         let audio = select(&info.audio_tracks, audio_index, "audio")?;
         let subtitle = select(&info.subtitle_tracks, subtitle_index, "subtitle")?;
         let config = Self {
-            src_file_pre16mib_md5: id.to_string(),
+            src_file_pre16mib_md5: file_id.to_string(),
             video_stream: video.stream_index,
             audio_stream: audio.map(|track| track.stream_index),
             subtitle_stream: subtitle.as_ref().map(|track| track.stream_index),
             encoder_profile: crate::constants::ENCODER_PROFILE.to_string(),
-            key: String::new(), // 临时占位
+            variant_key: String::new(), // 临时占位
         };
         // 字段声明顺序和显式 null 都参与哈希, 不能排序字段或省略空音轨与字幕.
-        let key = format!("{:x}", Md5::digest(serde_json::to_vec(&config)?));
-        Ok(Self { key, ..config })
+        let variant_key = format!("{:x}", Md5::digest(serde_json::to_vec(&config)?));
+        Ok(Self { variant_key, ..config })
     }
 
     // getters
 
-    pub(crate) fn key(&self) -> &str { &self.key }
+    pub(crate) fn variant_key(&self) -> &str { &self.variant_key }
     pub(crate) fn video_stream(&self) -> i32 { self.video_stream }
     pub(crate) fn audio_stream(&self) -> Option<i32> { self.audio_stream }
     pub(crate) fn src_file_pre16mib_md5(&self) -> &str { &self.src_file_pre16mib_md5 }

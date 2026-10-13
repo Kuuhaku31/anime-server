@@ -1,6 +1,7 @@
 //! 定义应用程序中使用的常量和配置参数.
 
 use std::path::Path;
+use std::time::Duration;
 
 pub(crate) const EXTENSIONS: &[&str] = &["mp4", "mkv", "webm", "mov", "avi", "m4v"];
 pub(crate) const HASH_LIMIT: u64 = 16 * 1024 * 1024;
@@ -21,3 +22,9 @@ pub(crate) fn video_root_path() -> &'static Path { Path::new(VIDEO_ROOT) }
 
 // 编码或续接规则改变兼容性时必须升级, 避免新任务复用旧契约的缓存.
 pub(crate) const ENCODER_PROFILE: &str = "h264-high-yuv420p-aac-fmp4-v2";
+
+
+/// MediaInfo 缓存最大数量
+pub(crate) const MEDIA_INFO_CACHE_MAX: usize = 1000;
+/// MediaInfo 缓存最大时间
+pub(crate) const MEDIA_INFO_CACHE_MAX_DURATION: Duration = Duration::from_secs(3600);

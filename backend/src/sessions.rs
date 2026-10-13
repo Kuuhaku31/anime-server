@@ -7,7 +7,7 @@ use serde::Serialize;
 use tokio::{sync::Mutex, time::interval};
 use tracing::warn;
 
-use crate::models::{MediaInfo, PlaybackRequest, PlaybackStart, PlaybackVariantConfig};
+use crate::models::{PlaybackRequest, PlaybackStart, PlaybackVariantConfig};
 use crate::cache::{CacheManager, CachePhase, CachePin};
 
 use crate::video::playback_target;
@@ -38,45 +38,47 @@ struct Session {
 #[derive(Clone)]
 pub(crate) struct SessionManager {
     sessions: Arc<Mutex<HashMap<String, Session>>>,
-    cache: CacheManager,
     idle_seconds: u64,
 }
 
 impl SessionManager {
-    pub(crate) fn new(cache: CacheManager, idle_seconds: u64) -> Self {
-        Self { sessions: Arc::new(Mutex::new(HashMap::new())), cache, idle_seconds }
+    pub(crate) fn new(idle_seconds: u64) -> Self {
+        Self { sessions: Arc::new(Mutex::new(HashMap::new())), idle_seconds }
     }
 
     /// 先预留会话名额再等待缓存加载, 防止并发创建绕过数量上限.
     pub(crate) async fn create(
         &self,
+        cache_manager: &CacheManager,
         file_id: &str,
         request: PlaybackRequest,
     ) -> Result<PlaybackStart> {
-        let media = self.cache.media_info(file_id, false).await?;
+        let media = cache_manager.media_info(file_id).await.map_err(|e| anyhow::anyhow!(e))?;
         let config = PlaybackVariantConfig::new(file_id, &media, &request)?;
         let target = playback_target(&media, &request)?;
-        let id = crate::utils::random_id()?;
-        let key = config.key().to_owned();
+        let session_id = crate::utils::random_id()?;
+        let variant_key = config.variant_key().to_owned();
         let selection = config.selection();
         {
             let mut sessions = self.sessions.lock().await;
-            ensure!(!self.cache.is_stopping(), "server is shutting down");
+            ensure!(!cache_manager.is_stopping(), "server is shutting down");
             ensure!(sessions.len() < 32, "too many playback sessions; stop an existing stream");
-            sessions.insert(id.clone(), Session { variant_key: key.clone(), target, created: Instant::now(), touched: None });
+            sessions.insert(session_id.clone(), Session {
+                variant_key: variant_key.clone(), target, created: Instant::now(), touched: None,
+            });
         }
         // 等待旧写入者回收时不持有会话表锁, 其他客户端仍能立即释放租约.
         let result = async {
-            let cache = self.cache.acquire(&config).await?;
-            let threads = self.desired_threads(&key, cache.buffered_until()).await?;
-            self.cache.start(&key, threads).await?;
-            self.status(&id).await
+            let cache = cache_manager.acquire(&config).await?;
+            let threads = self.desired_threads(cache_manager, &variant_key, cache.buffered_until()).await?;
+            cache_manager.start(&variant_key, threads).await?;
+            self.status(cache_manager, &session_id).await
         }.await;
         match result {
             Ok(session) => Ok(PlaybackStart::new(session, media, selection.0, selection.1)),
             Err(error) => {
-                self.sessions.lock().await.remove(&id);
-                if let Err(cleanup) = self.refresh_variant(&key).await {
+                self.sessions.lock().await.remove(&session_id);
+                if let Err(cleanup) = self.refresh_variant(cache_manager, &variant_key).await {
                     return Err(error.context(format!("session cleanup failed: {cleanup:#}")));
                 }
                 Err(error)
@@ -84,106 +86,104 @@ impl SessionManager {
         }
     }
 
-    pub(crate) async fn media_info(&self, id: &str, retry: bool) -> Result<MediaInfo> {
-        self.cache.media_info(id, retry).await
-    }
-
-    pub(crate) async fn status(&self, id: &str) -> Result<SessionStatus> {
-        let (key, target) = self.get_session(id).await?;
-        let status = self.cache.status(&key).await?;
+    pub(crate) async fn status(&self, cache_manager: &CacheManager, session_id: &str) -> Result<SessionStatus> {
+        let (variant_key, target_position) = self.get_session(session_id).await?;
+        let cache_status = cache_manager.status(&variant_key).await?;
         Ok(SessionStatus {
-            session_id: id.to_string(), url: format!("/playback/{id}/index.m3u8?revision={}", status.revision()),
-            mime_type: "application/vnd.apple.mpegurl", start_time: 0.0, duration: status.duration(),
-            position: target, phase: status.phase(), buffered_until: status.buffered_until(),
+            session_id: session_id.to_string(),
+            url: format!("/playback/{session_id}/index.m3u8?revision={}", cache_status.revision()),
+            mime_type: "application/vnd.apple.mpegurl", start_time: 0.0, duration: cache_status.duration(),
+            position: target_position, phase: cache_status.phase(), buffered_until: cache_status.buffered_until(),
         })
     }
 
-    pub(crate) async fn heartbeat(&self, id: &str) -> Result<()> {
-        self.status(id).await?;
+    pub(crate) async fn heartbeat(&self, cache_manager: &CacheManager, session_id: &str) -> Result<()> {
+        self.status(cache_manager, session_id).await?;
         Ok(())
     }
 
-    pub(crate) async fn target(&self, id: &str, target: f64) -> Result<SessionStatus> {
-        let current = self.status(id).await?;
-        ensure!(target.is_finite() && target >= 0.0 && target < current.duration,
+    pub(crate) async fn target(
+        &self, cache_manager: &CacheManager, session_id: &str, target_position: f64,
+    ) -> Result<SessionStatus> {
+        let current = self.status(cache_manager, session_id).await?;
+        ensure!(target_position.is_finite() && target_position >= 0.0 && target_position < current.duration,
             "position must be within the video duration");
         {
             let mut sessions = self.sessions.lock().await;
-            let session = sessions.get_mut(id).context("playback session not found or expired")?;
-            session.target = target;
+            let session = sessions.get_mut(session_id).context("playback session not found or expired")?;
+            session.target = target_position;
             session.touched = Some(Instant::now());
         }
-        self.status(id).await
+        self.status(cache_manager, session_id).await
     }
 
     #[allow(dead_code)]
-    pub(crate) async fn pause(&self, id: &str) -> Result<()> {
-        let (key, _) = self.get_session(id).await?;
-        self.cache.pause(&key).await
+    pub(crate) async fn pause(&self, cache_manager: &CacheManager, session_id: &str) -> Result<()> {
+        let (variant_key, _) = self.get_session(session_id).await?;
+        cache_manager.pause(&variant_key).await
     }
 
-    pub(crate) async fn media_path(
-        &self,
-        id: &str,
-        name: &str,
-    ) -> Result<(PathBuf, &'static str, CachePin)> {
-        let (key, _) = self.get_session(id).await?;
-        let (path, pin) = self.cache.media_path(&key, name).await?;
-        let mime = if name.ends_with(".m3u8") { "application/vnd.apple.mpegurl" }
-            else if name.ends_with(".m4s") { "video/iso.segment" } else { "video/mp4" };
+    pub(crate) async fn media_path(&self, cache_manager: &CacheManager, session_id: &str, asset_name: &str)
+        -> Result<(PathBuf, &'static str, CachePin)>
+    {
+        let (variant_key, _) = self.get_session(session_id).await?;
+        let (path, pin) = cache_manager.media_path(&variant_key, asset_name).await?;
+        let mime = if asset_name.ends_with(".m3u8") { "application/vnd.apple.mpegurl" }
+            else if asset_name.ends_with(".m4s") { "video/iso.segment" } else { "video/mp4" };
         // 只在文件打开期间持有额外 Arc, 即使最后一份租约被删除也不会被 LRU 抢先删除.
         Ok((path, mime, pin))
     }
 
     /// 先移除会话, 仅最后一个会话离开时停用共享缓存.
-    pub(crate) async fn release(&self, id: &str) -> Result<()> {
-        let session = self.sessions.lock().await.remove(id);
-        if let Some(session) = session { self.refresh_variant(&session.variant_key).await?; }
+    pub(crate) async fn release(&self, cache_manager: &CacheManager, session_id: &str) -> Result<()> {
+        let session = self.sessions.lock().await.remove(session_id);
+        if let Some(session) = session { self.refresh_variant(cache_manager, &session.variant_key).await?; }
         Ok(())
     }
 
-    pub(crate) fn spawn_expiration(&self) {
+    pub(crate) fn spawn_expiration(&self, cache_manager: CacheManager) {
         let manager = self.clone();
         tokio::spawn(async move {
             let mut tick = interval(Duration::from_secs(5));
             loop {
                 tick.tick().await;
-                if manager.cache.is_stopping() { break; }
-                if let Err(error) = expire(&manager).await {
+                if cache_manager.is_stopping() { break; }
+                if let Err(error) = expire(&manager, &cache_manager).await {
                     warn!("playback cache maintenance failed: {error:#}");
                 }
             }
         });
     }
 
-    pub(crate) async fn shutdown(&self) -> Result<()> {
+    pub(crate) async fn shutdown(&self) {
         self.sessions.lock().await.clear();
-        self.cache.shutdown().await
     }
 
     // 状态, 媒体和显式心跳请求都经此续期, 客户端不能自行提供缓存键.
-    async fn get_session(&self, id: &str) -> Result<(String, f64)> {
+    async fn get_session(&self, session_id: &str) -> Result<(String, f64)> {
         let mut sessions = self.sessions.lock().await;
-        let session = sessions.get_mut(id).context("playback session not found or expired")?;
+        let session = sessions.get_mut(session_id).context("playback session not found or expired")?;
         session.touched = Some(Instant::now());
         Ok((session.variant_key.clone(), session.target))
     }
 
-    async fn desired_threads(&self, key: &str, buffered_until: f64) -> Result<usize> {
+    async fn desired_threads(
+        &self, cache_manager: &CacheManager, variant_key: &str, buffered_until: f64,
+    ) -> Result<usize> {
         let sessions = self.sessions.lock().await;
         let target = sessions.values()
-            .filter(|session| session.variant_key == key)
+            .filter(|session| session.variant_key == variant_key)
             .map(|session| session.target)
             .max_by(f64::total_cmp);
         let target = target.context("playback session ended before cache generation started")?;
-        let (base, maximum) = self.cache.thread_limits();
+        let (base, maximum) = cache_manager.thread_limits();
         Ok(select_threads(target, buffered_until, base, maximum))
     }
 
-    async fn refresh_variant(&self, key: &str) -> Result<()> {
+    async fn refresh_variant(&self, cache_manager: &CacheManager, variant_key: &str) -> Result<()> {
         let sessions = self.sessions.lock().await;
-        if !sessions.values().any(|session| session.variant_key == key) {
-            self.cache.release(key).await?;
+        if !sessions.values().any(|session| session.variant_key == variant_key) {
+            cache_manager.release(variant_key).await?;
         }
         Ok(())
     }
@@ -208,24 +208,25 @@ mod policy_tests {
 }
 
 // 锁内批量摘除过期会话, 锁外逐一清理, 单个失败不能阻断其余租约释放.
-async fn expire(manager: &SessionManager) -> Result<()> {
+async fn expire(manager: &SessionManager, cache_manager: &CacheManager) -> Result<()> {
     let expired = {
         let mut sessions = manager.sessions.lock().await;
-        let ids: Vec<_> = sessions.iter().filter(|(_, session)| match session.touched {
+        let expired_session_ids: Vec<_> = sessions.iter().filter(|(_, session)| match session.touched {
             Some(touched) => touched.elapsed().as_secs() >= manager.idle_seconds,
             None => session.created.elapsed().as_secs() >= manager.idle_seconds.max(120),
         })
-            .map(|(id, _)| id.clone()).collect();
-        ids.into_iter().filter_map(|id| sessions.remove(&id)).collect::<Vec<_>>()
+            .map(|(session_id, _)| session_id.clone()).collect();
+        expired_session_ids.into_iter()
+            .filter_map(|session_id| sessions.remove(&session_id)).collect::<Vec<_>>()
     };
     let mut errors = Vec::new();
     let variants: std::collections::HashSet<_> = expired.iter().map(|session| session.variant_key.clone()).collect();
-    for key in variants {
-        if let Err(error) = manager.refresh_variant(&key).await {
-            errors.push(format!("variant {key}: {error:#}"));
+    for variant_key in variants {
+        if let Err(error) = manager.refresh_variant(cache_manager, &variant_key).await {
+            errors.push(format!("variant {variant_key}: {error:#}"));
         }
     }
-    if let Err(error) = manager.cache.maintain().await { errors.push(format!("{error:#}")); }
+    if let Err(error) = cache_manager.maintain().await { errors.push(format!("{error:#}")); }
     ensure!(errors.is_empty(), "session expiration failed: {}", errors.join("; "));
     Ok(())
 }
@@ -244,11 +245,11 @@ async fn expire(manager: &SessionManager) -> Result<()> {
 //         // 测试负责创建缓存挂载目录, 管理器要求根目录已经存在.
 //         tokio::fs::create_dir(&root).await.unwrap();
 //         let cache = CacheManager::new(root.clone(), PlaybackConfig::default(), Processes::new(2, 16)).await.unwrap();
-//         let manager = SessionManager::new(cache, 20);
+//         let manager = SessionManager::new(20);
 //         {
 //             let mut sessions = manager.sessions.lock().await;
-//             for (id, seconds) in [("loading", 30), ("abandoned", 121)] {
-//                 sessions.insert(id.to_string(), Session {
+//             for (session_id, seconds) in [("loading", 30), ("abandoned", 121)] {
+//                 sessions.insert(session_id.to_string(), Session {
 //                     variant_key: "a".repeat(32), touched: None,
 //                     created: Instant::now() - Duration::from_secs(seconds),
 //                 });
@@ -272,10 +273,10 @@ async fn expire(manager: &SessionManager) -> Result<()> {
 //         let processes = Processes::new(2, 16);
 //         let permit = processes.slots.acquire_many(2).await.unwrap();
 //         let cache = CacheManager::new(root.clone(), PlaybackConfig::default(), processes.clone()).await.unwrap();
-//         let manager = SessionManager::new(cache.clone(), 60);
+//         let manager = SessionManager::new(60);
 //         let (info, request) = fixture();
 //         let spec = EncodeSpec::new(&"a".repeat(32), "video.mkv".into(), info, request, None).unwrap();
-//         let key = spec.config.key().unwrap();
+//         let variant_key = spec.config.variant_key();
 //         let (first, second) = tokio::join!(manager.create(spec.clone()), manager.create(spec));
 //         // 从响应 JSON 读取会话 ID, 验证模型迁移后 flatten 及轨道字段保持不变.
 //         let first = serde_json::to_value(first.unwrap()).unwrap();
@@ -286,8 +287,8 @@ async fn expire(manager: &SessionManager) -> Result<()> {
 //         let first = first["session_id"].as_str().unwrap().to_owned();
 //         let second = second["session_id"].as_str().unwrap().to_owned();
 //         assert_ne!(first, second);
-//         let output = cache.get(&key).await.unwrap();
-//         assert!(Arc::ptr_eq(&output, &cache.get(&key).await.unwrap()));
+//         let output = cache.get(variant_key).await.unwrap();
+//         assert!(Arc::ptr_eq(&output, &cache.get(variant_key).await.unwrap()));
 //         manager.release(&first).await.unwrap();
 //         manager.release(&first).await.unwrap();
 //         assert!(manager.status(&first).await.is_err());
@@ -298,7 +299,7 @@ async fn expire(manager: &SessionManager) -> Result<()> {
 //         manager.expire().await.unwrap();
 //         assert!(manager.status(&second).await.is_err());
 //         tokio::time::timeout(Duration::from_secs(3), async {
-//             while cache.get(&key).await.is_ok() { tokio::time::sleep(Duration::from_millis(5)).await; }
+//             while cache.get(variant_key).await.is_ok() { tokio::time::sleep(Duration::from_millis(5)).await; }
 //         }).await.unwrap();
 //         assert!(manager.media_path(&second, "init.mp4").await.is_err());
 //         manager.shutdown().await.unwrap();

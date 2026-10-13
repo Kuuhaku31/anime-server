@@ -1,14 +1,14 @@
 //! 探测并缓存媒体轨道元数据.
 
-use std::{collections::HashMap, path::Path, time::{Duration, SystemTime}};
+use std::{collections::HashMap, path::Path, time::SystemTime};
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{Context, Result};
 use serde::Deserialize;
 use tokio::process::Command;
 
-use crate::models::{Attachment, MediaInfo, Track};
+use crate::{constants, models::{Attachment, MediaInfo, Track}};
 use crate::video::Processes;
-use crate::{db, utils};
+use crate::db;
 use super::CacheManager;
 
 
@@ -21,41 +21,63 @@ pub(super) struct MetadataEntry {
 
 impl CacheManager {
 
-    // retry 绕过成功缓存, 失败结果不写入 Map.
-    pub(crate) async fn media_info(&self, id: &str, retry: bool) -> Result<MediaInfo> {
-        ensure!(utils::check_md5_ok(id), "invalid source file ID");
-        let now = SystemTime::now();
-        {
-            let mut entries = self.inner.metadata.lock().await;
-            prune_metadata(&mut entries, now);
-            if !retry {
-                if let Some(entry) = entries.get_mut(id) {
-                    entry.last_access = now;
-                    return Ok(entry.info.clone());
-                }
+    // retry 绕过成功缓存, 失败结果不写入 Map. 使用缓存
+    pub(crate) async fn media_info(&self, file_id: &str) -> Result<MediaInfo, String> {
+        self.get_media_info(file_id, true).await
+    }
+
+    // 强制重新探测媒体信息, 绕过缓存.
+    pub(crate) async fn media_info_force(&self, file_id: &str) -> Result<MediaInfo, String> {
+        self.get_media_info(file_id, false).await
+    }
+
+    // 实际逻辑
+    async fn get_media_info(&self, file_id: &str, use_cache: bool)
+        -> Result<MediaInfo, String>
+    {
+        // 参数准备
+        let mut entries = self.inner.metadata.lock().await; // 解锁
+        let now      = SystemTime::now();
+        let database = &self.inner.database;
+        let process  = &self.inner.processes;
+
+        // 清理过期的缓存条目, 保留最近访问的 1000 条记录.
+        entries.retain(|_, e|
+            now.duration_since(e.last_access)
+            .unwrap_or_default() < constants::MEDIA_INFO_CACHE_MAX_DURATION
+        );
+        while entries.len() > constants::MEDIA_INFO_CACHE_MAX {
+            let Some(oldest) = entries.iter()
+            .min_by_key(|(_, e)| e.last_access).map(|(k, _)| k.clone())
+            else { break; };
+            entries.remove(&oldest);
+        }
+
+        // 检查缓存中是否已有条目
+        if use_cache {
+            if let Some(entry) = entries.get_mut(file_id) {
+                entry.last_access = now;
+                return Ok(entry.info.clone()); // 返回缓存中的媒体信息
             }
         }
 
-        let path = db::get_a_video_path_by_id(&self.inner.database, id).await?
-            .context("video file not found")?;
-        let info = probe(&path, &self.inner.processes).await?;
-        let mut entries = self.inner.metadata.lock().await;
-        entries.insert(id.to_string(), MetadataEntry { info: info.clone(), last_access: now });
-        prune_metadata(&mut entries, SystemTime::now());
+        // 获取一个源文件地址
+        let path = db::get_a_video_path_by_file_id(&database, file_id).await
+        .map_err(|error| format!("error when getting video path by file ID: {error}"))?
+        .ok_or_else(|| format!("video file not found: {file_id}"))?;
+
+        // 探测并写入缓存
+        let info = probe(&path, &process).await.map_err(|e|
+            format!("failed to probe media info: {}", e)
+        )?;
+        entries.insert(file_id.to_string(), MetadataEntry { info: info.clone(), last_access: now });
+
         Ok(info)
     }
 }
 
 
-fn prune_metadata(entries: &mut HashMap<String, MetadataEntry>, now: SystemTime) {
-    entries.retain(|_, entry| now.duration_since(entry.last_access).unwrap_or_default() < Duration::from_secs(3600));
-    while entries.len() > 1000 {
-        let Some(oldest) = entries.iter().min_by_key(|(_, entry)| entry.last_access).map(|(key, _)| key.clone()) else {
-            break;
-        };
-        entries.remove(&oldest);
-    }
-}
+
 
 /// 解析媒体文件并归一化 ffprobe 结果.
 async fn probe(path: &Path, processes: &Processes) -> Result<MediaInfo> {
@@ -150,7 +172,9 @@ async fn probe(path: &Path, processes: &Processes) -> Result<MediaInfo> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::time::Duration;
+
+use super::*;
 
     fn media_info() -> MediaInfo {
         MediaInfo {
@@ -169,16 +193,26 @@ mod tests {
         let mut entries = HashMap::new();
         entries.insert("expired".to_string(), MetadataEntry {
             info: media_info(),
-            last_access: now - Duration::from_secs(3601),
+            last_access: now - constants::MEDIA_INFO_CACHE_MAX_DURATION - Duration::from_secs(1),
         });
         for index in 0..1001 {
             entries.insert(format!("item-{index}"), MetadataEntry {
                 info: media_info(),
-                last_access: now - Duration::from_secs(index),
+                last_access: now - Duration::from_secs(index as u64),
             });
         }
 
-        prune_metadata(&mut entries, now);
+        {
+            let entries: &mut HashMap<String, MetadataEntry> = &mut entries;
+            entries.retain(|_, entry| now.duration_since(entry.last_access).unwrap_or_default() < constants::MEDIA_INFO_CACHE_MAX_DURATION);
+            while entries.len() > constants::MEDIA_INFO_CACHE_MAX {
+                let Some(oldest_file_id) = entries.iter().min_by_key(|(_, entry)| entry.last_access)
+                    .map(|(file_id, _)| file_id.clone()) else {
+                    break;
+                };
+                entries.remove(&oldest_file_id);
+            }
+        };
 
         assert_eq!(entries.len(), 1000);
         assert!(!entries.contains_key("expired"));

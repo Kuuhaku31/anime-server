@@ -69,13 +69,13 @@ function server(context, generated = 120) {
       sessions.delete(url.split("/").at(-1));
       return new Response(null, { status: 204 });
     } else if (url.endsWith("/playback")) {
-      const id = `session-${calls.filter((call) => call.url.endsWith("/playback")).length}`;
+      const sessionId = `session-${calls.filter((call) => call.url.endsWith("/playback")).length}`;
       result = {
-        session_id: id, url: `/playback/${id}/index.m3u8`, start_time: 0,
+        session_id: sessionId, url: `/playback/${sessionId}/index.m3u8`, start_time: 0,
         mime_type: "application/vnd.apple.mpegurl", duration: 120, position: body?.position ?? 12.375,
         phase: "running", buffered_until: generated,
       };
-      sessions.set(id, result);
+      sessions.set(sessionId, result);
       // 模拟服务端默认选择, 明确区分字段缺省与显式 null.
       result = { ...result, media: info, selection: {
         audio: body && "audio_stream_index" in body ? body.audio_stream_index : 1,

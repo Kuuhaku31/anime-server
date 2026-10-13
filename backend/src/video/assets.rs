@@ -9,27 +9,30 @@ use super::{models::EncodeSpec, process::checked_output_cancellable};
 
 /// 资源只属于本次字幕渲染任务, 不进入持久播放配置或缓存身份.
 pub(crate) struct RenderAssets {
-    id: String,
+    generation_id: String,
     subtitle: PathBuf,
     fonts: PathBuf,
 }
 
 impl RenderAssets {
     pub(crate) async fn allocate(root: &Path) -> Result<Self> {
-        let id = crate::utils::random_id()?;
-        let subtitle = root.join("subtitles").join(format!("{id}.ass"));
-        let fonts = root.join("fonts").join(&id);
+        let generation_id = crate::utils::random_id()?;
+        let subtitle = root.join("subtitles").join(format!("{generation_id}.ass"));
+        let fonts = root.join("fonts").join(&generation_id);
         tokio::fs::create_dir(&fonts).await?;
         if let Err(error) = tokio::fs::OpenOptions::new().write(true).create_new(true).open(&subtitle).await {
             tokio::fs::remove_dir(&fonts).await.context("cannot clean unused font directory")?;
             return Err(error).context("cannot allocate temporary subtitle");
         }
-        Ok(Self { id, subtitle, fonts })
+        Ok(Self { generation_id, subtitle, fonts })
     }
 
     pub(super) fn filter(&self) -> String {
         // FFmpeg 在 variant 的私有工作目录运行, 路径只包含服务端生成的十六进制名称.
-        format!("subtitles=filename='../../../subtitles/{}.ass':fontsdir='../../../fonts/{}'", self.id, self.id)
+        format!(
+            "subtitles=filename='../../../subtitles/{}.ass':fontsdir='../../../fonts/{}'",
+            self.generation_id, self.generation_id,
+        )
     }
 
     pub(crate) async fn prepare(&self, spec: &EncodeSpec, seconds: u64, cancel: &mut watch::Receiver<bool>) -> Result<()> {
