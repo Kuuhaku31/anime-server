@@ -151,7 +151,8 @@ Web 界面在缓存状态及生成范围连续 180 秒没有进展时显示错�
 HLS 元数据加载最多等待 30 秒, 超时后显示错误并释放租约.
 最后一个租约释放时, 编码器最多再提交一个完整分片, 30 秒内仍未完成则强制停止.
 
-缓存恢复与编码启动分两步. CacheManager 恢复磁盘状态并返回 `buffered_until` 快照,
+缓存恢复与编码启动分两步. CacheManager 恢复磁盘状态并返回包含阶段, revision,
+`buffered_until` 和 duration 的窄快照,
 不读取或保存会话等待位置. SessionManager 在创建会话时聚合同一 variant 的最大 position;
 当该位置大于或等于快照尾部时请求 `max_variant_threads`, 否则请求基础线程数.
 CacheManager 校验线程数范围, 并在 FFmpeg 实际启动前接受并发会话更新的请求.
@@ -322,15 +323,22 @@ v2 固定无 B 帧, 视频时间基 90000, 音频时间基 48000, AAC 预热处�
 每个客户端仍获得独立会话 ID 和媒体地址. 最多允许 32 个租约和 32 个排队或生成中的缓存任务.
 运行时 `HashMap<variant-key, Arc<CacheFolder>>` 只保存活动元素.
 SessionManager 保存会话到 variant-key 的关联, 各会话目标及保活时间, 并将同一变体的最大目标
-汇总到缓存文件夹. 最后一个会话离开后, 缓存生成停止; worker 收尾且媒体文件打开保护引用释放后,
-维护任务才从活动 Map 移除该文件夹.
-查询播放状态时, CacheManager 返回字段私有的 FolderState 克隆快照, SessionManager 通过只读 getter
-读取状态并构造 SessionStatus. 媒体时长由 CacheManager 独立读取, 不重复保存在 FolderState 中.
+汇总以选择线程预算. `FolderPhase` 使用 `loading`, `ready`, `running`, `stopping`, `complete`,
+`failed` 六个状态, 取代相互独立的布尔标记. Loading 完成后转入 Ready 或 Complete;
+Ready 的 start 转入 Running, 生成到 EOF 转入 Complete, 显式内部 pause 在安全分片边界返回 Ready.
+运行失败转入 Failed, 下一次 acquire 在原活动条目内重试 Loading.
+最后一个会话离开时, Ready, Complete 和 Failed 立即从活动 Map 移除;
+Loading 先完成恢复再移除, Running 转入 Stopping 并最多提交一个完整分片.
+Stopping worker 收尾后从 Map 移除, 停止阶段的错误只记录日志, 不对外转换成 Failed.
+活动 Map 条目本身就是租约标记, FolderState 不保存 active 或 inactive 字段.
+查询播放状态时, CacheManager 返回包含 phase, revision, buffered_until 和 duration 的窄快照,
+SessionManager 据此构造 SessionStatus; 前端只根据 `position < buffered_until` 判断目标是否可播.
+释放后的缓存文件夹只由弱引用登记, 使正在打开媒体文件的 CachePin 暂时阻止 LRU 移动其目录.
 状态和媒体请求必须通过 session 及活动集合, 不支持按客户端提供的缓存键访问磁盘.
 
-最后一个租约离开时, 排队和准备任务立即取消; 编码任务记录当前已提交数量,
-最多再验证和发布一个分片后停止. 30 秒未等到新分片则强制终止并回收进程.
-停止期间新租约可撤销尚未结束的停止请求; 如果已经开始最终清理, 则等待旧写入者退出.
+最后一个租约离开时, Loading 任务完成磁盘恢复后退出; Running 尚未启动 FFmpeg 时立即取消,
+正在编码时最多再验证和发布一个完整分片后停止. 30 秒未等到分片则强制终止并回收进程.
+进入 Stopping 后不再接纳新租约, acquire 等待旧写入者退出和条目移除后重新恢复磁盘缓存.
 DELETE 不等待此过程. 服务正常关闭采用相同停止规则, Compose 的宽限期为 40 秒.
 
 不保存 `metadata.json` 或单独的持久缓存索引.

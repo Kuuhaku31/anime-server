@@ -8,7 +8,7 @@ use tokio::{sync::Mutex, time::interval};
 use tracing::warn;
 
 use crate::models::{MediaInfo, PlaybackRequest, PlaybackStart, PlaybackVariantConfig};
-use crate::cache::{CacheManager, CachePin};
+use crate::cache::{CacheManager, CachePhase, CachePin};
 
 use crate::video::playback_target;
 
@@ -21,13 +21,8 @@ pub(crate) struct SessionStatus {
     start_time: f64,
     pub(crate) duration: f64,
     position: f64,
-    complete: bool,
-    generating: bool,
-    stopping: bool,
-    ready: bool,
+    phase: CachePhase,
     buffered_until: f64,
-    encoding_threads: usize,
-    error: Option<String>,
 }
 
 // 会话保存变体键, 目标位置和存活时间, 媒体状态由缓存文件夹维护.
@@ -93,24 +88,13 @@ impl SessionManager {
         self.cache.media_info(id, retry).await
     }
 
-    // 状态, 媒体和显式心跳请求都经此续期, 客户端不能自行提供缓存键.
-    async fn get_session(&self, id: &str) -> Result<(String, f64)> {
-        let mut sessions = self.sessions.lock().await;
-        let session = sessions.get_mut(id).context("playback session not found or expired")?;
-        session.touched = Some(Instant::now());
-        Ok((session.variant_key.clone(), session.target))
-    }
-
     pub(crate) async fn status(&self, id: &str) -> Result<SessionStatus> {
         let (key, target) = self.get_session(id).await?;
         let status = self.cache.status(&key).await?;
-        let duration = self.cache.duration(&key).await?;
         Ok(SessionStatus {
             session_id: id.to_string(), url: format!("/playback/{id}/index.m3u8?revision={}", status.revision()),
-            mime_type: "application/vnd.apple.mpegurl", start_time: 0.0, duration,
-            position: target, complete: status.complete(), generating: status.generating(),
-            stopping: status.stopping(), ready: status.ready(), buffered_until: status.buffered_until(),
-            encoding_threads: status.encoding_threads(), error: status.error().map(str::to_owned),
+            mime_type: "application/vnd.apple.mpegurl", start_time: 0.0, duration: status.duration(),
+            position: target, phase: status.phase(), buffered_until: status.buffered_until(),
         })
     }
 
@@ -130,6 +114,12 @@ impl SessionManager {
             session.touched = Some(Instant::now());
         }
         self.status(id).await
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn pause(&self, id: &str) -> Result<()> {
+        let (key, _) = self.get_session(id).await?;
+        self.cache.pause(&key).await
     }
 
     pub(crate) async fn media_path(
@@ -152,25 +142,6 @@ impl SessionManager {
         Ok(())
     }
 
-    async fn desired_threads(&self, key: &str, buffered_until: f64) -> Result<usize> {
-        let sessions = self.sessions.lock().await;
-        let target = sessions.values()
-            .filter(|session| session.variant_key == key)
-            .map(|session| session.target)
-            .max_by(f64::total_cmp);
-        let target = target.context("playback session ended before cache generation started")?;
-        let (base, maximum) = self.cache.thread_limits();
-        Ok(select_threads(target, buffered_until, base, maximum))
-    }
-
-    async fn refresh_variant(&self, key: &str) -> Result<()> {
-        let sessions = self.sessions.lock().await;
-        if !sessions.values().any(|session| session.variant_key == key) {
-            self.cache.release(key).await?;
-        }
-        Ok(())
-    }
-
     pub(crate) fn spawn_expiration(&self) {
         let manager = self.clone();
         tokio::spawn(async move {
@@ -188,6 +159,33 @@ impl SessionManager {
     pub(crate) async fn shutdown(&self) -> Result<()> {
         self.sessions.lock().await.clear();
         self.cache.shutdown().await
+    }
+
+    // 状态, 媒体和显式心跳请求都经此续期, 客户端不能自行提供缓存键.
+    async fn get_session(&self, id: &str) -> Result<(String, f64)> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions.get_mut(id).context("playback session not found or expired")?;
+        session.touched = Some(Instant::now());
+        Ok((session.variant_key.clone(), session.target))
+    }
+
+    async fn desired_threads(&self, key: &str, buffered_until: f64) -> Result<usize> {
+        let sessions = self.sessions.lock().await;
+        let target = sessions.values()
+            .filter(|session| session.variant_key == key)
+            .map(|session| session.target)
+            .max_by(f64::total_cmp);
+        let target = target.context("playback session ended before cache generation started")?;
+        let (base, maximum) = self.cache.thread_limits();
+        Ok(select_threads(target, buffered_until, base, maximum))
+    }
+
+    async fn refresh_variant(&self, key: &str) -> Result<()> {
+        let sessions = self.sessions.lock().await;
+        if !sessions.values().any(|session| session.variant_key == key) {
+            self.cache.release(key).await?;
+        }
+        Ok(())
     }
 }
 

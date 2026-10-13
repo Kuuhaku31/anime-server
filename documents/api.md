@@ -199,13 +199,8 @@ curl -X POST http://localhost:56080/api/files/FILE_ID/playback \
   "start_time": 0.0,
   "duration": 1400.0,
   "position": 125.5,
-  "complete": false,
-  "generating": true,
-  "stopping": false,
-  "ready": false,
+  "phase": "running",
   "buffered_until": 0.0,
-  "encoding_threads": 8,
-  "error": null,
   "media": {
     "duration": 1400.0,
     "video_tracks": [],
@@ -250,20 +245,18 @@ curl -X POST http://localhost:56080/api/playback/SESSION_ID/target \
 拒绝未知字段, 成功返回 `200` 和最新状态. 只改变会话目标, 不保存观看记录,
 不创建新会话, 不启动跳转位置的独立任务, 也不热调已运行编码器的线程数.
 
-缓存只有 `complete: true` 和 `false` 两种状态. `generating`, `stopping`,
-`encoding_threads` 和 `error` 独立描述任务活动, 不再返回状态枚举.
-`generating` 也包括排队, 准备和最终清理, 实际编码器未运行时 `encoding_threads` 为 0.
+`phase` 是缓存文件夹的当前状态: `loading` 正在恢复磁盘缓存, `ready` 表示缓存不完整且空闲,
+`running` 表示正在生成或排队, `stopping` 表示正在安全停止, `complete` 表示缓存已完整验证,
+`failed` 表示恢复或生成失败. 状态响应不包含内部错误详情或编码线程数.
 首次激活先登记唯一活动元素再校验磁盘, 创建响应等待加载结果, 不把完整缓存误报为新空缓存.
 尚未返回 ID 的创建预留使用 `max(idle_timeout_seconds, 120)` 秒宽限,
 防止等待清理时提前过期, 也避免被中断的创建请求永久占用名额.
 
-前端准备阶段轮询状态,
-播放或暂停期间, 生成任务活动时每秒查询状态以刷新缓存进度,
-任务结束后每 10 秒查询状态保活; 媒体请求也延长会话有效期.
+前端在 `loading`, `running`, `stopping` 阶段每秒轮询状态,
+在 `ready`, `complete`, `failed` 阶段每 10 秒查询状态保活; 媒体请求也延长会话有效期.
 `buffered_until` 是从时间 0 开始已经生成的范围终点, 不是浏览器本地缓冲长度.
-`ready: true` 只表示至少一个分片已通过验证. 目标必须满足 `target < buffered_until`;
-相等仍需等待. 已发布前缀可以在后续生成失败后继续播放, 未覆盖目标则明确报错,
-需要用户 Retry, 不自动启动新编码器.
+目标必须满足 `target < buffered_until`; 相等仍需等待. 已发布前缀可以在后续生成失败后继续播放,
+未覆盖位置等待期间若失败则使用通用无进展超时报错, 不暴露底层错误详情.
 最后一个租约释放或过期后, 停止任务并从活动集合移除, 磁盘缓存保留到 LRU 淘汰.
 
 ## 释放会话与媒体资源
@@ -307,5 +300,5 @@ Axum 的 JSON 提取错误或静态文件服务错误可能使用框架自身的
 | `500`  | 数据库或扫描失败, 会话创建或释放失败, 资源读取等内部错误                   |
 
 错误类型取决于接口中的映射, 不保证每个底层错误都有独立状态码.
-异步字幕准备或编码失败由成功状态响应中的 `error` 字段返回,
-不表示该 HTTP 状态查询本身失败. 已发布前缀仍可服务, 未覆盖目标需要手动 Retry.
+异步字幕准备或编码失败会反映为状态中的 `phase: "failed"`, 不表示该 HTTP 状态查询本身失败.
+状态不返回底层错误详情. 已发布前缀仍可服务, 未覆盖目标等待无进展超时后需要手动 Retry.

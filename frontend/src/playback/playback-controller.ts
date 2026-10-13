@@ -64,9 +64,13 @@ export class PlaybackController extends EventTarget {
     window.setInterval(() => {
       if (!this.pending && this.loaded && !video.paused) this.persist().catch((error) => this.fail(error));
     }, 5000);
-    // 活动生成每秒刷新, 完成或失败后只保留低频心跳, 等待阶段由 loadRange 自行轮询.
-    window.setInterval(() => { if (this.session?.generating) void this.report(); }, 1000);
-    window.setInterval(() => { if (!this.session?.generating) void this.report(); }, 10_000);
+    // 活动阶段每秒刷新, 静态阶段仅保留低频心跳, 等待阶段由 loadRange 自行轮询.
+    window.setInterval(() => {
+      if (this.session && ["loading", "running", "stopping"].includes(this.session.phase)) void this.report();
+    }, 1000);
+    window.setInterval(() => {
+      if (this.session && !["loading", "running", "stopping"].includes(this.session.phase)) void this.report();
+    }, 10_000);
     document.addEventListener("visibilitychange", () => {
       if (document.hidden) this.persist(true).catch((error) => console.error("Progress save failed", error));
       else if (!this.pending) void this.report();
@@ -288,11 +292,8 @@ export class PlaybackController extends EventTarget {
     while (true) {
       signal.throwIfAborted();
       if (!this.session || this.session.session_id !== id) throw new Error("Playback session changed");
-      // 生成失败不抹去已验证的前缀, 只有等待未覆盖位置的客户端需要终止并 Retry.
-      if (this.session.ready && rangeReady(position, this.session.buffered_until)) break;
-      if (this.session.error) throw new Error(this.session.error);
-      if (this.session.complete) throw new Error("Cached video does not cover the requested position.");
-      if (!this.session.generating) throw new Error("Cache generation is not active. Retry playback.");
+      if (rangeReady(position, this.session.buffered_until)) break;
+      if (this.session.phase === "complete") throw new Error("Cached video does not cover the requested position.");
       // 超时只限制持续无进展, 生成前进或调度状态变化都会刷新等待期限.
       if (this.session.buffered_until > generated || this.activity(this.session) !== activity) {
         generated = this.session.buffered_until;
@@ -300,9 +301,11 @@ export class PlaybackController extends EventTarget {
         deadline = Date.now() + 180_000;
       }
       if (Date.now() > deadline) throw new Error("Cache generation made no progress for 180 seconds. Retry later.");
-      this.message = this.session.encoding_threads === 0
-        ? `Preparing cache or waiting for a media process slot. Waiting for ${formatTime(position)}...`
-        : `Generating cache (${this.session.encoding_threads} threads): ${formatTime(this.session.buffered_until)} / ${formatTime(this.duration)}. Waiting for ${formatTime(position)}...`;
+      const phaseLabel = this.session.phase === "failed" ? "Cache generation failed"
+        : this.session.phase === "stopping" ? "Stopping cache generation"
+          : this.session.phase === "running" ? "Generating cache"
+            : "Preparing cache or waiting for a media process slot";
+      this.message = `${phaseLabel}: ${formatTime(this.session.buffered_until)} / ${formatTime(this.duration)}. Waiting for ${formatTime(position)}...`;
       this.changed();
       await wait(500, signal);
       const status: PlaybackSession = await request<PlaybackSession>(`/api/playback/${id}/status`, { signal });
@@ -312,7 +315,7 @@ export class PlaybackController extends EventTarget {
     signal.throwIfAborted();
     await this.adapter.attach(this.session.url, position, signal, (error) => this.fatal(error));
     this.loaded = true;
-    this.error = this.session.error ?? "";
+    this.error = "";
     this.playRequested = autoplay;
     this.message = autoplay ? "Starting playback..." : "Paused";
     if (autoplay) {
@@ -327,7 +330,7 @@ export class PlaybackController extends EventTarget {
   }
 
   private activity(session: PlaybackSession): string {
-    return `${session.generating}/${session.stopping}/${session.encoding_threads}`;
+    return session.phase;
   }
 
   private updateTarget(position: number, signal?: AbortSignal): Promise<void> {
@@ -377,9 +380,8 @@ export class PlaybackController extends EventTarget {
       // 响应返回前可能已换轨或进入拖动等待, 旧响应不能覆盖当前操作状态.
       if (this.session?.session_id !== id || this.pending) return;
       this.session = status;
-      if (status.error) {
-        if (!rangeReady(this.position, status.buffered_until)) throw new Error(status.error);
-        this.error = status.error;
+      if (status.phase === "failed" && rangeReady(this.position, status.buffered_until)) {
+        this.error = "";
         this.message = "Playing cached range. Cache generation stopped.";
       }
       this.changed();

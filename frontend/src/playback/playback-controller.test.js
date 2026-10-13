@@ -73,8 +73,7 @@ function server(context, generated = 120) {
       result = {
         session_id: id, url: `/playback/${id}/index.m3u8`, start_time: 0,
         mime_type: "application/vnd.apple.mpegurl", duration: 120, position: body?.position ?? 12.375,
-        complete: false, generating: true, stopping: false, encoding_threads: 8,
-        ready: true, buffered_until: generated, error: null,
+        phase: "running", buffered_until: generated,
       };
       sessions.set(id, result);
       // 模拟服务端默认选择, 明确区分字段缺省与显式 null.
@@ -126,10 +125,9 @@ test("active generation refreshes every second while paused and completion keeps
   await until(() => controller.session.buffered_until === 60);
   assert.ok(changes > 0);
   assert.equal(video.paused, true);
-  session.complete = true;
-  session.generating = false;
+  session.phase = "complete";
   timers.get(1000)();
-  await until(() => controller.session.complete);
+  await until(() => controller.session.phase === "complete");
   const polls = () => api.calls.filter((call) => call.url.endsWith("/status")).length;
   const completedPolls = polls();
   timers.get(1000)();
@@ -327,21 +325,21 @@ test("the exact cache boundary waits but even a sub-half-second covered target s
   await operation(controller, () => controller.stop());
 });
 
-test("a published prefix remains usable when generation fails beyond it", async (context) => {
+test("a published prefix remains usable while an uncovered failed range waits", async (context) => {
   const api = server(context);
   const video = new Video();
   const controller = new PlaybackController(video);
   await operation(controller, () => controller.open(file));
   const session = [...api.sessions.values()][0];
-  session.error = "Test encoder failure";
-  session.generating = false;
+  session.phase = "failed";
   session.buffered_until = 20;
   await controller.report();
-  assert.equal(controller.error, "Test encoder failure");
+  assert.equal(controller.error, "");
+  assert.equal(controller.message, "Playing cached range. Cache generation stopped.");
   assert.equal(video.paused, false);
-  context.mock.method(console, "error", () => {});
-  await operation(controller, () => controller.seek(30));
-  assert.equal(controller.error, "Test encoder failure");
-  assert.equal(api.sessions.size, 0);
-  assert.equal(api.creations().length, 1);
+  controller.seek(30);
+  await until(() => controller.message.includes("Cache generation failed"));
+  assert.equal(controller.pending, true);
+  assert.equal(api.sessions.size, 1);
+  await operation(controller, () => controller.stop());
 });

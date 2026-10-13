@@ -1,14 +1,18 @@
 // 统一原视频时间轴和已生成范围的边界计算.
 import type { PlaybackSession } from "../state/player-state.ts";
 
-// 使用服务端已验证前缀展示生成进度, 完成标记优先于分片末端的时间舍入差异.
+// 使用服务端阶段与已验证前缀展示生成进度.
 export function cacheProgress(session: PlaybackSession): { percent: number; text: string } {
   const seconds = Math.min(session.duration, session.buffered_until);
-  const percent = session.complete ? 100 : Math.min(100, 100 * seconds / session.duration);
-  const state = session.complete ? "Complete" : session.error ? "Generation failed"
-    : session.stopping ? "Stopping" : session.generating
-      ? session.encoding_threads > 0 ? `Generating (${session.encoding_threads} threads)` : "Preparing / queued"
-      : "Stopped";
+  const percent = session.phase === "complete" ? 100 : Math.min(100, 100 * seconds / session.duration);
+  const state = {
+    loading: "Preparing / queued",
+    ready: "Ready",
+    running: "Generating",
+    stopping: "Stopping",
+    complete: "Complete",
+    failed: "Generation failed",
+  }[session.phase];
   return {
     percent,
     text: `${state}: ${percent.toFixed(1)}% / ${formatTime(seconds)} of ${formatTime(session.duration)}`,

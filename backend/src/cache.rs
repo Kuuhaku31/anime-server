@@ -3,11 +3,12 @@
 use std::{
     collections::{hash_map::Entry, HashMap},
     fs::File, future::Future, path::{Path, PathBuf},
-    sync::{atomic::{AtomicU64, Ordering}, Arc},
+    sync::{atomic::{AtomicU64, Ordering}, Arc, Weak},
     time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::{bail, ensure, Context, Result};
+use serde::Serialize;
 use tokio::{process::Child, sync::{watch, Mutex, Notify, OwnedSemaphorePermit}, task::JoinSet, time::interval};
 use tracing::{info, warn};
 
@@ -28,39 +29,78 @@ use crate::video::{
 use crate::models::PlaybackVariantConfig;
 
 
-/// 缓存文件夹状态, 对外仅提供克隆快照和只读 getter.
-#[derive(Clone)]
-pub(crate) struct FolderState {
-    media: CachedMedia,
-    // 恢复完成前的空 media 只是占位, 不能作为创建响应返回.
-    loaded: bool,
-    active: bool,
-    // worker 覆盖整个任务生命周期, encoding 仅表示编码进程仍在运行.
-    worker_active: bool,
-    encoding: bool,
-    // 开始最终清理后不能撤销停止, 新租约必须等待旧写入者退出.
-    finalizing: bool,
-    encoding_threads: usize,
-    desired_threads: usize,
-    start_requested: bool,
-    stop_after: Option<usize>,
-    stop_deadline: Option<Instant>,
-    cancel: watch::Sender<bool>,
-    revision: u64,
-    last_used: SystemTime,
-    error: Option<String>,
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CachePhase {
+    Loading,
+    Ready,
+    Running,
+    Stopping,
+    Complete,
+    Failed,
 }
 
-impl FolderState {
-    // 媒体完整性与任务生命周期独立, 完整缓存仍可能处于收尾阶段.
-    pub(crate) fn complete(&self) -> bool { self.media.complete }
-    pub(crate) fn generating(&self) -> bool { self.worker_active }
-    pub(crate) fn stopping(&self) -> bool { self.stop_after.is_some() || self.finalizing }
-    pub(crate) fn ready(&self) -> bool { !self.media.segments.is_empty() }
-    pub(crate) fn buffered_until(&self) -> f64 { self.media.tail().seconds() }
-    pub(crate) fn encoding_threads(&self) -> usize { self.encoding_threads }
+/// SessionManager 所需的最小缓存状态快照.
+#[derive(Clone)]
+pub(crate) struct CacheSnapshot {
+    phase: CachePhase,
+    revision: u64,
+    buffered_until: f64,
+    duration: f64,
+}
+
+impl CacheSnapshot {
+    pub(crate) fn phase(&self) -> CachePhase { self.phase }
     pub(crate) fn revision(&self) -> u64 { self.revision }
-    pub(crate) fn error(&self) -> Option<&str> { self.error.as_deref() }
+    pub(crate) fn buffered_until(&self) -> f64 { self.buffered_until }
+    pub(crate) fn duration(&self) -> f64 { self.duration }
+}
+
+enum FolderPhase {
+    Loading { cancel: watch::Sender<bool> },
+    Ready,
+    Running {
+        cancel: watch::Sender<bool>,
+        desired_threads: usize,
+        encoding_threads: usize,
+        pause_after: Option<usize>,
+        deadline: Option<Instant>,
+    },
+    Stopping {
+        cancel: watch::Sender<bool>,
+        loading: bool,
+        stop_after: Option<usize>,
+        deadline: Option<Instant>,
+    },
+    Complete,
+    Failed,
+}
+
+impl FolderPhase {
+    fn snapshot(&self) -> CachePhase {
+        match self {
+            Self::Loading { .. } => CachePhase::Loading,
+            Self::Ready => CachePhase::Ready,
+            Self::Running { .. } => CachePhase::Running,
+            Self::Stopping { .. } => CachePhase::Stopping,
+            Self::Complete => CachePhase::Complete,
+            Self::Failed => CachePhase::Failed,
+        }
+    }
+
+    fn cancel(&self) -> Option<watch::Sender<bool>> {
+        match self {
+            Self::Loading { cancel } | Self::Running { cancel, .. } | Self::Stopping { cancel, .. } => Some(cancel.clone()),
+            Self::Ready | Self::Complete | Self::Failed => None,
+        }
+    }
+}
+
+struct FolderState {
+    media: CachedMedia,
+    phase: FolderPhase,
+    revision: u64,
+    last_used: SystemTime,
 }
 
 /// 文件打开期间持有缓存文件夹, 避免无活动会话时被 LRU 回收.
@@ -71,9 +111,9 @@ pub(crate) struct CachePin {
 /// 缓存统一入口, 独占目录锁并管理两个按需加载的 Map.
 ///
 /// new 校验缓存根目录并初始化临时资源目录和容量维护.
-/// media_info 查询或重试成功元数据缓存, acquire 恢复共享缓存并返回状态快照.
+/// media_info 查询或重试成功元数据缓存, acquire 恢复共享缓存并返回窄状态快照.
 /// start 校验并保存启动线程数, 但不接收播放等待位置.
-/// status 返回字段私有的 FolderState 快照, duration 独立读取不可变执行参数.
+/// status 仅返回 SessionManager 所需字段, 不泄露生成控制数据.
 /// shutdown 拒绝新请求, 停止生成任务并等待写入者退出.
 #[derive(Clone)]
 pub(crate) struct CacheManager {
@@ -110,6 +150,7 @@ impl CacheManager {
             inner: Arc::new(CacheInner {
                 root, config, database, processes, metadata: Mutex::new(HashMap::new()),
                 entries: Mutex::new(HashMap::new()),
+                folders: Mutex::new(HashMap::new()),
                 workers: Mutex::new(JoinSet::new()), maintenance: Mutex::new(()), stop,
                 _directory_lock: directory_lock,
             }),
@@ -122,9 +163,9 @@ impl CacheManager {
     }
 
     // 恢复并激活共享缓存, 不启动新的 FFmpeg 编码任务.
-    pub(crate) async fn acquire(&self, config: &PlaybackVariantConfig) -> Result<FolderState> {
+    pub(crate) async fn acquire(&self, config: &PlaybackVariantConfig) -> Result<CacheSnapshot> {
         let key = config.key().to_owned();
-        let output = loop {
+        loop {
             let entries = self.inner.entries.lock().await;
             ensure!(!self.is_stopping(), "server is shutting down");
             if let Some(output) = entries.get(&key).cloned() {
@@ -133,27 +174,31 @@ impl CacheManager {
                 notified.as_mut().enable();
                 let mut state = output.state.lock().await;
                 ensure!(output.spec.config == *config, "playback configuration hash collision");
-                if state.finalizing || (state.worker_active && *state.cancel.borrow()) {
-                    // 已开始回收的任务不可复活, 等待旧写入者退出后再从磁盘加载.
-                    drop(state);
-                    drop(entries);
-                    notified.await;
-                    continue;
-                }
-                state.active = true;
-                state.last_used = SystemTime::now();
-                state.stop_after = None;
-                state.stop_deadline = None;
-                if !state.media.complete && !state.worker_active {
-                    state.worker_active = true;
-                    state.error = None;
-                    state.cancel = watch::channel(false).0;
-                    state.start_requested = false;
-                    state.revision = REVISION.fetch_add(1, Ordering::Relaxed);
-                    self.spawn(&output).await;
-                }
+                let wait = match &state.phase {
+                    FolderPhase::Stopping { .. } => {
+                        drop(state);
+                        drop(entries);
+                        notified.await;
+                        continue;
+                    },
+                    FolderPhase::Failed => {
+                        state.phase = FolderPhase::Loading { cancel: watch::channel(false).0 };
+                        state.revision = REVISION.fetch_add(1, Ordering::Relaxed);
+                        state.last_used = SystemTime::now();
+                        true
+                    },
+                    _ => {
+                        state.last_used = SystemTime::now();
+                        if !matches!(state.phase, FolderPhase::Loading { .. }) {
+                            return Ok(output.snapshot(&state));
+                        }
+                        false
+                    },
+                };
                 drop(state);
-                break output.clone();
+                drop(entries);
+                if wait { self.spawn_load(&output).await; }
+                return output.wait_loaded().await;
             }
             ensure!(entries.len() < 32, "too many active playback configurations");
             drop(entries);
@@ -168,12 +213,9 @@ impl CacheManager {
             let output = Arc::new(CacheFolder {
                 key: key.to_string(), directory: self.inner.root.join("playback").join(&key), spec: spec.clone(),
                 state: Mutex::new(FolderState {
-                    media: CachedMedia::default(), loaded: false, active: true,
-                    worker_active: true, encoding: false, finalizing: false,
-                    encoding_threads: 0, desired_threads: self.inner.config.ffmpeg_threads,
-                    start_requested: false,
-                    stop_after: None, stop_deadline: None, cancel: watch::channel(false).0,
-                    revision: REVISION.fetch_add(1, Ordering::Relaxed), last_used: SystemTime::now(), error: None,
+                    media: CachedMedia::default(),
+                    phase: FolderPhase::Loading { cancel: watch::channel(false).0 },
+                    revision: REVISION.fetch_add(1, Ordering::Relaxed), last_used: SystemTime::now(),
                 }),
                 changed: Notify::new(),
             });
@@ -182,20 +224,18 @@ impl CacheManager {
                 Entry::Vacant(entry) => { entry.insert(output.clone()); },
                 Entry::Occupied(_) => bail!("playback activation raced while holding its lock"),
             }
-            self.spawn(&output).await;
-            break output;
-        };
-        output.wait_loaded().await?;
-        output.status().await
+            self.inner.folders.lock().await.insert(key.clone(), Arc::downgrade(&output));
+            drop(entries);
+            self.spawn_load(&output).await;
+            return output.wait_loaded().await;
+        }
     }
 
-    pub(crate) async fn status(&self, key: &str) -> Result<FolderState> {
-        self.get(key).await?.status().await
-    }
-
-    /// 时长来自不可变编码参数, 不在状态快照中重复保存.
-    pub(crate) async fn duration(&self, key: &str) -> Result<f64> {
-        Ok(self.get(key).await?.spec.duration)
+    pub(crate) async fn status(&self, key: &str) -> Result<CacheSnapshot> {
+        let output = self.get(key).await?;
+        let mut state = output.state.lock().await;
+        state.last_used = SystemTime::now();
+        Ok(output.snapshot(&state))
     }
 
     /// 返回 SessionManager 选择启动线程数所需的基础值和变体上限.
@@ -208,51 +248,93 @@ impl CacheManager {
         let (base, maximum) = self.thread_limits();
         ensure!(desired_threads >= base && desired_threads <= maximum,
             "requested encoder threads must be between {base} and {maximum}");
+        ensure!(!self.is_stopping(), "server is shutting down");
         loop {
-            ensure!(!self.is_stopping(), "server is shutting down");
             let output = self.get(key).await?;
             let notified = output.changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
             let mut state = output.state.lock().await;
-            ensure!(state.active, "playback cache has no active session");
-            if state.finalizing || (state.worker_active && *state.cancel.borrow()) {
-                drop(state);
-                notified.await;
-                continue;
-            }
-            if !state.request_start(desired_threads) { return Ok(()); }
             state.last_used = SystemTime::now();
-            if !state.worker_active {
-                state.worker_active = true;
-                state.error = None;
-                state.finalizing = false;
-                state.cancel = watch::channel(false).0;
-                state.revision = REVISION.fetch_add(1, Ordering::Relaxed);
-                self.spawn(&output).await;
+            let spawn = match &mut state.phase {
+                FolderPhase::Ready => {
+                    let (cancel, _) = watch::channel(false);
+                    state.phase = FolderPhase::Running {
+                        cancel, desired_threads, encoding_threads: 0, pause_after: None, deadline: None,
+                    };
+                    state.revision = REVISION.fetch_add(1, Ordering::Relaxed);
+                    true
+                },
+                FolderPhase::Running { cancel, desired_threads: requested, encoding_threads, .. } => {
+                    if *cancel.borrow() { drop(state); notified.await; continue; }
+                    if *encoding_threads == 0 { *requested = desired_threads; }
+                    false
+                },
+                FolderPhase::Complete => return Ok(()),
+                FolderPhase::Loading { .. } => bail!("cache has not finished loading"),
+                FolderPhase::Stopping { .. } => bail!("cache is stopping"),
+                FolderPhase::Failed => bail!("cache generation failed"),
+            };
+            drop(state);
+            if spawn {
+                self.spawn_generation(&output).await;
+                output.changed.notify_waiters();
             }
-            output.changed.notify_waiters();
             return Ok(());
         }
     }
 
-    /// 最后一个会话离开时标记为非活动并停止缓存生成.
+    /// SessionManager 可请求暂停, 但暂停策略仍由缓存任务在安全边界执行.
+    #[allow(dead_code)]
+    pub(crate) async fn pause(&self, key: &str) -> Result<()> {
+        let output = self.get(key).await?;
+        let mut state = output.state.lock().await;
+        let next_segment = state.media.segments.len() + 1;
+        if let FolderPhase::Running { cancel, encoding_threads, pause_after, deadline, .. } = &mut state.phase {
+            if *encoding_threads == 0 {
+                cancel.send_replace(true);
+            } else {
+                *pause_after = Some(next_segment);
+                *deadline = Some(Instant::now() + Duration::from_secs(30));
+            }
+        }
+        Ok(())
+    }
+
+    /// 最后一个会话离开时释放缓存 Map 条目或请求 worker 安全停止.
     pub(crate) async fn release(&self, key: &str) -> Result<()> {
-        let entries = self.inner.entries.lock().await;
+        let mut entries = self.inner.entries.lock().await;
         let Some(output) = entries.get(key).cloned() else { return Ok(()); };
         let mut state = output.state.lock().await;
-        if !state.active { return Ok(()); }
-        state.active = false;
         state.last_used = SystemTime::now();
-        if state.worker_active {
-            CacheFolder::stop(&mut state);
-        } else {
-            let persisted = persist_used(&output.directory, state.last_used).await;
-            output.changed.notify_waiters();
-            // 即使时间戳落盘失败, 后续维护也会清除无会话的文件夹记录.
-            persisted?;
+        match &state.phase {
+            FolderPhase::Loading { cancel } => {
+                state.phase = FolderPhase::Stopping {
+                    cancel: cancel.clone(), loading: true, stop_after: None, deadline: None,
+                };
+            },
+            FolderPhase::Running { cancel, encoding_threads, .. } => {
+                let cancel = cancel.clone();
+                let encoding = *encoding_threads > 0;
+                let (stop_after, deadline) = if encoding {
+                    (Some(state.media.segments.len() + 1), Some(Instant::now() + Duration::from_secs(30)))
+                } else { (None, None) };
+                state.phase = FolderPhase::Stopping { cancel: cancel.clone(), loading: false, stop_after, deadline };
+                if !encoding { cancel.send_replace(true); }
+            },
+            FolderPhase::Stopping { .. } => return Ok(()),
+            FolderPhase::Ready | FolderPhase::Complete | FolderPhase::Failed => {
+                drop(state);
+                entries.remove(key);
+                drop(entries);
+                output.changed.notify_waiters();
+                persist_used(&output.directory, SystemTime::now()).await?;
+                return Ok(());
+            },
         }
-        // 不等待 FFmpeg 完成当前分片. 回收和 LRU 由生成任务或定期维护完成.
+        drop(state);
+        drop(entries);
+        output.changed.notify_waiters();
         Ok(())
     }
 
@@ -263,7 +345,7 @@ impl CacheManager {
         ensure!(video::media_filename(name), "playback asset not found");
         let output = self.get(key).await?;
         let mut state = output.state.lock().await;
-        ensure!(state.active, "playback cache has no active session");
+        ensure!(!matches!(&state.phase, FolderPhase::Stopping { .. }), "playback cache is stopping");
         ensure!(!state.media.segments.is_empty(), "playback output is not ready");
         if let Some(index) = name.strip_prefix("segment_").and_then(|name| name.strip_suffix(".m4s")) {
             ensure!(index.parse::<usize>()? < state.media.segments.len(), "playback segment is not published");
@@ -285,18 +367,7 @@ impl CacheManager {
             }
         }
         let _maintenance = self.inner.maintenance.lock().await;
-        {
-            let mut entries = self.inner.entries.lock().await;
-            let mut removable = Vec::new();
-            for (key, folder) in entries.iter() {
-                if Arc::strong_count(folder) != 1 { continue; }
-                let state = folder.state.lock().await;
-                if !state.active && !state.worker_active && !state.finalizing {
-                    removable.push(key.clone());
-                }
-            }
-            for key in removable { entries.remove(&key); }
-        }
+        self.inner.folders.lock().await.retain(|_, folder| folder.strong_count() > 0);
         let root = self.inner.root.clone();
         let (mut total, mut candidates) = tokio::task::spawn_blocking(move || disk_usage(&root)).await??;
         candidates.sort_by_key(|candidate| candidate.0);
@@ -306,10 +377,16 @@ impl CacheManager {
             if entries.contains_key(&key) {
                 continue;
             }
+            let mut folders = self.inner.folders.lock().await;
+            if folders.get(&key).is_some_and(|folder| folder.strong_count() > 0) {
+                continue;
+            }
             let path = self.inner.root.join("playback").join(&key);
             let trash = self.inner.root.join("playback").join(format!(".evict-{key}-{}", utils::random_id()?));
             // 先原子移走不活跃目录, 避免长时间删除文件阻塞其他缓存的状态和释放请求.
             tokio::fs::rename(&path, &trash).await?;
+            folders.remove(&key);
+            drop(folders);
             drop(entries);
             tokio::fs::remove_dir_all(trash).await?;
             total = total.saturating_sub(size);
@@ -325,8 +402,23 @@ impl CacheManager {
             let entries = self.inner.entries.lock().await;
             for output in entries.values() {
                 let mut state = output.state.lock().await;
-                state.active = false;
-                if state.worker_active { CacheFolder::stop(&mut state); }
+                match &state.phase {
+                    FolderPhase::Loading { cancel } => {
+                        state.phase = FolderPhase::Stopping {
+                            cancel: cancel.clone(), loading: true, stop_after: None, deadline: None,
+                        };
+                    },
+                    FolderPhase::Running { cancel, encoding_threads, .. } => {
+                        let cancel = cancel.clone();
+                        let encoding = *encoding_threads > 0;
+                        let (stop_after, deadline) = if encoding {
+                            (Some(state.media.segments.len() + 1), Some(Instant::now() + Duration::from_secs(30)))
+                        } else { (None, None) };
+                        state.phase = FolderPhase::Stopping { cancel: cancel.clone(), loading: false, stop_after, deadline };
+                        if !encoding { cancel.send_replace(true); }
+                    },
+                    _ => {},
+                }
             }
         }
         let mut errors = Vec::new();
@@ -353,7 +445,18 @@ impl CacheManager {
 // ========================================================================== //
 
 impl CacheManager {
-    async fn spawn(&self, output: &Arc<CacheFolder>) {
+    async fn spawn_load(&self, output: &Arc<CacheFolder>) {
+        let manager = self.clone();
+        let output = output.clone();
+        let processes = self.inner.processes.clone();
+        self.inner.workers.lock().await.spawn(async move {
+            manager.load(&processes, &output).await;
+            drop(output);
+            if let Err(error) = manager.maintain().await { warn!("cache maintenance failed: {error:#}"); }
+        });
+    }
+
+    async fn spawn_generation(&self, output: &Arc<CacheFolder>) {
         let manager = self.clone();
         let output = output.clone();
         let processes = self.inner.processes.clone();
@@ -368,34 +471,79 @@ impl CacheManager {
         self.inner.entries.lock().await.get(key).cloned().context("playback cache is no longer active")
     }
 
-    // 成功, 失败和取消统一收尾, 有会话时保留错误快照.
-    async fn generate(&self, processes: &Processes, output: &Arc<CacheFolder>) {
-        let mut cancel = output.state.lock().await.cancel.subscribe();
-        let result = self.run(processes, output, &mut cancel).await;
-        let _entries = self.inner.entries.lock().await;
+    async fn load(&self, processes: &Processes, output: &Arc<CacheFolder>) {
+        let mut cancel = {
+            let state = output.state.lock().await;
+            let Some(cancel) = state.phase.cancel() else { return; };
+            cancel.subscribe()
+        };
+        let result = self.recover(processes, output, &mut cancel).await;
+        let mut entries = self.inner.entries.lock().await;
         let mut state = output.state.lock().await;
-        state.finalizing = true;
-        if let Err(error) = result {
-            if !error.is::<Cancelled>() || state.active {
-                state.error = Some(format!("{error:#}"));
-                warn!(variant_key = output.key, "cache generation failed: {error:#}");
+        let stopping = matches!(&state.phase, FolderPhase::Stopping { loading: true, .. });
+        if stopping || result.is_err() && *cancel.borrow() {
+            drop(state);
+            if entries.get(&output.key).is_some_and(|current| Arc::ptr_eq(current, output)) {
+                entries.remove(&output.key);
             }
+        } else {
+            match result {
+                Ok(media) => {
+                    state.media = media;
+                    state.phase = if state.media.complete { FolderPhase::Complete } else { FolderPhase::Ready };
+                },
+                Err(error) => {
+                    warn!(variant_key = output.key, "cache recovery failed: {error:#}");
+                    state.phase = FolderPhase::Failed;
+                },
+            }
+            state.revision = REVISION.fetch_add(1, Ordering::Relaxed);
+            drop(state);
         }
-        state.worker_active = false;
-        state.encoding = false;
-        state.encoding_threads = 0;
-        state.stop_after = None;
-        state.stop_deadline = None;
-        if let Err(error) = persist_used(&output.directory, state.last_used).await {
-            warn!(variant_key = output.key, "cache timestamp update failed: {error:#}");
-            state.error = Some(format!("cache timestamp update failed: {error:#}"));
-        }
-        state.finalizing = false;
+        drop(entries);
         output.changed.notify_waiters();
     }
 
-    // 先恢复有效磁盘前缀, 再决定复用完整缓存, 确认 EOF 或从尾部继续生成.
-    async fn run(&self, processes: &Processes, output: &Arc<CacheFolder>, cancel: &mut watch::Receiver<bool>) -> Result<()> {
+    async fn generate(&self, processes: &Processes, output: &Arc<CacheFolder>) {
+        let mut cancel = {
+            let state = output.state.lock().await;
+            let Some(cancel) = state.phase.cancel() else { return; };
+            cancel.subscribe()
+        };
+        let result = self.run_generation(processes, output, &mut cancel).await;
+        let mut entries = self.inner.entries.lock().await;
+        let mut state = output.state.lock().await;
+        let stopping = matches!(&state.phase, FolderPhase::Stopping { .. });
+        if stopping {
+            drop(state);
+            if entries.get(&output.key).is_some_and(|current| Arc::ptr_eq(current, output)) {
+                entries.remove(&output.key);
+            }
+        } else if matches!(&state.phase, FolderPhase::Running { .. }) {
+            match result {
+                Ok(()) => {
+                    if !state.media.complete { state.phase = FolderPhase::Ready; }
+                },
+                Err(error) if error.is::<Cancelled>() && *cancel.borrow() => {
+                    state.phase = FolderPhase::Ready;
+                },
+                Err(error) => {
+                    warn!(variant_key = output.key, "cache generation failed: {error:#}");
+                    state.phase = FolderPhase::Failed;
+                },
+            }
+            state.revision = REVISION.fetch_add(1, Ordering::Relaxed);
+            drop(state);
+        }
+        drop(entries);
+        if let Err(error) = persist_used(&output.directory, SystemTime::now()).await {
+            warn!(variant_key = output.key, "cache timestamp update failed: {error:#}");
+        }
+        output.changed.notify_waiters();
+    }
+
+    // 恢复并校验已有磁盘前缀, 返回可继续编码的媒体状态.
+    async fn recover(&self, processes: &Processes, output: &Arc<CacheFolder>, cancel: &mut watch::Receiver<bool>) -> Result<CachedMedia> {
         match tokio::fs::create_dir(&output.directory).await {
             Ok(()) => {},
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists =>
@@ -403,17 +551,17 @@ impl CacheManager {
             Err(error) => return Err(error.into()),
         }
         let media = video::recover(&output.directory, processes, cancel).await?;
-        let resume = media.tail();
-        let complete = media.complete;
-        {
-            let mut state = output.state.lock().await;
-            state.media = media;
-            state.loaded = true;
-        }
-        output.changed.notify_waiters();
+        check_cancel(cancel)?;
+        Ok(media)
+    }
+
+    async fn run_generation(&self, processes: &Processes, output: &Arc<CacheFolder>, cancel: &mut watch::Receiver<bool>) -> Result<()> {
+        let (resume, complete) = {
+            let state = output.state.lock().await;
+            (state.media.tail(), state.media.complete)
+        };
         if complete { return Ok(()); }
         check_cancel(cancel)?;
-        output.wait_start(cancel).await?;
         if resume.video > 0 && !video::has_video_after(&output.spec, resume, processes, cancel).await? {
             return self.complete(output).await;
         }
@@ -468,12 +616,12 @@ impl CacheManager {
         let mut child = {
             let mut state = output.state.lock().await;
             check_cancel(cancel)?;
-            ensure!(state.active && state.start_requested, "cache generation has no active start request");
-            processes.extend_encoding_threads(&mut threads, state.desired_threads)?;
+            let FolderPhase::Running { desired_threads, encoding_threads, .. } = &mut state.phase
+                else { bail!("cache generation is no longer running"); };
+            processes.extend_encoding_threads(&mut threads, *desired_threads)?;
             let child = video::command(&output.spec, directory, assets, resume, threads.num_permits())?
                 .spawn().context("failed to start FFmpeg")?;
-            state.encoding = true;
-            state.encoding_threads = threads.num_permits();
+            *encoding_threads = threads.num_permits();
             child
         };
         info!(variant_key = output.key, pid = child.id(), threads = threads.num_permits(),
@@ -494,15 +642,25 @@ impl CacheManager {
         budget: &mut EncoderBudget, started: Instant, published: usize, cancel: &watch::Receiver<bool>) -> Result<()> {
         // 发布 future 可能正持锁等待落盘, 监控分支不能再等待同一把锁而停止轮询它.
         let Ok(mut state) = output.state.try_lock() else { return Ok(()); };
-        if state.stop_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            state.cancel.send_replace(true);
-            warn!(variant_key = output.key, "forcing cache stop after the 30 second segment deadline");
+        let stop = match &state.phase {
+            FolderPhase::Running { deadline, cancel, .. } | FolderPhase::Stopping { deadline, cancel, .. } =>
+                Some((*deadline, cancel.clone())),
+            _ => None,
+        };
+        if let Some((Some(deadline), cancel_sender)) = stop {
+            if Instant::now() >= deadline {
+                cancel_sender.send_replace(true);
+                warn!(variant_key = output.key, "forcing cache stop after the 30 second segment deadline");
+            }
         }
         check_cancel(cancel)?;
         if let Some(exit) = child.try_wait()? {
             drop(budget.take());
-            state.encoding = false;
-            state.encoding_threads = 0;
+            match &mut state.phase {
+                FolderPhase::Running { encoding_threads, .. } => *encoding_threads = 0,
+                FolderPhase::Stopping { .. } => {},
+                _ => {},
+            }
             ensure!(exit.success(), "FFmpeg exited with {exit}");
         }
         ensure!(published > 0 || started.elapsed().as_secs() < self.inner.config.startup_timeout_seconds,
@@ -513,7 +671,7 @@ impl CacheManager {
     // 长耗时校验与编码监控同时推进, 保证等待校验时仍能响应停止和启动超时.
     async fn checked_step<T>(&self, output: &CacheFolder, child: &mut Child, budget: &mut EncoderBudget, started: Instant,
         published: usize, cancel: &watch::Receiver<bool>, step: impl Future<Output = Result<T>>) -> Result<T> {
-        let stop = output.state.lock().await.cancel.clone();
+        let stop = output.state.lock().await.phase.cancel().context("cache worker has no cancellation handle")?;
         tokio::pin!(step);
         let mut tick = interval(Duration::from_millis(100));
         loop {
@@ -560,9 +718,16 @@ impl CacheManager {
                     ensure!(published > 0, "FFmpeg completed without a playable segment");
                     return self.complete(output).await;
                 }
-                let mut state = output.state.lock().await;
-                if state.stop_after.is_some_and(|count| state.media.segments.len() >= count) {
-                    state.finalizing = true;
+                let state = output.state.lock().await;
+                let stop_after = match &state.phase {
+                    FolderPhase::Running { pause_after, .. } => *pause_after,
+                    FolderPhase::Stopping { stop_after, .. } => *stop_after,
+                    _ => None,
+                };
+                if stop_after.is_some_and(|count| state.media.segments.len() >= count) {
+                    if let FolderPhase::Running { cancel, .. } = &state.phase {
+                        cancel.send_replace(true);
+                    }
                     return Ok(());
                 }
             } else {
@@ -620,7 +785,9 @@ impl CacheManager {
         video::write_playlist(&output.directory, &media).await?;
         video::atomic_file(&output.directory, "complete", b"").await?;
         state.media = media;
-        state.finalizing = true;
+        state.phase = FolderPhase::Complete;
+        state.revision = REVISION.fetch_add(1, Ordering::Relaxed);
+        output.changed.notify_waiters();
         info!(variant_key = output.key, "playback cache complete");
         Ok(())
     }
@@ -636,6 +803,7 @@ struct CacheInner {
     metadata: Mutex<HashMap<String, MetadataEntry>>,
     // 同时访问集合和元素时先锁 entries 再锁 state, 创建与回收必须保持相同顺序.
     entries: Mutex<HashMap<String, Arc<CacheFolder>>>,
+    folders: Mutex<HashMap<String, Weak<CacheFolder>>>,
     workers: Mutex<JoinSet<()>>,
     maintenance: Mutex<()>,
     stop: watch::Sender<bool>,
@@ -652,64 +820,27 @@ struct CacheFolder {
 }
 
 impl CacheFolder {
-    async fn wait_loaded(&self) -> Result<()> {
-        // 创建响应必须反映磁盘的真实完成状态, 等待期间不占用全局活动集合锁.
+    fn snapshot(&self, state: &FolderState) -> CacheSnapshot {
+        CacheSnapshot {
+            phase: state.phase.snapshot(),
+            revision: state.revision,
+            buffered_until: state.media.tail().seconds(),
+            duration: self.spec.duration,
+        }
+    }
+
+    async fn wait_loaded(&self) -> Result<CacheSnapshot> {
         loop {
-            // 先注册通知再检查条件, 避免恢复完成通知落在检查与等待之间.
             let notified = self.changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
             let state = self.state.lock().await;
-            if state.loaded { return Ok(()); }
-            ensure!(state.worker_active, "cache activation failed: {}",
-                state.error.as_deref().unwrap_or("generation stopped before loading"));
+            if !matches!(&state.phase, FolderPhase::Loading { .. }) {
+                return Ok(self.snapshot(&state));
+            }
             drop(state);
             notified.await;
         }
-    }
-
-    async fn status(&self) -> Result<FolderState> {
-        let mut state = self.state.lock().await;
-        ensure!(state.active, "playback cache has no active session");
-        state.last_used = SystemTime::now();
-        Ok(state.clone())
-    }
-
-    async fn wait_start(&self, cancel: &mut watch::Receiver<bool>) -> Result<()> {
-        loop {
-            check_cancel(cancel)?;
-            let notified = self.changed.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            let state = self.state.lock().await;
-            ensure!(state.active, "playback cache has no active session");
-            if state.start_requested { return Ok(()); }
-            drop(state);
-            tokio::select! {
-                _ = &mut notified => {},
-                _ = cancelled(cancel) => return Err(Cancelled.into()),
-            }
-        }
-    }
-
-    fn stop(state: &mut FolderState) {
-        if state.encoding {
-            // 只允许再提交一个分片. 已在私有目录生成的更远内容也不能越过此边界发布.
-            state.stop_after.get_or_insert(state.media.segments.len() + 1);
-            state.stop_deadline.get_or_insert(Instant::now() + Duration::from_secs(30));
-        } else {
-            state.cancel.send_replace(true);
-        }
-    }
-}
-
-impl FolderState {
-    // 编码启动前允许并发创建更新请求, 启动后保留当前任务线程数.
-    fn request_start(&mut self, desired_threads: usize) -> bool {
-        if self.media.complete || self.encoding { return false; }
-        self.desired_threads = desired_threads;
-        self.start_requested = true;
-        true
     }
 }
 

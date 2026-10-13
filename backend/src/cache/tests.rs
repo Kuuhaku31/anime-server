@@ -1,28 +1,16 @@
 //! 集中保存缓存状态, 生命周期及磁盘淘汰测试, 保持原有注释禁用状态.
 
-use super::{CacheFolder, CachedMedia, FolderState};
+use super::{CacheFolder, CachePhase, CachedMedia, FolderPhase, FolderState};
 use crate::{models::PlaybackVariantConfig, video::{self, EncodeSpec}};
 use std::{path::PathBuf, time::SystemTime};
-use tokio::sync::{watch, Mutex, Notify};
+use tokio::sync::{Mutex, Notify};
 
 fn state() -> FolderState {
-    let (cancel, _) = watch::channel(false);
     FolderState {
         media: CachedMedia::default(),
-        loaded: true,
-        active: true,
-        worker_active: true,
-        encoding: false,
-        finalizing: false,
-        encoding_threads: 0,
-        desired_threads: 2,
-        start_requested: false,
-        stop_after: None,
-        stop_deadline: None,
-        cancel,
+        phase: FolderPhase::Ready,
         revision: 1,
         last_used: SystemTime::now(),
-        error: None,
     }
 }
 
@@ -38,36 +26,51 @@ fn folder() -> CacheFolder {
     }
 }
 
-#[tokio::test]
-async fn worker_waits_for_an_explicit_start_request() {
-    let folder = folder();
-    let mut cancel = folder.state.lock().await.cancel.subscribe();
-    let waiting = folder.wait_start(&mut cancel);
-    tokio::pin!(waiting);
-    assert!(tokio::time::timeout(std::time::Duration::from_millis(10), &mut waiting).await.is_err());
-
-    folder.state.lock().await.request_start(8);
-    folder.changed.notify_waiters();
-    tokio::time::timeout(std::time::Duration::from_secs(1), waiting).await.unwrap().unwrap();
+#[test]
+fn cache_phases_serialize_as_snake_case() {
+    let phases = [
+        (CachePhase::Loading, "loading"),
+        (CachePhase::Ready, "ready"),
+        (CachePhase::Running, "running"),
+        (CachePhase::Stopping, "stopping"),
+        (CachePhase::Complete, "complete"),
+        (CachePhase::Failed, "failed"),
+    ];
+    for (phase, expected) in phases {
+        assert_eq!(serde_json::to_value(phase).unwrap(), expected);
+    }
 }
 
 #[test]
-fn start_requests_can_change_before_encoding_and_are_ignored_afterward() {
-    let mut state = state();
+fn folder_phases_map_to_public_cache_phases() {
+    let (cancel, _) = tokio::sync::watch::channel(false);
+    let phases = [
+        (FolderPhase::Loading { cancel: cancel.clone() }, CachePhase::Loading),
+        (FolderPhase::Ready, CachePhase::Ready),
+        (FolderPhase::Running {
+            cancel: cancel.clone(), desired_threads: 2, encoding_threads: 0,
+            pause_after: None, deadline: None,
+        }, CachePhase::Running),
+        (FolderPhase::Stopping {
+            cancel, loading: false, stop_after: None, deadline: None,
+        }, CachePhase::Stopping),
+        (FolderPhase::Complete, CachePhase::Complete),
+        (FolderPhase::Failed, CachePhase::Failed),
+    ];
+    for (phase, expected) in phases {
+        assert_eq!(phase.snapshot(), expected);
+    }
+}
 
-    assert!(state.request_start(8));
-    assert!(state.request_start(4));
-    assert_eq!(state.desired_threads, 4);
-    assert!(state.start_requested);
-
-    state.encoding = true;
-    assert!(!state.request_start(8));
-    assert_eq!(state.desired_threads, 4);
-
-    state.encoding = false;
-    state.media.complete = true;
-    assert!(!state.request_start(8));
-    assert_eq!(state.desired_threads, 4);
+#[tokio::test]
+async fn cache_snapshot_exposes_only_session_status_fields() {
+    let folder = folder();
+    let state = folder.state.lock().await;
+    let snapshot = folder.snapshot(&state);
+    assert_eq!(snapshot.phase(), CachePhase::Ready);
+    assert_eq!(snapshot.revision(), 1);
+    assert_eq!(snapshot.buffered_until(), 0.0);
+    assert_eq!(snapshot.duration(), folder.spec.duration);
 }
 
 // use super::*;

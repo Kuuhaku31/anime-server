@@ -35,20 +35,13 @@ export interface PlaybackSession {
   session_id: string;
   url: string;
   mime_type: "application/vnd.apple.mpegurl";
-  // 完成状态与任务活动分开表达, 前端不推断额外的缓存状态枚举.
-  complete: boolean;
-  generating: boolean;
-  stopping: boolean;
-  encoding_threads: number;
+  phase: "loading" | "ready" | "running" | "stopping" | "complete" | "failed";
   // 本会话等待的绝对秒数, 默认由服务端读取观看记录后确定.
   position: number;
-  // 仅表示存在可播放分片, 目标可播仍须 position < buffered_until.
-  ready: boolean;
   start_time: number;
   // 服务端已验证连续前缀的右边界, 不是浏览器已下载的缓冲范围.
   buffered_until: number;
   duration: number;
-  error: string | null;
 }
 
 export interface PlaybackStart extends PlaybackSession {
