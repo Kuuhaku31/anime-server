@@ -206,10 +206,10 @@ async fn cache_snapshot_exposes_only_session_status_fields() {
 //     }
 //
 //     #[tokio::test]
-//     async fn last_lease_retires_the_entry_but_an_open_pin_still_blocks_eviction() {
-//         // 仅模拟已经发布的文件, 区分活动租约保护和退出集合后的文件打开保护.
+//     async fn last_lease_retires_the_entry_and_allows_eviction() {
+//         // 仅模拟已发布文件, 返回路径不延长目录生命周期.
 //         use tokio::io::AsyncReadExt;
-//         let root = std::env::temp_dir().join(format!("anime-media-pin-{}", random_id().unwrap()));
+//         let root = std::env::temp_dir().join(format!("anime-media-path-{}", random_id().unwrap()));
 //         // 测试负责创建缓存挂载目录, 管理器要求根目录已经存在.
 //         tokio::fs::create_dir(&root).await.unwrap();
 //         let config = PlaybackConfig { cache_max_bytes: 1, ..PlaybackConfig::default() };
@@ -238,18 +238,14 @@ async fn cache_snapshot_exposes_only_session_status_fields() {
 //         assert_eq!(shared.state.lock().await.clients.len(), 2);
 //         manager.maintain().await.unwrap();
 //         assert!(directory.exists());
-//         let (path, pin) = manager.media_path(variant_key, "second", "init.mp4").await.unwrap();
+//         let path = manager.media_path(variant_key, "init.mp4").await.unwrap();
+//         let mut file = tokio::fs::File::open(path).await.unwrap();
 //         manager.release(variant_key, "first").await.unwrap();
 //         manager.release(variant_key, "first").await.unwrap();
 //         assert_eq!(shared.state.lock().await.clients.len(), 1);
 //         drop(shared);
 //         manager.release(variant_key, "second").await.unwrap();
 //         assert!(manager.get(variant_key).await.is_err());
-//         assert!(pin.status("second").await.is_err());
-//         manager.maintain().await.unwrap();
-//         assert!(directory.exists());
-//         let mut file = tokio::fs::File::open(path).await.unwrap();
-//         drop(pin);
 //         manager.maintain().await.unwrap();
 //         assert!(!directory.exists());
 //         let mut data = Vec::new();

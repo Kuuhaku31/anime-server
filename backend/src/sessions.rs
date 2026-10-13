@@ -8,7 +8,7 @@ use tokio::{sync::Mutex, time::interval};
 use tracing::warn;
 
 use crate::models::{PlaybackRequest, PlaybackStart, PlaybackVariantConfig};
-use crate::cache::{CacheManager, CachePhase, CachePin};
+use crate::cache::{CacheManager, CachePhase};
 
 use crate::video::playback_target;
 
@@ -123,15 +123,12 @@ impl SessionManager {
         cache_manager.pause(&variant_key).await
     }
 
+    /// 续期会话并返回已验证的媒体路径, HTTP 媒体类型由 API 处理.
     pub(crate) async fn media_path(&self, cache_manager: &CacheManager, session_id: &str, asset_name: &str)
-        -> Result<(PathBuf, &'static str, CachePin)>
+        -> Result<PathBuf>
     {
         let (variant_key, _) = self.get_session(session_id).await?;
-        let (path, pin) = cache_manager.media_path(&variant_key, asset_name).await?;
-        let mime = if asset_name.ends_with(".m3u8") { "application/vnd.apple.mpegurl" }
-            else if asset_name.ends_with(".m4s") { "video/iso.segment" } else { "video/mp4" };
-        // 只在文件打开期间持有额外 Arc, 即使最后一份租约被删除也不会被 LRU 抢先删除.
-        Ok((path, mime, pin))
+        cache_manager.media_path(&variant_key, asset_name).await
     }
 
     /// 先移除会话, 仅最后一个会话离开时停用共享缓存.

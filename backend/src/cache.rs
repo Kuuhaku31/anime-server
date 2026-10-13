@@ -103,11 +103,6 @@ struct FolderState {
     last_used: SystemTime,
 }
 
-/// 文件打开期间持有缓存文件夹, 避免无活动会话时被 LRU 回收.
-pub(crate) struct CachePin {
-    _folder: Arc<CacheFolder>,
-}
-
 /// 缓存统一入口, 独占目录锁并管理两个按需加载的 Map.
 ///
 /// new 校验缓存根目录并初始化临时资源目录和容量维护.
@@ -343,7 +338,7 @@ impl CacheManager {
 
     /// 获取分片资源.
     /// 只开放正式清单中的已发布资源, 私有工作目录和未验证尾部不能被读取.
-    pub(crate) async fn media_path(&self, variant_key: &str, asset_name: &str) -> Result<(PathBuf, CachePin)> {
+    pub(crate) async fn media_path(&self, variant_key: &str, asset_name: &str) -> Result<PathBuf> {
 
         ensure!(video::media_filename(asset_name), "playback asset not found");
         let output = self.get(variant_key).await?;
@@ -360,10 +355,10 @@ impl CacheManager {
         ensure!(file.is_file() && file.len() > 0, "unsafe or empty cached media file");
         drop(state);
 
-        Ok((path, CachePin { _folder: output }))
+        Ok(path)
     }
 
-    /// 按磁盘访问时间淘汰非活动缓存, 正在打开媒体文件的旧引用仍受保护.
+    /// 按磁盘访问时间淘汰非活动缓存, 尚未退出的缓存任务引用仍受保护.
     pub(crate) async fn maintain(&self) -> Result<()> {
         if let Ok(mut workers) = self.inner.workers.try_lock() {
             while let Some(result) = workers.try_join_next() {

@@ -83,15 +83,15 @@ async fn streams(State(s): State<AppState>, Path(file_id): Path<String>)
 }
 
 /// 重新探测媒体文件.
-async fn probe(
-    State(state): State<AppState>,
-    Path(file_id): Path<String>,
-)-> Result<Json<MediaInfo>, ApiError> {
-    let media_info = state.cache_manager.media_info_force(&file_id).await.map_err(|error| {
-        if error.to_string() == "video file not found" { ApiError::missing(error) }
-        else { ApiError::media(error) }
-    })?;
-    Ok(Json(media_info))
+async fn probe(State(s): State<AppState>, Path(file_id): Path<String>)
+    -> Result<Json<MediaInfo>, ApiError>
+{
+    let cache = s.cache_manager;
+    return match cache.media_info_force(&file_id).await {
+        Ok(media_info) => Ok(Json(media_info)),
+        Err(error) => Err(if error.to_string() == "video file not found" { ApiError::missing(error) }
+            else { ApiError::media(error) }),
+    };
 }
 
 /// 创建播放会话.
@@ -208,29 +208,28 @@ async fn media(
     let session = s.session_manager;
     let cache   = s.cache_manager;
 
-    // 持有 lease 直到 ServeFile 完成文件打开, 避免资源目录被提前删除.
-    let (path, mime, _pin) = session
-        .media_path(&cache, &session_id, &asset_name)
-        .await
-        .map_err(ApiError::missing)?;
+    // 会话只返回已验证的路径, 文件由 ServeFile 打开.
+    let path = session
+    .media_path(&cache, &session_id, &asset_name).await.map_err(ApiError::missing)?;
 
     let response = ServeFile::new(path)
-        .try_call(request)
-        .await
-        .map_err(ApiError::internal)?;
+    .try_call(request).await.map_err(ApiError::internal)?;
 
     let mut response = response.map(Body::new);
 
     if response.status().is_success() {
-        response
-            .headers_mut()
-            .insert(header::CONTENT_TYPE, HeaderValue::from_static(mime));
+        // HTTP 层统一设置媒体类型, 保持清单和分片的响应头不变.
+        let mime =
+        if asset_name.ends_with(".m3u8") { "application/vnd.apple.mpegurl" }
+        else if asset_name.ends_with(".m4s") { "video/iso.segment" }
+        else { "video/mp4" };
+        response.headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(mime));
     }
 
     // 防止事件清单和分片的缓存掩盖会话状态变化.
-    response
-        .headers_mut()
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response.headers_mut()
+    .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
 
     response.headers_mut().insert(
         header::X_CONTENT_TYPE_OPTIONS,

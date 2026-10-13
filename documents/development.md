@@ -24,7 +24,7 @@ Serde 序列化和反序列化不依赖字段公开, 不为接口响应字段额
 类型和方法实现保留在子模块中, `video.rs` 的注释集中说明调用链及接口职责.
 随机名称和媒体样本辅助接口仅在测试构建中重导出.
 
-`cache.rs` 是 crate 层的缓存入口, 提供 CacheManager, CacheSnapshot 和 CachePin.
+`cache.rs` 是 crate 层的缓存入口, 提供 CacheManager 和 CacheSnapshot.
 活动缓存共享, 生成生命周期和淘汰编排由入口管理. 私有 `cache/metadata.rs`
 负责 ffprobe 探测, 成功元数据缓存及过期清理; 私有 `cache/disk.rs`
 负责磁盘占用统计和目录访问时间持久化. CacheManager 通过 `crate::video`
@@ -336,7 +336,9 @@ Stopping worker 收尾后从 Map 移除, 停止阶段的错误只记录日志, �
 活动 Map 条目本身就是租约标记, FolderState 不保存 active 或 inactive 字段.
 查询播放状态时, CacheManager 返回包含 phase, revision, buffered_until 和 duration 的窄快照,
 SessionManager 据此构造 SessionStatus; 前端只根据 `position < buffered_until` 判断目标是否可播.
-释放后的缓存文件夹只由弱引用登记, 使正在打开媒体文件的 CachePin 暂时阻止 LRU 移动其目录.
+释放后的缓存文件夹只由弱引用登记, 尚未退出的缓存任务引用暂时阻止 LRU 移动其目录.
+CacheManager 和 SessionManager 的 `media_path` 只返回已验证的路径, API 根据资源名设置 Content-Type.
+取得路径不会延长目录生命周期; 最后会话释放与资源打开并发时, 文件可能已被 LRU 移走而无法打开.
 状态和媒体请求必须通过 session 及活动集合, 不支持按客户端提供的缓存键访问磁盘.
 
 最后一个租约离开时, Loading 任务完成磁盘恢复后退出; Running 尚未启动 FFmpeg 时立即取消,
@@ -368,7 +370,7 @@ Rust 比较新旧 init 的轨道, timescale, AVC/AAC 描述和默认值, 去除�
 最后使用时间记录在内存中, 并通过变体目录修改时间跨重启保留;
 每 5 秒维护一次, 释放和生成完成时也执行维护, 避免每个分片请求都写盘.
 超过 `cache_max_bytes` 时, 按 LRU 删除活动集合外的完整或部分变体,
-直到满足上限或没有可淘汰条目. 文件打开期间持有的旧元素引用同样受到保护.
+直到满足上限或没有可淘汰条目. 尚未退出的缓存任务持有的旧元素引用同样受到保护.
 淘汰先在锁内原子改名, 再在锁外删除, 不长时间阻塞其他缓存的状态请求.
 停止清理中的变体仍受保护, 允许暂时超限; 超大单个变体在退出活动集合后也会被删除.
 不要在服务运行时手动删除缓存, 修改完成标记或接管中间文件.
@@ -451,7 +453,7 @@ python3 backend/tests/playback_smoke.py \
 | 会话不存在或过期       | 页面后台休眠可能停止保活; 手动点击 Play 或 Retry 创建同格式的新会话                         |
 | 解码或 HLS 解析失败    | 查看播放器错误及容器日志. 不会自动请求其他编码或封装                                        |
 | 缓存目录被占用         | 检查是否有另一实例挂载相同 `CACHE_DIR`, 为测试实例使用独立目录                              |
-| 缓存超过配置大小       | 活动目录及媒体打开引用受保护, 等待最后租约释放和后台停止; 容量上限不是硬配额                |
+| 缓存超过配置大小       | 活动目录及缓存任务引用受保护, 等待最后租约释放和后台停止; 容量上限不是硬配额                |
 | 磁盘已满               | 停止服务后清理 `/cache` 中指定的变体或增加空间, 不要删除数据库                              |
 
 
