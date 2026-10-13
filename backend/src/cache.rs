@@ -162,9 +162,8 @@ impl CacheManager {
     /// 确保该缓存的磁盘状态已经恢复并可以使用, 然后返回 CacheSnapshot
     pub(crate) async fn acquire(&self, config: &PlaybackVariantConfig) -> Result<CacheSnapshot> {
 
-        let variant_key = config.variant_key().to_owned();
-
         let folder_entries = self.inner.entries.lock().await; // 解锁
+        let variant_key = config.variant_key().to_owned();
 
         // 检查是否已有对应的缓存实例
         if let Some(folder) = folder_entries.get(&variant_key).cloned() {
@@ -200,15 +199,14 @@ impl CacheManager {
         let info = self.media_info(config.src_file_pre16mib_md5()).await.map_err(|e| anyhow::anyhow!(e))?;
         let source = db::get_a_video_path_by_file_id(
             &self.inner.database, config.src_file_pre16mib_md5(),
-        ).await?
-            .context("video file not found")?;
+        ).await?.context("video file not found")?;
         let spec = crate::models::EncodeSpec::from_config(config.clone(), source, info)?;
         let mut entries = self.inner.entries.lock().await;
         ensure!(!self.is_stopping(), "server is shutting down");
         ensure!(entries.len() < 32, "too many active playback configurations");
         let output = Arc::new(CacheFolder {
             variant_key: variant_key.clone(),
-            directory: self.inner.root.join("playback").join(&variant_key), spec: spec.clone(),
+            directory: self.inner.root.join("playback").join(&variant_key), spec: spec,
             state: Mutex::new(FolderState {
                 media: CachedMedia::default(),
                 phase: FolderPhase::Loading { cancel: watch::channel(false).0 },
