@@ -29,7 +29,6 @@ Serde 序列化和反序列化不依赖字段公开, 不为接口响应字段额
 外部代码只使用 `crate::process::{...}` 的重导出接口, 不导入其私有子模块.
 `ProcessManager::usage` 返回 process slots, encoder slots 和 thread permits 的只读快照,
 预留给 API 资源监视, 当前不提供 HTTP 路由.
-随机名称和媒体样本辅助接口仅在测试构建中重导出.
 
 `cache.rs` 是 crate 层的缓存入口, 提供 CacheManager 和 CacheSnapshot.
 活动缓存共享, 生成生命周期和淘汰编排由入口管理. 私有 `cache/metadata.rs`
@@ -37,12 +36,34 @@ Serde 序列化和反序列化不依赖字段公开, 不为接口响应字段额
 负责磁盘占用统计和目录访问时间持久化. CacheManager 通过 `crate::process`
 调用媒体执行能力, 并使用自己的 JoinSet 管理 load/generate Tokio worker.
 ProcessManager 只管理外部媒体进程, 两类 worker 生命周期不合并.
-入口文件中的缓存测试集中到私有 `cache/tests.rs`, 仅在测试构建时加载.
-元数据子模块的内部测试仍就近维护.
 
 `sessions.rs` 保留在 crate 层, 提供 SessionManager 和 SessionStatus,
 负责播放目标位置计算, 心跳和共享缓存租约. SessionManager 不持有 CacheManager,
 由 API 显式传入 `&CacheManager`.
+
+### 单元测试布局
+
+后端是二进制 crate, 单元测试需要访问模块私有项, 因此仍作为被测模块的子模块编译,
+但源文件统一集中在 `backend/src/tests/`, 目录结构与业务模块路径对应.
+业务文件只保留带 `#[path]` 的声明, 例如 `sessions.rs` 中:
+
+```rust
+#[cfg(test)]
+#[path = "tests/sessions.rs"]
+mod tests;
+```
+
+子目录模块的路径相对业务文件所在目录, 如 `process/ffmpeg.rs` 使用 `../tests/process/ffmpeg.rs`.
+业务文件中不得出现其他 `#[cfg(test)]` 函数或被注释的测试.
+
+- 测试文件: `tests/config.rs`, `tests/models.rs`, `tests/scanner.rs`, `tests/sessions.rs`,
+  `tests/db/repository.rs`, `tests/cache.rs`, `tests/cache/metadata.rs`,
+  `tests/process.rs`, `tests/process/ffmpeg.rs`, `tests/process/fragment.rs`.
+- 共享夹具: `tests/fixtures/process.rs` 作为 `process::testing` 加载, 提供测试媒体信息,
+  播放请求和已发布分片样本; `tests/fixtures/cache.rs` 作为 `cache::testing` 加载,
+  提供临时缓存目录, 内存数据库及预置元数据的 CacheManager, 测试不会调用 ffprobe.
+  两者仅在测试构建时加载.
+- 测试文件内测试函数在上, 私有辅助函数在下, 每个测试附中文注释说明验证意图.
 
 播放请求 `PlaybackRequest` 和创建响应 `PlaybackStart` 定义在 `models.rs`.
 请求选轨的缺省/null 区分及响应 flatten 结构不变.

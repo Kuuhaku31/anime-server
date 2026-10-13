@@ -9,6 +9,9 @@ use crate::{
     AppState, constants::{self, EXTENSIONS}, db, models::{ScanChanges, ScannedFile},
 };
 
+#[cfg(test)]
+#[path = "tests/scanner.rs"]
+mod tests;
 
 /// 扫描媒体目录, 同步数据库索引, 返回扫描摘要:
 ///
@@ -135,47 +138,4 @@ fn is_video(path: &Path) -> bool {
         .iter().any(|extension| value.eq_ignore_ascii_case(extension))
     })
     .unwrap_or(false)
-}
-
-
-// ========================================================================== //
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // #[test]
-    // fn initial_track_preferences_match_server_defaults() {
-    //     let info: crate::models::MediaInfo = serde_json::from_value(serde_json::json!({
-    //         "duration": 20.0, "start_time": 0.0,
-    //         "video_tracks": [{"stream_index": 0, "codec_name": "h264", "is_default": true, "is_forced": false}],
-    //         "audio_tracks": [
-    //             {"stream_index": 1, "codec_name": "aac", "is_default": false, "is_forced": false},
-    //             {"stream_index": 4, "codec_name": "aac", "is_default": true, "is_forced": false}
-    //         ],
-    //         "subtitle_tracks": [
-    //             {"stream_index": 3, "codec_name": "ass", "is_default": false, "is_forced": true}
-    //         ],
-    //         "attachments": []
-    //     })).unwrap();
-    //     let config = crate::models::PlaybackVariantConfig::new(
-    //         &"a".repeat(32),
-    //         &info,
-    //         &crate::models::PlaybackRequest::default(),
-    //     ).unwrap();
-    //     assert_eq!(config.selection(), (Some(4), Some(3)));
-    // }
-
-    #[test]
-    fn video_extensions_are_case_insensitive() {
-        // 只验证扩展名识别, 不创建或修改宿主机媒体文件.
-        for extension in EXTENSIONS {
-            assert!(is_video(Path::new(&format!("episode.{extension}"))));
-            assert!(is_video(Path::new(&format!("episode.{}", extension.to_ascii_uppercase()))));
-        }
-        for path in ["episode", "episode.", "episode.txt", "episode.mkv.txt"] {
-            assert!(!is_video(Path::new(path)));
-        }
-    }
-
 }

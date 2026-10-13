@@ -5,12 +5,9 @@
 mod media;
 
 use std::path::{Path, PathBuf};
-
 use serde::{Deserialize, Deserializer, Serialize};
-
 use crate::{constants::HASH_LIMIT, sessions::SessionStatus, utils};
 pub(crate) use media::{Attachment, MediaInfo, PlaybackVariantConfig, Track};
-
 
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -160,3 +157,8 @@ impl PlaybackStart {
         Self { session, media, selection: Selection { audio, subtitle } }
     }
 }
+
+
+#[cfg(test)]
+#[path = "tests/models.rs"]
+mod tests;

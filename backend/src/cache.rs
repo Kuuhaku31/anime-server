@@ -19,6 +19,10 @@ use crate::{cache::metadata::MetadataEntry, config::PlaybackConfig, db, utils};
 mod disk;
 mod metadata;
 #[cfg(test)]
+#[path = "tests/fixtures/cache.rs"]
+pub(crate) mod testing;
+#[cfg(test)]
+#[path = "tests/cache.rs"]
 mod tests;
 
 use disk::{disk_usage, persist_used};

@@ -65,13 +65,13 @@ anime-server/
 |   |   |-- db/
 |   |   |-- cache/
 |   |   |   |-- metadata.rs  # 媒体探测, 成功结果缓存及过期策略
-|   |   |   |-- disk.rs      # 磁盘占用统计及 LRU 访问时间持久化
-|   |   |   `-- tests.rs     # 缓存测试
-|   |   `-- process/
-|   |       |-- ffmpeg.rs    # FFmpeg 命令, HLS 读写, 恢复及解码校验
-|   |       |-- assets.rs    # 临时字幕与字体资源
-|   |       |-- fragment.rs  # fMP4 分片校验与时间轴归一化
-|   |       `-- models.rs    # EncodeSpec 等媒体执行参数
+|   |   |   `-- disk.rs      # 磁盘占用统计及 LRU 访问时间持久化
+|   |   |-- process/
+|   |   |   |-- ffmpeg.rs    # FFmpeg 命令, HLS 读写, 恢复及解码校验
+|   |   |   |-- assets.rs    # 临时字幕与字体资源
+|   |   |   |-- fragment.rs  # fMP4 分片校验与时间轴归一化
+|   |   |   `-- models.rs    # EncodeSpec 等媒体执行参数
+|   |   `-- tests/           # 全部单元测试及测试夹具, 结构对应业务模块
 |   |-- sql/init.sql
 |   `-- tests/
 |-- frontend/

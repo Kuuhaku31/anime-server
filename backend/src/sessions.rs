@@ -10,6 +10,10 @@ use tracing::warn;
 use crate::models::{PlaybackRequest, PlaybackStart, PlaybackVariantConfig};
 use crate::cache::{CacheManager, CachePhase};
 
+#[cfg(test)]
+#[path = "tests/sessions.rs"]
+mod tests;
+
 
 /// 对外只暴露不透明会话和状态快照, 不返回播放配置或 variant-key.
 #[derive(Debug, Clone, Serialize)]
@@ -192,19 +196,6 @@ fn select_threads(target: f64, buffered_until: f64, base: usize, maximum: usize)
     if target >= buffered_until { maximum } else { base }
 }
 
-#[cfg(test)]
-mod policy_tests {
-    use super::select_threads;
-
-    // 等于缓存尾部时仍需等待后续分片, 因此选择变体线程上限.
-    #[test]
-    fn thread_policy_uses_maximum_when_position_reaches_cache_tail() {
-        assert_eq!(select_threads(6.0, 5.0, 2, 8), 8);
-        assert_eq!(select_threads(5.0, 5.0, 2, 8), 8);
-        assert_eq!(select_threads(4.0, 5.0, 2, 8), 2);
-    }
-}
-
 // 锁内批量摘除过期会话, 锁外逐一清理, 单个失败不能阻断其余租约释放.
 async fn expire(manager: &SessionManager, cache_manager: &CacheManager) -> Result<()> {
     let expired = {
@@ -228,96 +219,3 @@ async fn expire(manager: &SessionManager, cache_manager: &CacheManager) -> Resul
     ensure!(errors.is_empty(), "session expiration failed: {}", errors.join("; "));
     Ok(())
 }
-
-
-// ========================================================================== //
-
-// #[cfg(test)]
-// mod target_tests {
-//     use super::playback_target;
-
-//     // 非法或越界的目标位置必须被拒绝.
-//     #[test]
-//     fn invalid_positions_fail() {
-//         for position in [-1.0, f64::NAN, f64::INFINITY, 20.0] {
-//             let (info, mut request) = crate::process::fixture();
-//             request.position = Some(position);
-//             assert!(playback_target(&info, &request).is_err());
-//         }
-//     }
-// }
-
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//     use crate::{config::PlaybackConfig, process::fixture, sessions::SessionManager};
-
-//     #[tokio::test]
-//     async fn an_abandoned_creation_reservation_expires_after_its_grace_period() {
-//         let root = std::env::temp_dir().join(format!("anime-pending-lease-{}", random_id().unwrap()));
-//         // 测试负责创建缓存挂载目录, 管理器要求根目录已经存在.
-//         tokio::fs::create_dir(&root).await.unwrap();
-//         let cache = CacheManager::new(root.clone(), PlaybackConfig::default(), ProcessManager::new(2, 16)).await.unwrap();
-//         let manager = SessionManager::new(20);
-//         {
-//             let mut sessions = manager.sessions.lock().await;
-//             for (session_id, seconds) in [("loading", 30), ("abandoned", 121)] {
-//                 sessions.insert(session_id.to_string(), Session {
-//                     variant_key: "a".repeat(32), touched: None,
-//                     created: Instant::now() - Duration::from_secs(seconds),
-//                 });
-//             }
-//         }
-//         manager.expire().await.unwrap();
-//         let sessions = manager.sessions.lock().await;
-//         assert!(sessions.contains_key("loading"));
-//         assert!(!sessions.contains_key("abandoned"));
-//         drop(sessions);
-//         manager.shutdown().await.unwrap();
-//         tokio::fs::remove_dir_all(root).await.unwrap();
-//     }
-
-//     #[tokio::test]
-//     async fn concurrent_sessions_share_one_entry_and_last_expiry_cancels_queued_work() {
-//         // 先占满媒体名额, 让最后释放发生在排队阶段, 不能意外启动编码.
-//         let root = std::env::temp_dir().join(format!("anime-active-leases-{}", random_id().unwrap()));
-//         // 测试负责创建缓存挂载目录, 管理器要求根目录已经存在.
-//         tokio::fs::create_dir(&root).await.unwrap();
-//         let processes = ProcessManager::new(2, 16);
-//         let permit = processes.slots.acquire_many(2).await.unwrap();
-//         let cache = CacheManager::new(root.clone(), PlaybackConfig::default(), processes.clone()).await.unwrap();
-//         let manager = SessionManager::new(60);
-//         let (info, request) = fixture();
-//         let spec = EncodeSpec::new(&"a".repeat(32), "video.mkv".into(), info, request, None).unwrap();
-//         let variant_key = spec.config.variant_key();
-//         let (first, second) = tokio::join!(manager.create(spec.clone()), manager.create(spec));
-//         // 从响应 JSON 读取会话 ID, 验证模型迁移后 flatten 及轨道字段保持不变.
-//         let first = serde_json::to_value(first.unwrap()).unwrap();
-//         let second = serde_json::to_value(second.unwrap()).unwrap();
-//         assert!(first.get("session").is_none());
-//         assert!(first["media"].is_object());
-//         assert_eq!(first["selection"], serde_json::json!({"audio": 1, "subtitle": null}));
-//         let first = first["session_id"].as_str().unwrap().to_owned();
-//         let second = second["session_id"].as_str().unwrap().to_owned();
-//         assert_ne!(first, second);
-//         let output = cache.get(variant_key).await.unwrap();
-//         assert!(Arc::ptr_eq(&output, &cache.get(variant_key).await.unwrap()));
-//         manager.release(&first).await.unwrap();
-//         manager.release(&first).await.unwrap();
-//         assert!(manager.status(&first).await.is_err());
-//         assert!(manager.status(&second).await.unwrap().generating);
-//         manager.target(&second, 7.375).await.unwrap();
-//         assert_eq!(manager.status(&second).await.unwrap().position, 7.375);
-//         manager.sessions.lock().await.get_mut(&second).unwrap().touched = Some(Instant::now() - Duration::from_secs(61));
-//         manager.expire().await.unwrap();
-//         assert!(manager.status(&second).await.is_err());
-//         tokio::time::timeout(Duration::from_secs(3), async {
-//             while cache.get(variant_key).await.is_ok() { tokio::time::sleep(Duration::from_millis(5)).await; }
-//         }).await.unwrap();
-//         assert!(manager.media_path(&second, "init.mp4").await.is_err());
-//         manager.shutdown().await.unwrap();
-//         drop(permit);
-//         drop(output);
-//         tokio::fs::remove_dir_all(root).await.unwrap();
-//     }
-// }

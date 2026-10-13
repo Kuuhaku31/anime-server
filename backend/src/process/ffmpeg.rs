@@ -7,9 +7,11 @@ use serde::Deserialize;
 use tokio::{io::AsyncWriteExt, process::Command, sync::watch};
 use tracing::warn;
 
-#[cfg(test)]
-use crate::models::{MediaInfo, PlaybackRequest};
 use super::models::EncodeSpec;
+
+#[cfg(test)]
+#[path = "../tests/process/ffmpeg.rs"]
+mod tests;
 
 use super::{
     assets::RenderAssets,
@@ -359,121 +361,4 @@ pub(crate) async fn recover(directory: &Path, processes: &ProcessManager, cancel
         if media.complete { atomic_file(directory, "complete", b"").await?; }
     }
     Ok(media)
-}
-
-
-// ========================================================================== //
-// ========================================================================== //
-// ========================================================================== //
-
-#[cfg(test)]
-pub(crate) fn fixture() -> (MediaInfo, PlaybackRequest) {
-    let info = serde_json::from_value(serde_json::json!({
-        "duration": 20.0, "start_time": 0.0,
-        "video_tracks": [{"stream_index": 0, "codec_name": "h264", "is_default": true, "is_forced": false}],
-        "audio_tracks": [{"stream_index": 1, "codec_name": "aac", "is_default": true, "is_forced": false}],
-        "subtitle_tracks": [{"stream_index": 2, "codec_name": "ass", "is_default": false, "is_forced": false}],
-        "attachments": []
-    })).unwrap();
-    (info, PlaybackRequest::default())
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::{constants::ENCODER_PROFILE, models::PlaybackVariantConfig, process::models::EncodeSpec};
-
-use super::*;
-
-    fn make_spec(file_id: &str, source: &str, info: MediaInfo, request: PlaybackRequest, saved: Option<f64>) -> anyhow::Result<EncodeSpec> {
-        let request = request.with_saved_position(saved);
-        let config = PlaybackVariantConfig::new(file_id, &info, &request)?;
-        EncodeSpec::from_config(config, source.into(), info)
-    }
-
-    // #[test]
-    // fn defaults_explicit_off_and_saved_positions_are_distinct() {
-    //     // file ID 默认请求使用服务端进度和默认轨道, null 仍可关闭音轨.
-    //     let (info, request) = fixture();
-    //     let spec = make_spec(&"a".repeat(32), "video", info.clone(), request, Some(7.375)).unwrap();
-    //     assert_eq!(spec.config.audio_stream, Some(1));
-    //     let request = serde_json::from_str(r#"{"audio_stream_index":null,"subtitle_stream_index":2,"position":8.5}"#).unwrap();
-    //     let changed = make_spec(&"a".repeat(32), "video", info.clone(), request, Some(3.0)).unwrap();
-    //     assert_eq!(changed.config.audio_stream, None);
-    //     assert_eq!(changed.config.subtitle_stream, Some(2));
-    // }
-
-    // #[test]
-    // fn saved_tracks_fill_only_omitted_fields() {
-    //     let omitted: PlaybackRequest = serde_json::from_str("{}").unwrap();
-    //     let resolved = omitted.with_preferences(Some(4), Some(7));
-    //     assert_eq!(resolved.audio_stream_index, Some(Some(4)));
-    //     assert_eq!(resolved.subtitle_stream_index, Some(Some(7)));
-
-    //     let (info, _) = fixture();
-    //     let chosen = PlaybackRequest::default().with_preferences(Some(1), Some(2));
-    //     let spec = make_spec(&"a".repeat(32), "video", info.clone(), chosen, None).unwrap();
-    //     assert_eq!(spec.config.audio_stream, Some(1));
-    //     assert_eq!(spec.config.subtitle_stream, Some(2));
-
-    //     let explicit: PlaybackRequest = serde_json::from_str(r#"{"audio_stream_index":null}"#).unwrap();
-    //     let resolved = explicit.with_preferences(Some(4), Some(2));
-    //     assert_eq!(resolved.audio_stream_index, Some(None));
-    //     assert_eq!(resolved.subtitle_stream_index, Some(Some(2)));
-    //     let spec = make_spec(&"a".repeat(32), "video", info, resolved, None).unwrap();
-    //     assert_eq!(spec.config.audio_stream, None);
-    //     assert_eq!(spec.config.subtitle_stream, Some(2));
-    // }
-
-    #[test]
-    fn invalid_tracks_and_client_profiles_fail() {
-        for value in [
-            serde_json::json!({"video_stream_index":0}), serde_json::json!({"encoder_profile":ENCODER_PROFILE}),
-            serde_json::json!({"variant_key":"a".repeat(32)}), serde_json::json!({"source_version":"old"}),
-        ] {
-            assert!(serde_json::from_value::<PlaybackRequest>(value).is_err());
-        }
-        for field in ["audio_stream_index", "subtitle_stream_index"] {
-            let (info, _) = fixture();
-            let request = serde_json::from_value(serde_json::json!({field:99})).unwrap();
-            assert!(make_spec(&"a".repeat(32), "video", info, request, None).is_err());
-        }
-    }
-
-    #[test]
-    fn positions_threads_and_paths_do_not_enter_the_configuration() {
-        let (info, request) = fixture();
-        let spec = make_spec(&"a".repeat(32), "video.mp4", info.clone(), request, Some(7.375)).unwrap();
-        let zero = make_spec(&"a".repeat(32), "other.mp4", info, PlaybackRequest::default(), None).unwrap();
-        assert_eq!(spec.config, zero.config);
-        let command = command(&spec, Path::new("/tmp"), None, Tail::default(), 8).unwrap();
-        let args: Vec<_> = command.as_std().get_args().map(|arg| arg.to_str().unwrap()).collect();
-        assert!(!args.contains(&"-ss"));
-        for pair in [["-c:v", "libx264"], ["-bf", "0"], ["-threads", "8"],
-            ["-fps_mode", "passthrough"], ["-enc_time_base:v", "1:90000"]] {
-            assert!(args.windows(2).any(|args| args == pair));
-        }
-        let command = super::command(&spec, Path::new("/tmp"), None, Tail { video: 720000, audio: 385024 }, 2).unwrap();
-        let args: Vec<_> = command.as_std().get_args().map(|arg| arg.to_str().unwrap()).collect();
-        assert!(args.windows(2).any(|args| args == ["-ss", "7.000000000"]));
-        assert!(args.iter().any(|arg| arg.contains("atrim=start_sample=376832")));
-        assert_eq!(args.iter().filter(|arg| **arg == "-i").count(), 2);
-    }
-
-    #[test]
-    fn playlists_require_local_continuous_segments_and_finite_durations() {
-        let text = "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:4,\nsegment_000000.m4s\n#EXT-X-ENDLIST\n";
-        let playlist = parse_playlist(text).unwrap();
-        assert!(playlist.complete);
-        assert_eq!(playlist.duration, 4.0);
-        for invalid in [
-            text.replace("#EXTINF:4,", "#EXTINF:NaN,"),
-            text.replace("segment_000000.m4s", "../init.mp4"),
-            text.replace("segment_000000.m4s", "segment_000001.m4s"),
-            text.replace("segment_000000.m4s\n", ""),
-            format!("{text}#EXTINF:4,\nsegment_000001.m4s\n"),
-        ] { assert!(parse_playlist(&invalid).is_err()); }
-        for name in ["../main.db", "complete", ".work-abc", "subtitle.ass", "segment_1.m4s", "index.m3u8.tmp"] {
-            assert!(!media_filename(name));
-        }
-    }
 }

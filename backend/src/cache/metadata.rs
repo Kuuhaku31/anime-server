@@ -11,6 +11,10 @@ use crate::process::ProcessManager;
 use crate::db;
 use super::CacheManager;
 
+#[cfg(test)]
+#[path = "../tests/cache/metadata.rs"]
+pub(super) mod tests;
+
 
 // MetadataEntry
 pub(super) struct MetadataEntry {
@@ -18,11 +22,6 @@ pub(super) struct MetadataEntry {
     last_access: SystemTime,
 }
 
-// 缓存并发测试使用已知媒体信息, 不启动外部探测进程.
-#[cfg(test)]
-pub(super) fn test_entry(info: MediaInfo) -> MetadataEntry {
-    MetadataEntry { info, last_access: SystemTime::now() }
-}
 
 
 impl CacheManager {
@@ -47,17 +46,7 @@ impl CacheManager {
         let database = &self.inner.database;
         let process  = &self.inner.processes;
 
-        // 清理过期的缓存条目, 保留最近访问的 1000 条记录.
-        entries.retain(|_, e|
-            now.duration_since(e.last_access)
-            .unwrap_or_default() < constants::MEDIA_INFO_CACHE_MAX_DURATION
-        );
-        while entries.len() > constants::MEDIA_INFO_CACHE_MAX {
-            let Some(oldest) = entries.iter()
-            .min_by_key(|(_, e)| e.last_access).map(|(k, _)| k.clone())
-            else { break; };
-            entries.remove(&oldest);
-        }
+        prune(&mut entries, now);
 
         // 检查缓存中是否已有条目
         if use_cache {
@@ -176,52 +165,16 @@ async fn probe(path: &Path, processes: &ProcessManager) -> Result<MediaInfo> {
         Ok(info)
 }
 
-#[cfg(test)]
-mod tests {
-    use std::time::Duration;
-
-use super::*;
-
-    fn media_info() -> MediaInfo {
-        MediaInfo {
-            duration: 1.0,
-            start_time: 0.0,
-            video_tracks: Vec::new(),
-            audio_tracks: Vec::new(),
-            subtitle_tracks: Vec::new(),
-            attachments: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn metadata_pruning_expires_old_entries_and_caps_capacity() {
-        let now = SystemTime::now();
-        let mut entries = HashMap::new();
-        entries.insert("expired".to_string(), MetadataEntry {
-            info: media_info(),
-            last_access: now - constants::MEDIA_INFO_CACHE_MAX_DURATION - Duration::from_secs(1),
-        });
-        for index in 0..1001 {
-            entries.insert(format!("item-{index}"), MetadataEntry {
-                info: media_info(),
-                last_access: now - Duration::from_secs(index as u64),
-            });
-        }
-
-        {
-            let entries: &mut HashMap<String, MetadataEntry> = &mut entries;
-            entries.retain(|_, entry| now.duration_since(entry.last_access).unwrap_or_default() < constants::MEDIA_INFO_CACHE_MAX_DURATION);
-            while entries.len() > constants::MEDIA_INFO_CACHE_MAX {
-                let Some(oldest_file_id) = entries.iter().min_by_key(|(_, entry)| entry.last_access)
-                    .map(|(file_id, _)| file_id.clone()) else {
-                    break;
-                };
-                entries.remove(&oldest_file_id);
-            }
-        };
-
-        assert_eq!(entries.len(), 1000);
-        assert!(!entries.contains_key("expired"));
-        assert!(!entries.contains_key("item-1000"));
+// 清理过期的缓存条目, 并按最后访问时间保留最近的有限条记录.
+fn prune(entries: &mut HashMap<String, MetadataEntry>, now: SystemTime) {
+    entries.retain(|_, entry|
+        now.duration_since(entry.last_access)
+        .unwrap_or_default() < constants::MEDIA_INFO_CACHE_MAX_DURATION
+    );
+    while entries.len() > constants::MEDIA_INFO_CACHE_MAX {
+        let Some(oldest) = entries.iter()
+        .min_by_key(|(_, entry)| entry.last_access).map(|(file_id, _)| file_id.clone())
+        else { break; };
+        entries.remove(&oldest);
     }
 }

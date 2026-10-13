@@ -16,14 +16,18 @@ pub(crate) mod assets;
 pub(crate) mod ffmpeg;
 pub(crate) mod fragment;
 pub(crate) mod models;
+#[cfg(test)]
+#[path = "tests/fixtures/process.rs"]
+pub(crate) mod testing;
+#[cfg(test)]
+#[path = "tests/process.rs"]
+mod tests;
 
 pub(crate) use assets::{clean_startup, RenderAssets};
 pub(crate) use ffmpeg::{
     atomic_file, command, has_video_after, media_filename, read_playlist, recover,
     regular_bytes, segment_name, sync_directory, validate_segment, write_playlist, CachedMedia,
 };
-#[cfg(test)]
-pub(crate) use ffmpeg::fixture;
 pub(crate) use fragment::{normalize, Init, Tail};
 pub(crate) use models::EncodeSpec;
 
@@ -229,45 +233,4 @@ pub(crate) async fn read_tail(mut reader: impl AsyncRead + Unpin) -> Result<Stri
         }
     }
     Ok(String::from_utf8_lossy(&tail).into_owned())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn stderr_retains_only_a_bounded_tail() {
-        let mut input = vec![b'a'; 6000];
-        input.extend_from_slice(b"last error");
-        let tail = read_tail(input.as_slice()).await.unwrap();
-        assert_eq!(tail.len(), 4000);
-        assert!(tail.ends_with("last error"));
-    }
-
-    #[tokio::test]
-    async fn weighted_threads_start_at_base_and_return_every_permit() {
-        // 多个任务不能因分别占有半份基础预算而互相等待.
-        let manager = ProcessManager::new(3, 10);
-        let (_sender, mut cancel) = watch::channel(false);
-        let fast = manager.encoding_threads(2, 8, &mut cancel).await.unwrap();
-        assert_eq!(fast.num_permits(), 8);
-        let base = manager.encoding_threads(2, 8, &mut cancel).await.unwrap();
-        assert_eq!(base.num_permits(), 2);
-        let (stop, mut cancelled_waiter) = watch::channel(false);
-        stop.send_replace(true);
-        assert!(manager.encoding_threads(2, 8, &mut cancelled_waiter).await.is_err());
-        drop(fast);
-        drop(base);
-        assert_eq!(manager.threads.available_permits(), 10);
-        assert_eq!(manager.encoders.available_permits(), 2);
-    }
-
-    #[test]
-    fn process_usage_snapshot_reflects_current_permits() {
-        let manager = ProcessManager::new(4, 16);
-        let usage = manager.usage();
-        assert_eq!(usage.process_slots, ResourceUsage { total: 4, used: 0, available: 4 });
-        assert_eq!(usage.encoder_slots, ResourceUsage { total: 3, used: 0, available: 3 });
-        assert_eq!(usage.thread_permits, ResourceUsage { total: 16, used: 0, available: 16 });
-    }
 }
