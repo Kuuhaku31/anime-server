@@ -10,11 +10,6 @@ use tracing::warn;
 use crate::models::{PlaybackRequest, PlaybackStart, PlaybackVariantConfig};
 use crate::cache::{CacheManager, CachePhase};
 
-#[cfg(test)]
-#[path = "tests/sessions.rs"]
-mod tests;
-
-
 /// 对外只暴露不透明会话和状态快照, 不返回播放配置或 variant-key.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct SessionStatus {

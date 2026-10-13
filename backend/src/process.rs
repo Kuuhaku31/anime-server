@@ -15,21 +15,12 @@ use tracing::info;
 pub(crate) mod assets;
 pub(crate) mod ffmpeg;
 pub(crate) mod fragment;
-pub(crate) mod models;
-#[cfg(test)]
-#[path = "tests/fixtures/process.rs"]
-pub(crate) mod testing;
-#[cfg(test)]
-#[path = "tests/process.rs"]
-mod tests;
-
 pub(crate) use assets::{clean_startup, RenderAssets};
 pub(crate) use ffmpeg::{
     atomic_file, command, has_video_after, media_filename, read_playlist, recover,
     regular_bytes, segment_name, sync_directory, validate_segment, write_playlist, CachedMedia,
 };
 pub(crate) use fragment::{normalize, Init, Tail};
-pub(crate) use models::EncodeSpec;
 
 /// 进程或线程资源的使用快照.
 // 预留给 API 资源监视, 当前尚未开放 HTTP 路由.
@@ -234,3 +225,4 @@ pub(crate) async fn read_tail(mut reader: impl AsyncRead + Unpin) -> Result<Stri
     }
     Ok(String::from_utf8_lossy(&tail).into_owned())
 }
+

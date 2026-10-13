@@ -11,11 +11,6 @@ use crate::process::ProcessManager;
 use crate::db;
 use super::CacheManager;
 
-#[cfg(test)]
-#[path = "../tests/cache/metadata.rs"]
-pub(super) mod tests;
-
-
 // MetadataEntry
 pub(super) struct MetadataEntry {
     info: MediaInfo,

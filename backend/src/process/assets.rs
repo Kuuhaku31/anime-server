@@ -5,7 +5,8 @@ use std::{path::{Path, PathBuf}, time::Instant};
 use anyhow::{ensure, Context, Result};
 use tokio::{process::Command, sync::watch};
 
-use super::{models::EncodeSpec, checked_output_cancellable};
+use super::checked_output_cancellable;
+use crate::models::EncodeSpec;
 
 /// 资源只属于本次字幕渲染任务, 不进入持久播放配置或缓存身份.
 pub(crate) struct RenderAssets {

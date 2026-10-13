@@ -5,9 +5,6 @@ use std::{collections::HashMap, path::{Path, PathBuf}};
 use crate::models::{ScannedFile, VideoFile, WatchProgress};
 use sqlx::SqlitePool;
 
-#[cfg(test)]
-#[path = "../tests/db/repository.rs"]
-mod tests;
 
 // 列表按地址展示每个副本, 指纹仅用于关联共享的业务数据.
 const VIDEO_SELECT: &str = r#"

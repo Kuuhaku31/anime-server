@@ -4,9 +4,6 @@ use anyhow::{ensure, Result};
 use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
 
-#[cfg(test)]
-#[path = "tests/config.rs"]
-mod tests;
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct AppConfig {

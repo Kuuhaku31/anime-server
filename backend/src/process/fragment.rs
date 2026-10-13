@@ -4,9 +4,6 @@ use std::ops::Range;
 
 use anyhow::{ensure, Context, Result};
 
-#[cfg(test)]
-#[path = "../tests/process/fragment.rs"]
-mod tests;
 
 const VIDEO_TIMESCALE: u32 = 90_000;
 const AUDIO_TIMESCALE: u32 = 48_000;

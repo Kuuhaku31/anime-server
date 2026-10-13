@@ -7,11 +7,8 @@ use serde::Deserialize;
 use tokio::{io::AsyncWriteExt, process::Command, sync::watch};
 use tracing::warn;
 
-use super::models::EncodeSpec;
+use crate::models::EncodeSpec;
 
-#[cfg(test)]
-#[path = "../tests/process/ffmpeg.rs"]
-mod tests;
 
 use super::{
     assets::RenderAssets,

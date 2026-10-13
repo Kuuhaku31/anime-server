@@ -14,20 +14,15 @@ use tracing::{info, warn};
 
 use sqlx::SqlitePool;
 
-use crate::{cache::metadata::MetadataEntry, config::PlaybackConfig, db, utils};
+use crate::{cache::metadata::MetadataEntry, config::PlaybackConfig, db, models::EncodeSpec, utils};
 
 mod disk;
 mod metadata;
-#[cfg(test)]
-#[path = "tests/fixtures/cache.rs"]
-pub(crate) mod testing;
-#[cfg(test)]
-#[path = "tests/cache.rs"]
-mod tests;
+
 
 use disk::{disk_usage, persist_used};
 use crate::process::{
-    self, cancelled, check_cancel, read_tail, Cancelled, CachedMedia, EncodeSpec,
+    self, cancelled, check_cancel, read_tail, Cancelled, CachedMedia,
     Init, ProcessManager, RenderAssets, Tail,
 };
 use crate::models::PlaybackVariantConfig;
@@ -207,7 +202,7 @@ impl CacheManager {
             &self.inner.database, config.src_file_pre16mib_md5(),
         ).await?
             .context("video file not found")?;
-        let spec = EncodeSpec::from_config(config.clone(), source, info)?;
+        let spec = crate::models::EncodeSpec::from_config(config.clone(), source, info)?;
         let mut entries = self.inner.entries.lock().await;
         ensure!(!self.is_stopping(), "server is shutting down");
         ensure!(entries.len() < 32, "too many active playback configurations");

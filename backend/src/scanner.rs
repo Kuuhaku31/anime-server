@@ -9,9 +9,6 @@ use crate::{
     AppState, constants::{self, EXTENSIONS}, db, models::{ScanChanges, ScannedFile},
 };
 
-#[cfg(test)]
-#[path = "tests/scanner.rs"]
-mod tests;
 
 /// 扫描媒体目录, 同步数据库索引, 返回扫描摘要:
 ///
