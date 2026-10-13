@@ -1,8 +1,8 @@
 //! 集中保存缓存状态, 生命周期及磁盘淘汰测试, 保持原有注释禁用状态.
 
-use super::{CacheFolder, CachePhase, CachedMedia, FolderPhase, FolderState};
-use crate::{models::PlaybackVariantConfig, video::{self, EncodeSpec}};
-use std::{path::PathBuf, time::SystemTime};
+use super::{CacheFolder, CacheManager, CachePhase, CachedMedia, FolderPhase, FolderState};
+use crate::{config::PlaybackConfig, models::PlaybackVariantConfig, video::{self, EncodeSpec, Processes}};
+use std::{path::PathBuf, sync::Arc, time::{Duration, SystemTime}};
 use tokio::sync::{Mutex, Notify};
 
 fn state() -> FolderState {
@@ -71,6 +71,71 @@ async fn cache_snapshot_exposes_only_session_status_fields() {
     assert_eq!(snapshot.revision(), 1);
     assert_eq!(snapshot.buffered_until(), 0.0);
     assert_eq!(snapshot.duration(), folder.spec.duration);
+}
+
+// 停止条目直接拒绝, 正常条目仍可复用, 两者都不依赖状态通知.
+#[tokio::test]
+async fn acquire_rejects_stopping_and_reuses_ready_folder() {
+    let (manager, root) = manager_fixture().await;
+    let folder = Arc::new(folder());
+    let config = folder.spec.config.clone();
+    let variant_key = folder.variant_key.clone();
+    folder.state.lock().await.phase = FolderPhase::Stopping {
+        cancel: tokio::sync::watch::channel(false).0,
+        loading: false, stop_after: None, deadline: None,
+    };
+    manager.inner.entries.lock().await.insert(variant_key.clone(), folder.clone());
+    let error = tokio::time::timeout(Duration::from_secs(1), manager.acquire(&config))
+        .await.unwrap().err().unwrap();
+    assert_eq!(error.to_string(), "playback cache is stopping");
+    assert!(Arc::ptr_eq(&manager.get(&variant_key).await.unwrap(), &folder));
+    folder.state.lock().await.phase = FolderPhase::Ready;
+    assert_eq!(manager.acquire(&config).await.unwrap().phase(), CachePhase::Ready);
+    manager.shutdown().await.unwrap();
+    drop(manager);
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+// 在锁外查询期间插入胜出条目, 验证失败请求不会替换条目或启动恢复任务.
+#[tokio::test]
+async fn acquire_reports_concurrent_activation_without_replacing_folder() {
+    let (manager, root) = manager_fixture().await;
+    let folder = Arc::new(folder());
+    let config = folder.spec.config.clone();
+    let variant_key = folder.variant_key.clone();
+    let file_id = config.src_file_pre16mib_md5();
+    sqlx::raw_sql(include_str!("../../sql/init.sql")).execute(&manager.inner.database).await.unwrap();
+    sqlx::query("INSERT INTO file (pre16mib_md5, size) VALUES (?, 1)")
+        .bind(file_id).execute(&manager.inner.database).await.unwrap();
+    sqlx::query("INSERT INTO file_path (path, pre16mib_md5) VALUES ('/media/test.mkv', ?)")
+        .bind(file_id).execute(&manager.inner.database).await.unwrap();
+    let mut metadata = manager.inner.metadata.lock().await;
+    metadata.insert(file_id.to_owned(), super::metadata::test_entry(video::fixture().0));
+    let acquiring = manager.acquire(&config);
+    tokio::pin!(acquiring);
+    // 锁住元数据使 acquire 必然停在初次 Map 未命中之后, 无需调度时序猜测.
+    assert!(tokio::time::timeout(Duration::from_millis(20), &mut acquiring).await.is_err());
+    manager.inner.entries.lock().await.insert(variant_key.clone(), folder.clone());
+    drop(metadata);
+    let error = tokio::time::timeout(Duration::from_secs(1), &mut acquiring)
+        .await.unwrap().err().unwrap();
+    assert_eq!(error.to_string(), "playback cache was activated by another request");
+    assert!(Arc::ptr_eq(&manager.get(&variant_key).await.unwrap(), &folder));
+    assert!(manager.inner.workers.lock().await.is_empty());
+    manager.shutdown().await.unwrap();
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+// 每个测试独占缓存目录和内存数据库, 避免访问真实媒体或持久缓存.
+async fn manager_fixture() -> (CacheManager, PathBuf) {
+    let root = std::env::temp_dir().join(format!("anime-acquire-{}", crate::utils::random_id().unwrap()));
+    tokio::fs::create_dir(&root).await.unwrap();
+    let database = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1)
+        .connect("sqlite::memory:").await.unwrap();
+    let manager = CacheManager::new(
+        root.clone(), PlaybackConfig::default(), database, Processes::new(2, 16),
+    ).await.unwrap();
+    (manager, root)
 }
 
 // use super::*;

@@ -343,7 +343,9 @@ CacheManager 和 SessionManager 的 `media_path` 只返回已验证的路径, AP
 
 最后一个租约离开时, Loading 任务完成磁盘恢复后退出; Running 尚未启动 FFmpeg 时立即取消,
 正在编码时最多再验证和发布一个完整分片后停止. 30 秒未等到分片则强制终止并回收进程.
-进入 Stopping 后不再接纳新租约, acquire 等待旧写入者退出和条目移除后重新恢复磁盘缓存.
+进入 Stopping 后不再接纳新租约, acquire 立即返回停止错误, 不等待旧写入者退出.
+acquire 未命中时在锁外读取媒体信息; 若期间其他请求先激活同 variant, 返回并发激活错误,
+不自动重试或复用胜出条目. 客户端需重新请求播放; 已命中的 Loading 条目仍等待恢复完成.
 DELETE 不等待此过程. 服务正常关闭采用相同停止规则, Compose 的宽限期为 40 秒.
 
 不保存 `metadata.json` 或单独的持久缓存索引.

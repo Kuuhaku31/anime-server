@@ -157,76 +157,75 @@ impl CacheManager {
         Ok(manager)
     }
 
-    // 恢复并激活共享缓存, 不启动新的 FFmpeg 编码任务.
+    /// 恢复并激活共享缓存, 不启动新的 FFmpeg 编码任务.
+    ///
+    /// 根据 PlaybackVariantConfig 找到或创建一个共享缓存实例,
+    /// 确保该缓存的磁盘状态已经恢复并可以使用, 然后返回 CacheSnapshot
     pub(crate) async fn acquire(&self, config: &PlaybackVariantConfig) -> Result<CacheSnapshot> {
+
         let variant_key = config.variant_key().to_owned();
-        loop {
-            let entries = self.inner.entries.lock().await;
-            ensure!(!self.is_stopping(), "server is shutting down");
-            if let Some(output) = entries.get(&variant_key).cloned() {
-                let notified = output.changed.notified();
-                tokio::pin!(notified);
-                notified.as_mut().enable();
-                let mut state = output.state.lock().await;
-                ensure!(output.spec.config == *config, "playback configuration hash collision");
-                let wait = match &state.phase {
-                    FolderPhase::Stopping { .. } => {
-                        drop(state);
-                        drop(entries);
-                        notified.await;
-                        continue;
-                    },
-                    FolderPhase::Failed => {
-                        state.phase = FolderPhase::Loading { cancel: watch::channel(false).0 };
-                        state.revision = REVISION.fetch_add(1, Ordering::Relaxed);
-                        state.last_used = SystemTime::now();
-                        true
-                    },
-                    _ => {
-                        state.last_used = SystemTime::now();
-                        if !matches!(state.phase, FolderPhase::Loading { .. }) {
-                            return Ok(output.snapshot(&state));
-                        }
-                        false
-                    },
-                };
-                drop(state);
-                drop(entries);
-                if wait { self.spawn_load(&output).await; }
-                return output.wait_loaded().await;
-            }
-            ensure!(entries.len() < 32, "too many active playback configurations");
-            drop(entries);
-            let info = self.media_info(config.src_file_pre16mib_md5()).await.map_err(|e| anyhow::anyhow!(e))?;
-            let source = db::get_a_video_path_by_file_id(
-                &self.inner.database, config.src_file_pre16mib_md5(),
-            ).await?
-                .context("video file not found")?;
-            let spec = EncodeSpec::from_config(config.clone(), source, info)?;
-            let mut entries = self.inner.entries.lock().await;
-            ensure!(!self.is_stopping(), "server is shutting down");
-            if entries.contains_key(&variant_key) { continue; }
-            ensure!(entries.len() < 32, "too many active playback configurations");
-            let output = Arc::new(CacheFolder {
-                variant_key: variant_key.clone(),
-                directory: self.inner.root.join("playback").join(&variant_key), spec: spec.clone(),
-                state: Mutex::new(FolderState {
-                    media: CachedMedia::default(),
-                    phase: FolderPhase::Loading { cancel: watch::channel(false).0 },
-                    revision: REVISION.fetch_add(1, Ordering::Relaxed), last_used: SystemTime::now(),
-                }),
-                changed: Notify::new(),
-            });
-            // 先保留唯一活动元素, 磁盘校验在该元素的任务内进行, 不阻塞其他会话的 DELETE.
-            match entries.entry(variant_key.clone()) {
-                Entry::Vacant(entry) => { entry.insert(output.clone()); },
-                Entry::Occupied(_) => bail!("playback activation raced while holding its lock"),
-            }
-            self.inner.folders.lock().await.insert(variant_key.clone(), Arc::downgrade(&output));
-            drop(entries);
-            self.spawn_load(&output).await;
-            return output.wait_loaded().await;
+
+        let folder_entries = self.inner.entries.lock().await; // 解锁
+
+        // 检查是否已有对应的缓存实例
+        if let Some(folder) = folder_entries.get(&variant_key).cloned() {
+
+            let mut folder_state = folder.state.lock().await;
+            ensure!(folder.spec.config == *config, "playback configuration hash collision");
+
+            let wait = match &folder_state.phase {
+                FolderPhase::Stopping { .. } => bail!("playback cache is stopping"),
+                FolderPhase::Failed => {
+                    folder_state.phase = FolderPhase::Loading { cancel: watch::channel(false).0 };
+                    folder_state.revision = REVISION.fetch_add(1, Ordering::Relaxed);
+                    folder_state.last_used = SystemTime::now();
+                    true
+                },
+                _ => {
+                    folder_state.last_used = SystemTime::now();
+                    if !matches!(folder_state.phase, FolderPhase::Loading { .. }) {
+                        return Ok(folder.snapshot(&folder_state));
+                    }
+                    false
+                },
+            };
+            drop(folder_state);
+            drop(folder_entries);
+            if wait { self.spawn_load(&folder).await; }
+            return folder.wait_loaded().await;
         }
+
+        // 缓存内没有对应文件夹
+        ensure!(folder_entries.len() < 32, "too many active playback configurations");
+        drop(folder_entries);
+        let info = self.media_info(config.src_file_pre16mib_md5()).await.map_err(|e| anyhow::anyhow!(e))?;
+        let source = db::get_a_video_path_by_file_id(
+            &self.inner.database, config.src_file_pre16mib_md5(),
+        ).await?
+            .context("video file not found")?;
+        let spec = EncodeSpec::from_config(config.clone(), source, info)?;
+        let mut entries = self.inner.entries.lock().await;
+        ensure!(!self.is_stopping(), "server is shutting down");
+        ensure!(entries.len() < 32, "too many active playback configurations");
+        let output = Arc::new(CacheFolder {
+            variant_key: variant_key.clone(),
+            directory: self.inner.root.join("playback").join(&variant_key), spec: spec.clone(),
+            state: Mutex::new(FolderState {
+                media: CachedMedia::default(),
+                phase: FolderPhase::Loading { cancel: watch::channel(false).0 },
+                revision: REVISION.fetch_add(1, Ordering::Relaxed), last_used: SystemTime::now(),
+            }),
+            changed: Notify::new(),
+        });
+        // 先保留唯一活动元素, 磁盘校验在该元素的任务内进行, 不阻塞其他会话的 DELETE.
+        match entries.entry(variant_key.clone()) {
+            Entry::Vacant(entry) => { entry.insert(output.clone()); },
+            Entry::Occupied(_) => bail!("playback cache was activated by another request"),
+        }
+        self.inner.folders.lock().await.insert(variant_key.clone(), Arc::downgrade(&output));
+        drop(entries);
+        self.spawn_load(&output).await;
+        output.wait_loaded().await
     }
 
     pub(crate) async fn status(&self, variant_key: &str) -> Result<CacheSnapshot> {
@@ -353,7 +352,6 @@ impl CacheManager {
         let path = output.directory.join(asset_name);
         let file = tokio::fs::symlink_metadata(&path).await.context("cached media file is missing")?;
         ensure!(file.is_file() && file.len() > 0, "unsafe or empty cached media file");
-        drop(state);
 
         Ok(path)
     }

@@ -67,7 +67,7 @@ impl SessionManager {
                 variant_key: variant_key.clone(), target, created: Instant::now(), touched: None,
             });
         }
-        // 等待旧写入者回收时不持有会话表锁, 其他客户端仍能立即释放租约.
+        // 缓存恢复时不持有会话表锁, 停止或并发激活冲突直接交由创建失败流程清理.
         let result = async {
             let cache = cache_manager.acquire(&config).await?;
             let threads = self.desired_threads(cache_manager, &variant_key, cache.buffered_until()).await?;

@@ -18,6 +18,12 @@ pub(super) struct MetadataEntry {
     last_access: SystemTime,
 }
 
+// 缓存并发测试使用已知媒体信息, 不启动外部探测进程.
+#[cfg(test)]
+pub(super) fn test_entry(info: MediaInfo) -> MetadataEntry {
+    MetadataEntry { info, last_access: SystemTime::now() }
+}
+
 
 impl CacheManager {
 
