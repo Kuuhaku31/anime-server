@@ -64,9 +64,7 @@
     "watched_datetime": "2026-10-10T07:00:00.000Z",
     "path": "/media/series/episode.mkv"
   },
-  "paths": [
-    "/media/series/episode.mkv"
-  ]
+  "paths": ["/media/series/episode.mkv"]
 }
 ```
 
@@ -123,7 +121,7 @@
 文件列表每行的 `Rescan` 按钮调用 `POST /api/scan/file`, 请求不包含文件指纹:
 
 ```json
-{"path":"/media/series/episode.mkv"}
+{ "path": "/media/series/episode.mkv" }
 ```
 
 `path` 是该行展示副本的完整服务器地址, 必须存在于数据库路径记录中.

@@ -18,30 +18,14 @@
 
 每个模块只能直接调用表中列出的核心模块, 未列出的一律禁止.
 
-| 调用方         | 允许直接调用                                       | 禁止直接调用                                        |
-| -------------- | -------------------------------------------------- | --------------------------------------------------- |
-| API            | Scanner, DB, SessionManager, CacheManager, Process | 无                                                  |
-| Scanner        | DB                                                 | API, SessionManager, CacheManager, Process          |
-| DB             | 无                                                 | API, Scanner, SessionManager, CacheManager, Process |
-| SessionManager | CacheManager                                       | API, Scanner, DB, Process                           |
-| CacheManager   | DB, Process                                        | API, Scanner, SessionManager                        |
-| Process        | 无                                                 | API, Scanner, DB, SessionManager, CacheManager      |
-
-```text
-API --+--> Scanner ---------------------------> DB
-      |                                        ^
-      +--> DB                                  |
-      |                                        |
-      +--> SessionManager --> CacheManager ----+
-      |                            |
-      +--> CacheManager            `----------> Process
-      |
-      `--> Process
-```
-
-图中不存在的边均为禁止依赖. DB 和 Process 是依赖图的叶子,
-不通过回调, trait object 或后台任务隐藏反向依赖.
-API 虽然可以调用全部其他模块, 但只能使用其 `pub(crate)` 公开接口, 不得访问私有子模块或私有状态.
+| 调用方         | 允许直接调用                                       |
+| -------------- | -------------------------------------------------- |
+| API            | Scanner, DB, SessionManager, CacheManager, Process |
+| Scanner        | DB                                                 |
+| SessionManager | CacheManager                                       |
+| CacheManager   | DB, Process                                        |
+| DB             | 无                                                 |
+| Process        | 无                                                 |
 
 ## 模块职责
 
