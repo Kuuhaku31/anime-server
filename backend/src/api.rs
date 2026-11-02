@@ -41,7 +41,7 @@ async fn list_media() -> Result<Json<Vec<(PathBuf, MediaInfo)>>, ApiError> {
     for record in records {
         let path = record.0;
         let configs = record.1;
-        let source_path = services::scanner().resolve(&path).await.map_err(ApiError::media)?;
+        let source_path = path.clone();
         let metadata = services::process().probe(&source_path).await.map_err(ApiError::media)?;
         media.push((path, MediaInfo { metadata, configs }));
     }
@@ -66,7 +66,6 @@ async fn rescan_media(
     input: Result<Json<MediaPathInput>, JsonRejection>,
 ) -> Result<Json<Option<(PathBuf, MediaInfo)>>, ApiError> {
     let Json(input) = input.map_err(ApiError::bad)?;
-    services::scanner().check_path(&input.path).map_err(ApiError::bad)?;
     let Some(file) = services::scanner().scan_one(services::database(), &input.path).await.map_err(ApiError::media)?
         else { return Ok(Json(None)); };
     let metadata = services::process().probe(&file.path).await.map_err(ApiError::media)?;
@@ -90,7 +89,6 @@ async fn save_media_configs(
     input: Result<Json<SaveMediaConfigsInput>, JsonRejection>,
 ) -> Result<StatusCode, ApiError> {
     let Json(input) = input.map_err(ApiError::bad)?;
-    services::scanner().check_path(&input.path).map_err(ApiError::bad)?;
     if input.configs.position.is_some_and(|position| !position.is_finite() || position < 0.0) {
         return Err(ApiError::bad("position must be finite and non-negative"));
     }

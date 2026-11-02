@@ -16,7 +16,7 @@ async fn scanning_updates_changed_content_and_deletes_only_missing_paths() -> Re
     tokio::fs::write(&first, b"first media").await?;
     tokio::fs::copy(&first, &copy).await?;
     let database = DatabaseManager::initialize(&directory.path.join("main.db")).await?;
-    let scanner = ScannerManager::new(root).await?;
+    let scanner = ScannerManager::new(&root).await?;
     let changes = scanner.scan_all(&database).await?;
     assert_eq!((changes.added, changes.updated, changes.total), (2, 0, 2));
     let (first_media_id, _) = database.get_file_by_path(&first).await?.unwrap();
@@ -43,7 +43,7 @@ async fn media_paths_cannot_escape_the_root() -> Result<()> {
     let outside = directory.path.join("outside.mkv");
     tokio::fs::write(&outside, b"not in the media root").await?;
     std::os::unix::fs::symlink(&outside, root.join("linked.mkv"))?;
-    let scanner = ScannerManager::new(root.clone()).await?;
+    let scanner = ScannerManager::new(&root).await?;
     assert!(scanner.resolve(&root.join("linked.mkv")).await.is_err());
     assert!(scanner.check_path(&root.join("../outside.mkv")).is_err());
     assert!(scanner.check_path(Path::new("episode.mkv")).is_err());
@@ -60,7 +60,7 @@ async fn moving_media_and_reusing_its_old_path_preserves_configs() -> Result<()>
     let moved = root.join("z.mkv");
     tokio::fs::write(&first, b"original media").await?;
     let database = DatabaseManager::initialize(&directory.path.join("main.db")).await?;
-    let scanner = ScannerManager::new(root).await?;
+    let scanner = ScannerManager::new(&root).await?;
     scanner.scan_all(&database).await?;
     let configs = crate::models::MediaConfigs { position: Some(7.375), ..Default::default() };
     database.save_configs_by_path(&first, &configs).await?;

@@ -34,7 +34,6 @@ async fn create_playback(
     input: Result<Json<PlaybackQuery>, JsonRejection>,
 ) -> Result<Json<PlaybackStart>, ApiError> {
     let Json(query) = input.map_err(ApiError::bad)?;
-    services::scanner().check_path(&query.path).map_err(ApiError::bad)?;
     let file = services::scanner().scan_one(services::database(), &query.path).await.map_err(ApiError::media)?
         .ok_or_else(|| ApiError::missing("media file not found"))?;
     let metadata = services::process().probe(&file.path).await.map_err(ApiError::media)?;

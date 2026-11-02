@@ -34,7 +34,7 @@ pub(crate) async fn initialize(config_path: &Path) -> Result<()> {
     register(&DATABASE, DatabaseManager::initialize(Path::new(constants::DATABASE_PATH)).await?, "database")?;
     let processes = register(&PROCESS, ProcessManager::new(config.max_processes, config.max_total_ffmpeg_threads), "process")?;
     register(&CACHE, CacheManager::new(constants::CACHE_DIR.into(), processes).await?, "cache")?;
-    register(&SCANNER, ScannerManager::new(constants::VIDEO_ROOT.into()).await?, "scanner")?;
+    register(&SCANNER, ScannerManager::new(Path::new(constants::VIDEO_ROOT)).await?, "scanner")?;
     register(&SESSIONS, SessionManager::new(), "sessions")?;
     Ok(())
 }

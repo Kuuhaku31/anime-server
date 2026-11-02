@@ -16,6 +16,7 @@ mod tests;
 
 /// 保存媒体根目录和扫描锁, 不持有数据库管理器.
 pub(crate) struct ScannerManager {
+
     /// 已规范化的媒体根目录.
     root: PathBuf,
     /// 串行化全量扫描和播放前的单路径重扫.
@@ -23,29 +24,12 @@ pub(crate) struct ScannerManager {
 }
 
 impl ScannerManager {
+
     /// 校验媒体根目录并创建独立扫描器.
-    pub(crate) async fn new(root: PathBuf) -> Result<Self> {
+    pub(crate) async fn new(root: &Path) -> Result<Self> {
         let root = tokio::fs::canonicalize(root).await.context("cannot resolve media root")?;
         ensure!(tokio::fs::metadata(&root).await?.is_dir(), "media root is not a directory");
         Ok(Self { root, lock: Mutex::new(()) })
-    }
-
-    /// 检查请求地址没有越界或父目录跳转, 不读取目标文件.
-    pub(crate) fn check_path(&self, path: &Path) -> Result<()> {
-        ensure!(path.is_absolute() && path.starts_with(&self.root) && path != self.root
-            && path.to_str().is_some() && is_video(path)
-            && !path.components().any(|part| matches!(part, Component::ParentDir | Component::CurDir)),
-            "invalid media path: {}", path.display());
-        Ok(())
-    }
-
-    /// 验证现存文件实际位于媒体目录内, 保留列表展示的路径身份.
-    pub(crate) async fn resolve(&self, path: &Path) -> Result<PathBuf> {
-        self.check_path(path)?;
-        let resolved = tokio::fs::canonicalize(path).await?;
-        ensure!(resolved.starts_with(&self.root) && tokio::fs::metadata(&resolved).await?.is_file(),
-            "media path must resolve to a file inside media root: {}", path.display());
-        Ok(resolved)
     }
 
     /// 全量重算内容身份, 只删除本次确实未发现的已登记路径.
@@ -101,6 +85,24 @@ impl ScannerManager {
         file.path = path.to_owned();
         database.replace_scanned_path(&file).await?;
         Ok(Some(file))
+    }
+
+    /// 验证现存文件实际位于媒体目录内, 保留列表展示的路径身份.
+    async fn resolve(&self, path: &Path) -> Result<PathBuf> {
+        self.check_path(path)?;
+        let resolved = tokio::fs::canonicalize(path).await?;
+        ensure!(resolved.starts_with(&self.root) && tokio::fs::metadata(&resolved).await?.is_file(),
+            "media path must resolve to a file inside media root: {}", path.display());
+        Ok(resolved)
+    }
+
+    /// 检查请求地址没有越界或父目录跳转, 不读取目标文件.
+    fn check_path(&self, path: &Path) -> Result<()> {
+        ensure!(path.is_absolute() && path.starts_with(&self.root) && path != self.root
+            && path.to_str().is_some() && is_video(path)
+            && !path.components().any(|part| matches!(part, Component::ParentDir | Component::CurDir)),
+            "invalid media path: {}", path.display());
+        Ok(())
     }
 }
 
