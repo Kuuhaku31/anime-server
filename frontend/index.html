@@ -1,6 +1,6 @@
 
 <!-- frontend/index.html -->
-<!-- 定义常驻播放器和右侧文件及缓存任务列表. -->
+<!-- 定义简洁播放器和可展开的媒体及缓存列表. -->
 <!doctype html>
 <html lang="en">
 
@@ -47,28 +47,8 @@
           <button id="fullscreen" type="button">Fullscreen</button>
         </div>
       </div>
-      <div class="track-controls">
-        <label>
-          <span>Video</span>
-          <select id="video-track" disabled></select>
-        </label>
-        <label>
-          <span>Audio</span>
-          <select id="audio-track" disabled></select>
-        </label>
-        <label>
-          <span>Subtitles</span>
-          <select id="subtitle-track" disabled></select>
-        </label>
-      </div>
       <div class="playback-feedback">
         <span id="playback-status" role="status">Select a video from the library</span>
-        <!-- 缓存生成进度独立于播放位置和浏览器下载缓冲. -->
-        <div id="cache-generation" hidden>
-          <label for="cache-progress">Cache generation</label>
-          <output id="cache-status" for="cache-progress"></output>
-          <progress id="cache-progress" max="100" value="0"></progress>
-        </div>
         <div id="error" role="alert"></div>
         <div id="error-actions" hidden>
           <button id="retry" type="button">Retry</button>
@@ -81,8 +61,8 @@
     <section class="panel files-panel">
       <div class="section-heading files-heading">
         <div>
-          <span class="eyebrow">Library</span>
-          <h2>Video files</h2>
+          <span class="eyebrow">Sources</span>
+          <h2>Media files</h2>
         </div>
         <span id="files-count" class="count-badge">0</span>
       </div>
@@ -98,18 +78,18 @@
           <option value="progress-desc">Playback progress</option>
         </select>
       </label>
-      <div id="files" class="files-list"></div>
+      <div id="files" class="files-list" aria-label="Media files"></div>
     </section>
     <section class="panel cache-panel" aria-label="Cache tasks">
       <div class="section-heading">
         <div>
-          <span class="eyebrow">Transcoding</span>
-          <h2>Caches <span id="cache-count" class="count-badge">0</span></h2>
+          <span class="eyebrow">Generated</span>
+          <h2>Cache folders <span id="cache-count" class="count-badge">0</span></h2>
         </div>
         <button id="cache-refresh" type="button">Refresh</button>
       </div>
       <p id="cache-resources" class="cache-summary"></p>
-      <p class="cache-hint">Worker permits only, not CPU usage or browser decoding.</p>
+      <p class="cache-hint">Worker permits, not CPU usage or browser decoding.</p>
       <div id="cache-error" role="alert"></div>
       <div id="caches" class="cache-list"></div>
     </section>
@@ -118,7 +98,7 @@
   <dialog id="cache-delete-dialog">
     <h2>Delete cache?</h2>
     <p id="cache-delete-name"></p>
-    <p>This stops transcoding and removes cached files immediately. Playback using this cache will be interrupted.</p>
+    <p>This stops encoding and removes cached files immediately. Playback using this cache will be interrupted.</p>
     <div class="actions">
       <button id="cache-delete-cancel" type="button">Cancel</button>
       <button id="cache-delete-confirm" type="button">Delete cache</button>

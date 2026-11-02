@@ -1,6 +1,6 @@
 
 // frontend/src/ui/cache-list.ts
-// 展示稳定句柄缓存列表, worker 资源和独立管理操作.
+// 展示可展开的缓存文件夹摘要, 状态和管理操作.
 
 import type { CacheStore } from "../state/cache-store.ts";
 import type { CacheEntry, MediaInfo } from "../state/player-state.ts";
@@ -18,35 +18,19 @@ export function cacheActions(entry: CacheEntry): Record<"play" | "retry" | "stop
   };
 }
 
-/** 将共享缓存 Map 渲染为独立于视频文件列表的任务面板. */
+/** 将共享缓存 Map 渲染为可独立展开的缓存文件夹列表. */
 export class CacheList {
-  /** 绑定缓存管理按钮和明确的删除确认, 所有动态文本使用 textContent. */
+  /** 绑定缓存管理按钮和明确的删除确认. */
   constructor(store: CacheStore, play: (handleId: string) => void, media: (path: string | null) => MediaInfo | null) {
     this.store = store;
+    this.play = play;
     this.media = media;
     store.addEventListener("change", () => this.render());
-    this.container.addEventListener("click", (event) => {
-      const target = event.target;
-      if (!(target instanceof HTMLButtonElement)) return;
-      const handleId = target.dataset.handleId;
-      if (!handleId || target.disabled) return;
-      const entry = store.entries.get(handleId);
-      if (!entry || store.pending.has(handleId)) return;
-      const action = target.dataset.action;
-      if (action === "play" && cacheActions(entry).play) play(handleId);
-      else if (action === "retry" && cacheActions(entry).retry) {
-        void store.retry(handleId).catch((error) => console.error("Cache retry failed", error));
-      } else if (action === "stop" && cacheActions(entry).stop) {
-        void store.stop(handleId).catch((error) => console.error("Cache stop failed", error));
-      } else if (action === "delete") {
-        this.deleting = handleId;
-        element("#cache-delete-name").textContent = entry.source_path ?? handleId;
-        this.dialog.showModal();
-      }
-    });
+    this.container.addEventListener("click", (event) => this.click(event));
     element<HTMLButtonElement>("#cache-delete-cancel").onclick = () => this.dialog.close();
     element<HTMLButtonElement>("#cache-delete-confirm").onclick = () => {
       const handleId = this.deleting;
+      this.deleting = null;
       this.dialog.close();
       if (handleId) void store.remove(handleId).catch((error) => console.error("Cache deletion failed", error));
     };
@@ -70,15 +54,19 @@ export class CacheList {
     const total = this.store.resources;
     element("#cache-resources").textContent =
       `Workers ${total.encoder_slots} / processes ${total.process_slots} / FFmpeg threads ${total.ffmpeg_threads}`;
-    const rows = [...this.store.entries.values()].sort((left, right) => left.handle_id.localeCompare(right.handle_id))
-      .map((entry) => this.row(entry));
+    const entries = [...this.store.entries.values()].sort((left, right) => left.handle_id.localeCompare(right.handle_id));
+    const visible = new Set(entries.map((entry) => entry.handle_id));
+    this.expanded = new Set([...this.expanded].filter((handleId) => visible.has(handleId)));
+    const rows = entries.map((entry) => this.row(entry));
     this.container.replaceChildren(...rows);
-    if (!rows.length) this.container.textContent = "No caches yet. Build one from the video files.";
+    if (!rows.length) this.container.textContent = "No cache folders yet. Create one from a media file.";
   }
 
-  /** 列表共用的内存数据源. */
+  /** 共享缓存状态的唯一数据源. */
   private store: CacheStore;
-  /** 查找已经探测过的源媒体信息. */
+  /** 缓存列表播放回调. */
+  private play: (handleId: string) => void;
+  /** 查找已加载媒体信息的回调. */
   private media: (path: string | null) => MediaInfo | null;
   /** 任务列表容器. */
   private container = element<HTMLDivElement>("#caches");
@@ -88,52 +76,129 @@ export class CacheList {
   private deleting: string | null = null;
   /** 当前播放器引用的稳定标识. */
   private active: string | null = null;
+  /** 多行独立的展开状态. */
+  private expanded = new Set<string>();
 
-  /** 为一个句柄创建安全文本和具有明确边界的操作按钮. */
-  private row(entry: CacheEntry): HTMLDivElement {
-    const row = document.createElement("div");
+  /** 处理行展开和仅在展开详情中出现的操作. */
+  private click(event: Event): void {
+    const target = event.target;
+    if (!(target instanceof Element)) return;
+    const summary = target.closest<HTMLElement>("summary[data-handle-id]");
+    if (summary && this.container.contains(summary)) {
+      event.preventDefault();
+      const handleId = summary.dataset.handleId;
+      if (!handleId) return;
+      if (this.expanded.has(handleId)) this.expanded.delete(handleId);
+      else this.expanded.add(handleId);
+      this.render();
+      return;
+    }
+    const button = target.closest<HTMLButtonElement>("button[data-action]");
+    if (!button || !this.container.contains(button) || button.disabled) return;
+    const handleId = button.dataset.handleId;
+    if (!handleId || this.store.pending.has(handleId)) return;
+    const entry = this.store.entries.get(handleId);
+    if (!entry) return;
+    const action = button.dataset.action;
+    if (action === "play" && cacheActions(entry).play) this.play(handleId);
+    else if (action === "retry" && cacheActions(entry).retry) {
+      void this.store.retry(handleId).catch((error) => console.error("Cache retry failed", error));
+    } else if (action === "stop" && cacheActions(entry).stop) {
+      void this.store.stop(handleId).catch((error) => console.error("Cache pause failed", error));
+    } else if (action === "delete") {
+      this.deleting = handleId;
+      element("#cache-delete-name").textContent = entry.source_path ?? handleId;
+      this.dialog.showModal();
+    }
+  }
+
+  /** 创建一个紧凑缓存摘要及可选的完整状态详情. */
+  private row(entry: CacheEntry): HTMLDetailsElement {
+    const expanded = this.expanded.has(entry.handle_id);
+    const row = document.createElement("details");
     row.className = `cache-row${entry.handle_id === this.active ? " active" : ""}`;
     row.dataset.handleId = entry.handle_id;
+    row.open = expanded;
+
+    const summary = document.createElement("summary");
+    summary.dataset.handleId = entry.handle_id;
     const name = document.createElement("strong");
     name.textContent = entry.source_path?.split("/").at(-1) ?? "Source unavailable";
     name.title = entry.source_path ?? entry.handle_id;
-    const identity = document.createElement("code");
-    identity.textContent = entry.handle_id;
-    const selection = document.createElement("span");
-    const spec = entry.spec;
-    selection.textContent = `Video ${spec.video_stream_index} / Audio ${spec.audio_stream_index ?? "off"} / Subtitles ${spec.subtitle_stream_index ?? "off"}`;
+    const identifier = document.createElement("code");
+    identifier.textContent = entry.handle_id.slice(0, 12);
+    identifier.title = entry.handle_id;
     const duration = this.media(entry.source_path)?.metadata.duration ?? 0;
     const progress = cacheProgress(entry.status, duration);
-    const state = document.createElement("span");
-    state.textContent = progress.text;
-    state.dataset.phase = entry.status.phase;
+    const status = document.createElement("span");
+    status.className = "cache-summary-state";
+    status.dataset.phase = entry.status.phase;
+    status.textContent = progress.text;
+    const usage = entry.status.resources;
+    const resources = document.createElement("span");
+    resources.className = "cache-summary-resources";
+    resources.textContent = `Worker ${usage.encoder_slots}/1 / ${usage.ffmpeg_threads} threads`;
+    summary.append(name, identifier, status, resources);
+    row.append(summary);
+    if (expanded) row.append(this.details(entry, duration));
+    return row;
+  }
+
+  /** 展示完整缓存身份, 生成状态和操作入口. */
+  private details(entry: CacheEntry, duration: number): HTMLDivElement {
+    const details = document.createElement("div");
+    details.className = "cache-details";
+    const identity = document.createElement("code");
+    identity.textContent = entry.handle_id;
+    identity.className = "cache-full-id";
+    const source = document.createElement("p");
+    source.className = "item-status";
+    source.textContent = `Source: ${entry.source_path ?? "unavailable"}`;
+    const spec = document.createElement("p");
+    spec.className = "item-status";
+    spec.textContent = `Media ${entry.spec.media_id} / version ${entry.spec.version}`;
+    const tracks = document.createElement("p");
+    tracks.className = "item-status";
+    tracks.textContent = `Video ${entry.spec.video_stream_index} / Audio ${entry.spec.audio_stream_index ?? "off"} / Subtitles ${entry.spec.subtitle_stream_index ?? "off"}`;
+    const status = document.createElement("p");
+    status.className = "item-status";
+    status.textContent = `State: ${entry.status.phase} / Published: ${entry.status.buffered_until.toFixed(2)}s${duration > 0 ? ` / Total: ${duration.toFixed(2)}s` : ""}`;
+    const progress = cacheProgress(entry.status, duration);
     const bar = document.createElement("progress");
     bar.max = 100;
     if (duration > 0 || entry.status.phase === "completed") bar.value = progress.percent;
     bar.setAttribute("aria-label", progress.text);
-    const resources = document.createElement("span");
     const usage = entry.status.resources;
-    resources.textContent = `Encoder ${usage.encoder_slots}/1 / process ${usage.process_slots}/1 / threads ${usage.ffmpeg_threads}`;
+    const resources = document.createElement("p");
+    resources.className = "item-status";
+    resources.textContent = `Encoder ${usage.encoder_slots}/1 / process ${usage.process_slots}/1 / FFmpeg threads ${usage.ffmpeg_threads}`;
+    details.append(identity, source, spec, tracks, status, bar, resources);
+    if (entry.status.error) {
+      const diagnostic = document.createElement("p");
+      diagnostic.className = "item-error";
+      diagnostic.textContent = entry.status.error;
+      details.append(diagnostic);
+    }
+    details.append(this.actions(entry));
+    return details;
+  }
+
+  /** 创建具有明确可用条件的详情操作按钮. */
+  private actions(entry: CacheEntry): HTMLDivElement {
     const actions = document.createElement("div");
-    actions.className = "actions cache-actions";
+    actions.className = "item-actions cache-actions";
     const enabled = cacheActions(entry);
     for (const action of ["play", "retry", "stop", "delete"] as const) {
       const button = document.createElement("button");
       button.type = "button";
       button.dataset.handleId = entry.handle_id;
       button.dataset.action = action;
-      button.textContent = { play: "Play", retry: "Retry / resume", stop: "Stop build", delete: "Delete" }[action];
+      button.textContent = {
+        play: "Play", retry: "Retry / resume", stop: "Pause encoding", delete: "Delete cache",
+      }[action];
       button.disabled = this.store.pending.has(entry.handle_id) || !enabled[action];
       actions.append(button);
     }
-    row.append(name, identity, selection, state, bar, resources);
-    if (entry.status.error) {
-      const error = document.createElement("span");
-      error.className = "cache-diagnostic";
-      error.textContent = entry.status.error;
-      row.append(error);
-    }
-    row.append(actions);
-    return row;
+    return actions;
   }
 }

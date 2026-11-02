@@ -8,22 +8,12 @@ import { attachControls, element } from "./ui/controls.ts";
 import { fileAddress, Library } from "./ui/library.ts";
 import { CacheStore } from "./state/cache-store.ts";
 import { CacheList } from "./ui/cache-list.ts";
-import type { PlaybackQuery } from "./state/player-state.ts";
 
 const player = element<HTMLVideoElement>("#player");
 const caches = new CacheStore();
 const controller = new PlaybackController(player, caches);
 attachControls(controller, player);
-const library = new Library((file) => controller.open(file), (error) => controller.fail(error), async (file) => {
-  const query: PlaybackQuery = { path: file[0] };
-  const configs = file[1].configs;
-  if (configs.video_stream_index !== null) {
-    query.video_stream_index = configs.video_stream_index;
-    query.audio_stream_index = configs.audio_stream_index;
-    query.subtitle_stream_index = configs.subtitle_stream_index;
-  }
-  await caches.build(query);
-});
+const library = new Library((query) => caches.build(query), (error) => controller.fail(error));
 const cacheList = new CacheList(caches, (handleId) => controller.openCached(handleId), (path) => library.info(path));
 controller.addEventListener("change", () => {
   library.select(controller.file ? fileAddress(controller.file) : null);
