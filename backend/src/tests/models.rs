@@ -28,11 +28,11 @@ fn cache_descriptor_round_trips_and_keeps_ordered_identity() {
 /// 前端只能接收 metadata 和 configs, 内部时间轴和附件不泄露.
 #[test]
 fn media_response_keeps_internal_probe_details_private() {
-    let media = MediaInfo { metadata: crate::testing::metadata(), configs: MediaConfigs::default() };
+    let media = (crate::testing::metadata(), MediaConfigs::default());
     let json = serde_json::to_value(media).unwrap();
-    assert_eq!(json.as_object().unwrap().len(), 2);
-    assert!(json["metadata"].get("video_streams").is_some());
-    assert!(json["metadata"].get("start_time").is_none());
-    assert!(json["metadata"].get("attachments").is_none());
-    assert!(json["metadata"]["video_streams"][0].get("color_transfer").is_none());
+    assert_eq!(json.as_array().unwrap().len(), 2);
+    assert!(json[0].get("video_streams").is_some());
+    assert!(json[0].get("start_time").is_none());
+    assert!(json[0].get("attachments").is_none());
+    assert!(json[0]["video_streams"][0].get("color_transfer").is_none());
 }

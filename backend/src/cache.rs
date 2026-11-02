@@ -21,12 +21,17 @@ use handle::CacheInstanceHandle;
 /// 返回稳定缓存身份和公开状态, 不暴露内部目录.
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct CacheSnapshot {
+
     /// 客户端用来查询和播放的稳定句柄标识.
     pub(crate) handle_id: String,
     /// 已确认的媒体内容和流选择.
     pub(crate) spec: CacheSpec,
-    /// 当前生成进度和资源占用.
+    /// 当前生成进度.
     pub(crate) status: CacheStatus,
+    /// 当前转码 worker 占用.
+    pub(crate) resources: WorkerResources,
+    /// 稳定排序后的首个现存源路径, 无源缓存为 None.
+    pub(crate) source_path: Option<PathBuf>,
 }
 
 /// 描述缓存状态和已发布范围, 不保存播放位置.
@@ -36,8 +41,6 @@ pub(crate) struct CacheStatus {
     pub(crate) phase: String,
     /// 已验证并发布的连续前缀终点秒数.
     pub(crate) buffered_until: f64,
-    /// 仅统计已启动的转码 worker.
-    pub(crate) resources: WorkerResources,
     /// 最近一次恢复或转码失败的诊断, 正常状态为 None.
     pub(crate) error: Option<String>,
 }

@@ -36,7 +36,7 @@ async fn concurrent_opens_share_one_handle_and_completed_cache_survives_restart(
     let json = serde_json::to_value(manager.status(&first.handle_id).await?)?;
     assert_eq!(json["handle_id"], first.handle_id);
     assert!(json.get("folder").is_none());
-    assert_eq!(json["status"]["resources"]["ffmpeg_threads"], 0);
+    assert_eq!(json["resources"]["ffmpeg_threads"], 0);
     manager.shutdown().await?;
     drop(manager);
     tokio::fs::remove_file(&source).await?;
@@ -69,7 +69,7 @@ async fn failed_generation_reloads_the_same_handle_on_retry() -> Result<()> {
     let first = manager.build(spec.clone(), source.clone(), metadata.clone(), &config, &processes).await?;
     wait_phase(&manager, &first.handle_id, "failed").await?;
     let handle = manager.handle(&first.handle_id).await?;
-    assert_eq!(manager.status(&first.handle_id).await?.status.resources, WorkerResources::default());
+    assert_eq!(manager.status(&first.handle_id).await?.resources, WorkerResources::default());
     tokio::fs::rename(&backup, &source).await?;
     let second = manager.retry(&first.handle_id, source, metadata, &config, &processes).await?;
     assert!(Arc::ptr_eq(&handle, &manager.handle(&second.handle_id).await?));
@@ -92,7 +92,7 @@ async fn remove_cancels_queued_generation_and_prevents_late_writers() -> Result<
         spec.media_id = format!("{iteration:032x}");
         let snapshot = manager.build(spec, directory.path.join("missing.mkv"), metadata(), &config, &processes).await?;
         if iteration == 0 { wait_phase(&manager, &snapshot.handle_id, "running").await?; }
-        assert_eq!(manager.status(&snapshot.handle_id).await?.status.resources, WorkerResources::default());
+        assert_eq!(manager.status(&snapshot.handle_id).await?.resources, WorkerResources::default());
         let folder = manager.handle(&snapshot.handle_id).await?.path.clone();
         manager.remove(&snapshot.handle_id).await?;
         tokio::time::sleep(std::time::Duration::from_millis(40)).await;
@@ -152,14 +152,14 @@ async fn recovered_partial_cache_appends_without_overwriting_the_prefix() -> Res
     let stopped = manager.stop(&snapshot.handle_id).await?;
     assert_eq!(stopped.status.phase, "ready");
     assert_eq!(stopped.status.buffered_until, 8.0);
-    assert_eq!(stopped.status.resources, WorkerResources::default());
+    assert_eq!(stopped.resources, WorkerResources::default());
     assert!(folder.exists());
     manager.retry(&snapshot.handle_id, source.clone(), metadata.clone(), &config, &processes).await?;
     manager.shutdown().await?;
     assert_eq!(tokio::fs::read(folder.join("segment_000000.m4s")).await?, first);
     assert_eq!(tokio::fs::read(folder.join("segment_000001.m4s")).await?, second);
     assert!(folder.join("instance.json").exists());
-    assert_eq!(manager.status(&snapshot.handle_id).await?.status.resources, WorkerResources::default());
+    assert_eq!(manager.status(&snapshot.handle_id).await?.resources, WorkerResources::default());
     drop(manager);
     let manager = CacheManager::new(root, &processes).await?;
     wait_phase(&manager, &snapshot.handle_id, "ready").await?;

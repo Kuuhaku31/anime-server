@@ -8,7 +8,7 @@ use anyhow::{ensure, Result};
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 
-use crate::{cache::CacheSnapshot, constants::HASH_LIMIT, process::WorkerResources, utils};
+use crate::{cache::CacheSnapshot, constants::HASH_LIMIT, utils};
 
 mod media;
 
@@ -16,7 +16,7 @@ mod media;
 #[path = "tests/models.rs"]
 mod tests;
 
-pub(crate) use media::{Attachment, MediaConfigs, MediaInfo, MediaMetadata, StreamInfo};
+pub(crate) use media::{Attachment, MediaConfigs, MediaMetadata, StreamInfo};
 
 // /// 保存内容标识对应的共享播放配置.
 // #[derive(Debug, sqlx::FromRow)]
@@ -79,32 +79,14 @@ pub(crate) struct PlaybackQuery {
     pub(crate) subtitle_stream_index: Option<Option<i32>>,
 }
 
-/// 聚合缓存快照和按内容身份找到的现存源路径.
-#[derive(Debug, Serialize)]
-pub(crate) struct CacheEntry {
-    /// 不包含磁盘目录的缓存身份和当前状态.
-    #[serde(flatten)]
-    pub(crate) snapshot: CacheSnapshot,
-    /// 稳定排序后的首个现存源路径, 无源缓存为 None.
-    pub(crate) source_path: Option<PathBuf>,
-}
-
-/// 返回全部缓存及其转码 worker 的占用合计.
-#[derive(Debug, Serialize)]
-pub(crate) struct CacheList {
-    /// 按 handle_id 排序的全部缓存条目.
-    pub(crate) entries: Vec<CacheEntry>,
-    /// 全部条目的转码 worker 占用, 不包含短时探测和校验进程.
-    pub(crate) resources: WorkerResources,
-}
-
 /// 返回构建结果及最新媒体信息, 实际流选择位于 cache.spec.
 #[derive(Debug, Serialize)]
 pub(crate) struct CacheBuild {
     /// 新建或复用的缓存条目.
-    pub(crate) cache: CacheEntry,
+    pub(crate) cache: CacheSnapshot,
     /// 当前路径重新探测的元数据和共享配置.
-    pub(crate) media: MediaInfo,
+    pub(crate) media_meta: MediaMetadata,
+    pub(crate) media_configs: MediaConfigs,
 }
 
 /// 以固定字段顺序定义缓存身份和 instance.json 的唯一格式.

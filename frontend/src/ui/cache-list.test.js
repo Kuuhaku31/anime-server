@@ -12,8 +12,8 @@ function entry(handleId = "a".repeat(32), phase = "ready", sourcePath = "/media/
   return {
     handle_id: handleId, source_path: sourcePath,
     spec: { media_id: "b".repeat(32), version: "test", video_stream_index: 0, audio_stream_index: null, subtitle_stream_index: null },
-    status: { phase, buffered_until: bufferedUntil, error: null,
-      resources: { encoder_slots: 0, process_slots: 0, ffmpeg_threads: 0 } },
+    status: { phase, buffered_until: bufferedUntil, error: null },
+    resources: { encoder_slots: 0, process_slots: 0, ffmpeg_threads: 0 },
   };
 }
 

@@ -8,21 +8,21 @@ import type { CacheStatus } from "../state/player-state.ts";
 
 test("cache generation shows verified time independently of playback and completion rounding", () => {
   // 播放目标和浏览器缓冲不参与百分比, 完成标记将舍入不足的末端显示为 100%.
-  const cache: CacheStatus = { buffered_until: 30, phase: "running", error: null,
-    resources: { encoder_slots: 1, process_slots: 1, ffmpeg_threads: 2 } };
-  assert.deepEqual(cacheProgress(cache, 120), { percent: 25, text: "Generating: 25.0% / 0:30 of 2:00" });
-  assert.match(cacheProgress({ ...cache, phase: "loading" }, 120).text, /^Preparing \/ queued/);
-  assert.match(cacheProgress({ ...cache, phase: "ready" }, 120).text, /^Ready/);
-  assert.match(cacheProgress({ ...cache, phase: "stopping" }, 120).text, /^Stopping/);
-  assert.match(cacheProgress({ ...cache, phase: "failed" }, 120).text, /^Generation failed/);
-  const complete = cacheProgress({ ...cache, phase: "completed", buffered_until: 119.99 }, 120);
+  const cache: CacheStatus = { buffered_until: 30, phase: "running", error: null };
+  const resources = { encoder_slots: 1, process_slots: 1, ffmpeg_threads: 2 };
+  assert.deepEqual(cacheProgress(cache, 120, resources), { percent: 25, text: "Generating: 25.0% / 0:30 of 2:00" });
+  assert.match(cacheProgress({ ...cache, phase: "loading" }, 120, resources).text, /^Preparing \/ queued/);
+  assert.match(cacheProgress({ ...cache, phase: "ready" }, 120, resources).text, /^Ready/);
+  assert.match(cacheProgress({ ...cache, phase: "stopping" }, 120, resources).text, /^Stopping/);
+  assert.match(cacheProgress({ ...cache, phase: "failed" }, 120, resources).text, /^Generation failed/);
+  const complete = cacheProgress({ ...cache, phase: "completed", buffered_until: 119.99 }, 120, resources);
   assert.equal(complete.percent, 100);
   assert.match(complete.text, /^Complete: 100.0%/);
-  assert.equal(cacheProgress({ ...cache, buffered_until: 120.1 }, 120).percent, 100);
-  assert.match(cacheProgress({ ...cache, resources: { encoder_slots: 0, process_slots: 0, ffmpeg_threads: 0 } }, 120).text,
+  assert.equal(cacheProgress({ ...cache, buffered_until: 120.1 }, 120, resources).percent, 100);
+  assert.match(cacheProgress(cache, 120, { encoder_slots: 0, process_slots: 0, ffmpeg_threads: 0 }).text,
     /^Queued \/ preparing/);
-  assert.match(cacheProgress(cache, 0).text, /duration unavailable/);
-  assert.equal(cacheProgress(cache, 0).percent, 0);
+  assert.match(cacheProgress(cache, 0, resources).text, /duration unavailable/);
+  assert.equal(cacheProgress(cache, 0, resources).percent, 0);
 });
 
 test("fractional HLS source offsets preserve the original timeline", () => {

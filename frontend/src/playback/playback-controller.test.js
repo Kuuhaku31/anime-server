@@ -101,13 +101,13 @@ function server(context, generated = 120) {
       const handleId = createHash("md5").update(JSON.stringify(spec)).digest("hex");
       const cache = {
         handle_id: handleId, spec, source_path: body.path,
-        status: { phase: "running", buffered_until: generated, error: null,
-          resources: { encoder_slots: 1, process_slots: 1, ffmpeg_threads: 2 } },
+        status: { phase: "running", buffered_until: generated, error: null },
+        resources: { encoder_slots: 1, process_slots: 1, ffmpeg_threads: 2 },
       };
       caches.set(handleId, cache);
       result = { cache, media: info };
     } else if (url === "/api/cache" && method === "GET") {
-      result = { entries: [...caches.values()], resources: { encoder_slots: 0, process_slots: 0, ffmpeg_threads: 0 } };
+      result = { entries: [...caches.values()] };
     } else if (method === "GET" && url.startsWith("/api/cache/")) result = caches.get(url.split("/").at(-1));
     else if (method === "PUT") return new Response(null, { status: 204 });
     else throw new Error(`Unexpected request: ${method} ${url}`);
@@ -340,7 +340,7 @@ test("stopping generation ends an uncovered initial playback wait without rebuil
   await until(() => controller.message.includes("Waiting for 0:12"));
   const cache = [...api.caches.values()][0];
   cache.status.phase = "ready";
-  cache.status.resources = { encoder_slots: 0, process_slots: 0, ffmpeg_threads: 0 };
+  cache.resources = { encoder_slots: 0, process_slots: 0, ffmpeg_threads: 0 };
   await until(() => !controller.pending);
   assert.match(controller.error, /generation is stopped/);
   assert.equal(controller.handleId, cache.handle_id);

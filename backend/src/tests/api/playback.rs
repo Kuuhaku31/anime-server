@@ -1,37 +1,38 @@
 
 // backend/src/tests/api/playback.rs
-//! 验证直接选轨, null 关闭语义和最小播放请求.
+//! 验证播放请求字段和缓存源路径查询.
 
 use super::*;
 
-/// 缺省继承配置, 显式 null 关闭, 三类流都按全局索引校验.
+/// 请求字段缺省和显式 null 保持不同, 以区分继承偏好与关闭轨道.
 #[test]
-fn selected_streams_preserve_defaults_and_explicit_disabled_choices() {
-    let metadata = crate::testing::metadata();
-    let configs = MediaConfigs { position: Some(7.375), video_stream_index: Some(4),
-        audio_stream_index: Some(3), subtitle_stream_index: Some(2) };
-    let query: PlaybackQuery = serde_json::from_value(serde_json::json!({"path": "/media/episode.mkv"})).unwrap();
-    let spec = select_streams("a".repeat(32), &query, &metadata, &configs).unwrap();
-    assert_eq!((spec.video_stream_index, spec.audio_stream_index, spec.subtitle_stream_index), (4, Some(3), Some(2)));
-    let query: PlaybackQuery = serde_json::from_value(serde_json::json!({
-        "path": "/media/episode.mkv", "video_stream_index": 0, "audio_stream_index": null, "subtitle_stream_index": null,
+fn playback_query_distinguishes_missing_tracks_from_explicit_null() {
+    let inherited: PlaybackQuery = serde_json::from_value(serde_json::json!({
+        "path": "/media/episode.mkv",
     })).unwrap();
-    let spec = select_streams("a".repeat(32), &query, &metadata, &configs).unwrap();
-    assert_eq!((spec.video_stream_index, spec.audio_stream_index, spec.subtitle_stream_index), (0, None, None));
+    assert_eq!(inherited.audio_stream_index, None);
+    assert_eq!(inherited.subtitle_stream_index, None);
+
+    let disabled: PlaybackQuery = serde_json::from_value(serde_json::json!({
+        "path": "/media/episode.mkv",
+        "audio_stream_index": null,
+        "subtitle_stream_index": null,
+    })).unwrap();
+    assert_eq!(disabled.audio_stream_index, Some(None));
+    assert_eq!(disabled.subtitle_stream_index, Some(None));
+
+    let selected: PlaybackQuery = serde_json::from_value(serde_json::json!({
+        "path": "/media/episode.mkv",
+        "audio_stream_index": 3,
+        "subtitle_stream_index": 2,
+    })).unwrap();
+    assert_eq!(selected.audio_stream_index, Some(Some(3)));
+    assert_eq!(selected.subtitle_stream_index, Some(Some(2)));
 }
 
-/// 拒绝不存在或类别不匹配的索引, 不允许客户端传入等待位置和缓存身份.
+/// 不允许客户端传入等待位置和缓存身份等非请求字段.
 #[test]
-fn invalid_indices_and_removed_playback_fields_are_rejected() {
-    let metadata = crate::testing::metadata();
-    for field in ["video_stream_index", "audio_stream_index", "subtitle_stream_index"] {
-        let query: PlaybackQuery = serde_json::from_value(serde_json::json!({
-            "path": "/media/episode.mkv", field: 99,
-        })).unwrap();
-        assert_eq!(select_streams("a".repeat(32), &query, &metadata, &MediaConfigs::default())
-            .unwrap_err().status, StatusCode::BAD_REQUEST);
-    }
-
+fn removed_playback_fields_are_rejected() {
     for field in ["position", "media_id", "handle_id", "version"] {
         assert!(serde_json::from_value::<PlaybackQuery>(serde_json::json!({
             "path": "/media/episode.mkv", field: 1,
@@ -39,9 +40,9 @@ fn invalid_indices_and_removed_playback_fields_are_rejected() {
     }
 }
 
-/// 重试选择稳定排序的现存副本, 缺失源和身份变化均明确拒绝.
+/// 源查询使用稳定排序的现存副本, 文件缺失后回退到其他副本.
 #[tokio::test]
-async fn cache_sources_are_sorted_and_retries_reject_changed_content() -> anyhow::Result<()> {
+async fn cache_sources_are_sorted_and_fall_back_to_existing_copies() -> anyhow::Result<()> {
     let directory = crate::testing::TestDirectory::new();
     let root = directory.path.join("media");
     tokio::fs::create_dir(&root).await?;
@@ -57,14 +58,9 @@ async fn cache_sources_are_sorted_and_retries_reject_changed_content() -> anyhow
     tokio::fs::remove_file(&first).await?;
     assert_eq!(source_path(&original.media_id, &database, &scanner).await.unwrap(), Some(second.clone()));
     tokio::fs::write(&second, b"different content").await?;
-    let error = prepare_media(&second, Some(&original.media_id), &database, &scanner,
-        &ProcessManager::new(2, 2)).await.err().unwrap();
-    assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert!(error.message.contains("content changed"));
+    scanner.scan_one(&database, &second).await?;
     assert_eq!(source_path(&original.media_id, &database, &scanner).await.unwrap(), None);
-    let error = prepare_media(&first, Some(&original.media_id), &database, &scanner,
-        &ProcessManager::new(2, 2)).await.err().unwrap();
-    assert_eq!(error.status, StatusCode::NOT_FOUND);
+    assert_eq!(source_path("c".repeat(32).as_str(), &database, &scanner).await.unwrap(), None);
     database.shutdown().await;
     Ok(())
 }

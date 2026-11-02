@@ -18,9 +18,9 @@ export class CacheStore extends EventTarget {
   get resources(): WorkerResources {
     const total = { encoder_slots: 0, process_slots: 0, ffmpeg_threads: 0 };
     for (const entry of this.entries.values()) {
-      total.encoder_slots += entry.status.resources.encoder_slots;
-      total.process_slots += entry.status.resources.process_slots;
-      total.ffmpeg_threads += entry.status.resources.ffmpeg_threads;
+      total.encoder_slots += entry.resources.encoder_slots;
+      total.process_slots += entry.resources.process_slots;
+      total.ffmpeg_threads += entry.resources.ffmpeg_threads;
     }
     return total;
   }

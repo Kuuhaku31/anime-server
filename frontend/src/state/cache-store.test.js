@@ -11,8 +11,8 @@ function entry(handleId = "a".repeat(32)) {
   return {
     handle_id: handleId, source_path: "/media/video.mkv",
     spec: { media_id: "b".repeat(32), video_stream_index: 0, audio_stream_index: null, subtitle_stream_index: null, version: "test" },
-    status: { phase: "ready", buffered_until: 8, error: null,
-      resources: { encoder_slots: 0, process_slots: 0, ffmpeg_threads: 0 } },
+    status: { phase: "ready", buffered_until: 8, error: null },
+    resources: { encoder_slots: 0, process_slots: 0, ffmpeg_threads: 0 },
   };
 }
 
@@ -29,7 +29,7 @@ test("a late list response cannot resurrect a deleted cache", async (context) =>
   const first = store.refresh();
   assert.equal(store.refresh(), first);
   await store.remove(cache.handle_id);
-  resolveList(Response.json({ entries: [cache], resources: cache.status.resources }));
+  resolveList(Response.json({ entries: [cache] }));
   await first;
   assert.equal(store.entries.size, 0);
 });
@@ -46,8 +46,8 @@ test("retry stop and errors update only their cache entry", async (context) => {
     calls.push({ url, method: options.method ?? "GET" });
     if (fail) return new Response("cannot delete cache", { status: 500 });
     if (url.endsWith("/retry")) {
-      return Response.json({ cache: { ...cache, status: { ...cache.status, phase: "running",
-        resources: { encoder_slots: 1, process_slots: 1, ffmpeg_threads: 2 } } }, media: {} });
+      return Response.json({ cache: { ...cache, status: { ...cache.status, phase: "running" },
+        resources: { encoder_slots: 1, process_slots: 1, ffmpeg_threads: 2 } }, media: {} });
     }
     return Response.json(cache);
   });
@@ -74,7 +74,7 @@ test("an obsolete build response reconciles with the server after deletion", asy
   context.mock.method(globalThis, "fetch", async (_url, options = {}) => {
     if (options.method === "POST") return new Promise((resolve) => { finishBuild = resolve; });
     if (options.method === "DELETE") return new Response(null, { status: 204 });
-    return Response.json({ entries: [], resources: cache.status.resources });
+    return Response.json({ entries: [] });
   });
   const building = store.build({ path: cache.source_path });
   await store.remove(cache.handle_id);
@@ -100,7 +100,7 @@ test("independent concurrent builds both remain in the shared map", async (conte
   await new Promise((resolve) => setImmediate(resolve));
   builds[1](Response.json({ cache: second, media: {} }));
   await secondBuild;
-  finishList?.(Response.json({ entries: [first], resources: first.status.resources }));
+  finishList?.(Response.json({ entries: [first] }));
   await firstBuild;
   assert.deepEqual([...store.entries.keys()].sort(), [first.handle_id, second.handle_id]);
 });

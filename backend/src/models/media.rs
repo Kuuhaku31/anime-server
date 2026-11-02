@@ -80,11 +80,11 @@ pub(crate) struct MediaConfigs {
     pub(crate) subtitle_stream_index: Option<i32>,
 }
 
-/// 组合前端所需的实时元数据和持久化配置.
-#[derive(Debug, Serialize)]
-pub(crate) struct MediaInfo {
-    /// 当前路径的实时媒体元数据.
-    pub(crate) metadata: MediaMetadata,
-    /// 当前媒体内容身份对应的配置.
-    pub(crate) configs: MediaConfigs,
-}
+// /// 组合前端所需的实时元数据和持久化配置.
+// #[derive(Debug, Serialize)]
+// pub(crate) struct MediaInfo {
+//     /// 当前路径的实时媒体元数据.
+//     pub(crate) metadata: MediaMetadata,
+//     /// 当前媒体内容身份对应的配置.
+//     pub(crate) configs: MediaConfigs,
+// }

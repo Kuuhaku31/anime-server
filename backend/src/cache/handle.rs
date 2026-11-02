@@ -85,7 +85,9 @@ impl CacheInstanceHandle {
         let error = match phase { Phase::Failed { error } => Some(error.clone()), _ => None };
         Ok(CacheSnapshot {
             handle_id: self.handle_id.clone(), spec: self.spec.clone(),
-            status: CacheStatus { phase: phase.kind(), buffered_until, resources: self.resources.snapshot(), error },
+            status: CacheStatus { phase: phase.kind(), buffered_until, error },
+            resources: self.resources.snapshot(),
+            source_path: None,
         })
     }
 

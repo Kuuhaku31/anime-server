@@ -42,11 +42,10 @@ CacheManager 的查询和资源接口只接收 handle_id, 不接收客户端提�
 | StreamInfo     | stream_index, codec_name, language, title, is_default, is_forced        |
 | MediaConfigs   | position, video_stream_index, audio_stream_index, subtitle_stream_index |
 | PlaybackQuery  | path, video_stream_index, audio_stream_index, subtitle_stream_index     |
-| CacheStatus    | phase, buffered_until, resources, error                                |
-| CacheSnapshot  | handle_id, spec, status                                                 |
-| CacheEntry     | handle_id, spec, status, source_path                                     |
+| CacheStatus    | phase, buffered_until, error                                            |
+| CacheSnapshot  | handle_id, spec, status, resources, source_path                        |
 | CacheBuild     | cache, media; 实际流选择位于 cache.spec                                  |
-| CacheList      | entries, resources; resources 是所有条目的 worker 占用合计              |
+| CacheList      | entries                                                               |
 | WorkerResources | encoder_slots, process_slots, ffmpeg_threads                           |
 
 MediaMetadata 内部额外保留容器起点, 字体附件和视频色彩信息,

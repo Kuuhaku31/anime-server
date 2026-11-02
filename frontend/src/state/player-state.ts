@@ -83,8 +83,6 @@ export interface CacheStatus {
   phase: "loading" | "completed" | "ready" | "failed" | "stopping" | "running";
   /** 服务端已验证的连续前缀终点, 不是浏览器缓冲. */
   buffered_until: number;
-  /** 已启动转码 worker 的实际预算占用. */
-  resources: WorkerResources;
   /** 恢复或生成失败的诊断, 正常状态为 null. */
   error: string | null;
 }
@@ -113,18 +111,18 @@ export interface CacheEntry {
   handle_id: string;
   /** 服务端确认的实际流选择和媒体身份. */
   spec: CacheSpec;
-  /** 当前生成进度和 worker 占用. */
+  /** 当前生成进度. */
   status: CacheStatus;
+  /** 当前转码 worker 占用. */
+  resources: WorkerResources;
   /** 稳定选择的现存源路径, null 时不能播放或重试. */
   source_path: string | null;
 }
 
-/** 描述全部缓存以及同一轮快照的 worker 占用总数. */
+/** 描述全部缓存条目. */
 export interface CacheList {
   /** 按 handle_id 排序的缓存条目. */
   entries: CacheEntry[];
-  /** 全部转码 worker 的资源合计. */
-  resources: WorkerResources;
 }
 
 /** 构建响应不创建会话, 播放器直接使用返回的 handle_id. */
