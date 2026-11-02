@@ -136,14 +136,41 @@ function action(rowElement, name) {
   return rowElement.findAll((child) => child instanceof Button && child.dataset.action === name)[0];
 }
 
+/** 模拟共享媒体数据源, 允许测试 metadata 完成后的列表更新. */
+class MediaLibrary extends EventTarget {
+  /** 当前可读取的源 metadata. */
+  metadata = null;
+  /** 当前源 metadata 的局部错误. */
+  error = null;
+  /** 记录列表主动请求的源路径. */
+  requested = [];
+
+  /** 返回已有源信息, 不隐式加载. */
+  info() { return this.metadata; }
+
+  /** 记录按需加载, 测试通过 change 事件发布结果. */
+  async ensureMetadata(path) { this.requested.push(path); }
+
+  /** 返回独立于缓存编码状态的时长诊断. */
+  metadataError() { return this.error; }
+}
+
 // 缓存操作依赖源文件和阶段, 无源 completed 不能播放或重试.
-test("cache actions distinguish playback, retry and encoding pause", () => {
-  assert.deepEqual(cacheActions(entry()), { play: true, retry: true, stop: false, delete: true });
-  assert.deepEqual(cacheActions(entry("b".repeat(32), "running")), { play: true, retry: false, stop: true, delete: true });
+test("one encoding action follows the cache phase without starting playback", () => {
+  assert.deepEqual(cacheActions(entry()), { play: true, encoding: "retry", encodingLabel: "Retry / resume", delete: true });
+  assert.deepEqual(cacheActions(entry("b".repeat(32), "running")), {
+    play: true, encoding: "stop", encodingLabel: "Pause encoding", delete: true,
+  });
   assert.equal(cacheActions(entry("b".repeat(32), "loading", "/media/video.mkv", 0)).play, false);
-  assert.equal(cacheActions(entry("b".repeat(32), "stopping")).play, false);
-  assert.deepEqual(cacheActions(entry("b".repeat(32), "completed", null)), { play: false, retry: false, stop: false, delete: true });
-  assert.equal(cacheActions(entry("b".repeat(32), "failed")).play, true);
+  assert.equal(cacheActions(entry("b".repeat(32), "loading")).encoding, null);
+  assert.deepEqual(cacheActions(entry("b".repeat(32), "stopping")), {
+    play: false, encoding: null, encodingLabel: "Pause encoding", delete: true,
+  });
+  assert.deepEqual(cacheActions(entry("b".repeat(32), "completed", null)), {
+    play: false, encoding: null, encodingLabel: "Completed", delete: true,
+  });
+  assert.equal(cacheActions(entry("b".repeat(32), "failed")).encoding, "retry");
+  assert.equal(cacheActions(entry("b".repeat(32), "ready", null)).encoding, null);
 });
 
 // 折叠时无操作按钮, 多项可展开, 仅展开详情提供播放和删除.
@@ -161,7 +188,7 @@ test("cache rows expand independently and deletion requires confirmation", async
     deleted++;
     return new Response(null, { status: 204 });
   });
-  new CacheList(store, (handleId) => played.push(handleId), () => null);
+  new CacheList(store, (handleId) => played.push(handleId), new MediaLibrary());
   const container = nodes.get("#caches");
   assert.equal(container.children.length, 2);
   assert.equal(container.children.every((item) => item.tagName === "DETAILS" && !item.open), true);
@@ -171,7 +198,7 @@ test("cache rows expand independently and deletion requires confirmation", async
   container.emit("click", row(container, second.handle_id).children[0]);
   assert.equal(row(container, cache.handle_id).open, true);
   assert.equal(row(container, second.handle_id).open, true);
-  assert.equal(action(row(container, second.handle_id), "stop").textContent, "Pause encoding");
+  assert.equal(action(row(container, second.handle_id), "encoding").textContent, "Pause encoding");
   container.emit("click", action(row(container, cache.handle_id), "play"));
   assert.deepEqual(played, [cache.handle_id]);
   container.emit("click", action(row(container, cache.handle_id), "delete"));
@@ -188,4 +215,77 @@ test("cache rows expand independently and deletion requires confirmation", async
   assert.equal(deleted, 1);
   assert.equal(store.entries.has(cache.handle_id), false);
   assert.equal(row(container, second.handle_id).open, true);
+});
+
+// 同一个按钮根据最新快照调用暂停或恢复, 在途请求和 stopping 都不能重复操作.
+test("encoding toggle dispatches pause and retry with pending protection", async (context) => {
+  const nodes = dom();
+  const store = new CacheStore();
+  const cache = entry("a".repeat(32), "running");
+  store.entries.set(cache.handle_id, cache);
+  const requests = [];
+  let resolveStop;
+  context.mock.method(globalThis, "fetch", async (url, options) => {
+    requests.push(url);
+    assert.equal(options.method, "POST");
+    if (url.endsWith("/stop")) return new Promise((resolve) => { resolveStop = resolve; });
+    assert.equal(url, `/api/cache/${cache.handle_id}/retry`);
+    return Response.json({ cache: { ...cache, status: { ...cache.status, phase: "running" } } });
+  });
+  new CacheList(store, () => assert.fail("encoding must not start playback"), new MediaLibrary());
+  const container = nodes.get("#caches");
+  container.emit("click", row(container, cache.handle_id).children[0]);
+  assert.equal(row(container, cache.handle_id).findAll((child) => child instanceof Button).length, 3);
+  container.emit("click", action(row(container, cache.handle_id), "encoding"));
+  assert.equal(action(row(container, cache.handle_id), "encoding").disabled, true);
+  container.emit("click", action(row(container, cache.handle_id), "encoding"));
+  resolveStop(Response.json({ ...cache, status: { ...cache.status, phase: "stopping" } }));
+  await new Promise(setImmediate);
+  assert.equal(action(row(container, cache.handle_id), "encoding").disabled, true);
+  container.emit("click", action(row(container, cache.handle_id), "encoding"));
+  assert.deepEqual(requests, [`/api/cache/${cache.handle_id}/stop`]);
+
+  store.entries.set(cache.handle_id, { ...cache, status: { ...cache.status, phase: "ready" } });
+  store.dispatchEvent(new Event("change"));
+  assert.equal(action(row(container, cache.handle_id), "encoding").textContent, "Retry / resume");
+  container.emit("click", action(row(container, cache.handle_id), "encoding"));
+  await new Promise(setImmediate);
+  assert.deepEqual(requests, [`/api/cache/${cache.handle_id}/stop`, `/api/cache/${cache.handle_id}/retry`]);
+  assert.equal(action(row(container, cache.handle_id), "encoding").textContent, "Pause encoding");
+});
+
+// 折叠摘要直接显示进度, metadata 到达和轮询均更新同一条进度条.
+test("collapsed progress follows source duration and completion without duplicate detail bars", () => {
+  const nodes = dom();
+  const store = new CacheStore();
+  const cache = entry();
+  store.entries.set(cache.handle_id, cache);
+  const library = new MediaLibrary();
+  const list = new CacheList(store, () => {}, library);
+  const container = nodes.get("#caches");
+  const bars = () => row(container, cache.handle_id).findAll((child) => child.tagName === "PROGRESS");
+  assert.deepEqual(library.requested, [cache.source_path]);
+  assert.equal(row(container, cache.handle_id).open, false);
+  assert.equal(bars().length, 1);
+  assert.equal(bars()[0].value, undefined);
+  library.metadata = { metadata: { duration: 32 } };
+  library.dispatchEvent(new Event("change"));
+  assert.equal(bars()[0].value, 25);
+  store.entries.set(cache.handle_id, { ...cache, status: { ...cache.status, buffered_until: 16 } });
+  store.dispatchEvent(new Event("change"));
+  assert.equal(bars()[0].value, 50);
+  assert.match(bars()[0].attributes["aria-label"], /0:16 of 0:32/);
+  container.emit("click", row(container, cache.handle_id).children[0]);
+  assert.equal(bars().length, 1);
+  assert.equal(row(container, cache.handle_id).children[0].contains(bars()[0]), true);
+
+  library.metadata = null;
+  library.error = "Source could not be probed";
+  store.entries.set(cache.handle_id, { ...cache, status: { ...cache.status, phase: "completed" } });
+  list.select(cache.handle_id);
+  assert.match(row(container, cache.handle_id).className, /completed active/);
+  assert.equal(bars()[0].value, 100);
+  assert.equal(action(row(container, cache.handle_id), "encoding").disabled, true);
+  assert.match(row(container, cache.handle_id).findAll((child) => child.className === "item-error")[0].textContent,
+    /Source could not be probed/);
 });

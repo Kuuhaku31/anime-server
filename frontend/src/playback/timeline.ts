@@ -7,6 +7,12 @@ import type { CacheStatus, WorkerResources } from "../state/player-state.ts";
 interface CacheProgress {
   /** 已生成内容占媒体时长的百分比. */
   percent: number;
+  /** 是否有足够信息显示确定的进度条. */
+  determinate: boolean;
+  /** 独立于时间文本的缓存阶段. */
+  state: string;
+  /** 已生成时间和总时长, 未知时长时明确提示. */
+  timing: string;
   /** 带阶段和时长的可读说明. */
   text: string;
 }
@@ -14,7 +20,7 @@ interface CacheProgress {
 /** 使用服务端阶段与已验证前缀展示生成进度. */
 export function cacheProgress(cache: CacheStatus, duration: number, resources: WorkerResources): CacheProgress {
   const knownDuration = Number.isFinite(duration) && duration > 0;
-  const seconds = knownDuration ? Math.min(duration, cache.buffered_until) : cache.buffered_until;
+  const seconds = Math.max(0, knownDuration ? Math.min(duration, cache.buffered_until) : cache.buffered_until);
   const percent = cache.phase === "completed" ? 100 : knownDuration ? Math.min(100, 100 * seconds / duration) : 0;
   const state = {
     loading: "Preparing / queued",
@@ -24,11 +30,15 @@ export function cacheProgress(cache: CacheStatus, duration: number, resources: W
     completed: "Complete",
     failed: "Generation failed",
   }[cache.phase];
+  const timing = knownDuration
+    ? `${formatTime(seconds)} of ${formatTime(duration)}`
+    : `${formatTime(seconds)} generated / source duration unavailable`;
   return {
     percent,
-    text: knownDuration
-      ? `${state}: ${percent.toFixed(1)}% / ${formatTime(seconds)} of ${formatTime(duration)}`
-      : `${state}: ${formatTime(seconds)} generated / source duration unavailable`,
+    determinate: knownDuration || cache.phase === "completed",
+    state,
+    timing,
+    text: `${state}: ${knownDuration || cache.phase === "completed" ? `${percent.toFixed(1)}% / ` : ""}${timing}`,
   };
 }
 

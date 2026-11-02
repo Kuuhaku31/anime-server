@@ -14,12 +14,11 @@ const caches = new CacheStore();
 const controller = new PlaybackController(player, caches);
 attachControls(controller, player);
 const library = new Library((query) => caches.build(query), (error) => controller.fail(error));
-const cacheList = new CacheList(caches, (handleId) => controller.openCached(handleId), (path) => library.info(path));
+const cacheList = new CacheList(caches, (handleId) => controller.openCached(handleId), library);
 controller.addEventListener("change", () => {
   library.select(controller.file ? fileAddress(controller.file) : null);
   cacheList.select(controller.handleId);
 });
-library.addEventListener("change", () => cacheList.render());
 
 /** 读取默认主题并加载路径型媒体列表. */
 async function initialize(): Promise<void> {

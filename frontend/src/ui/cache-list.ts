@@ -3,17 +3,21 @@
 // 展示可展开的缓存文件夹摘要, 状态和管理操作.
 
 import type { CacheStore } from "../state/cache-store.ts";
-import type { CacheEntry, MediaInfo } from "../state/player-state.ts";
+import type { CacheEntry } from "../state/player-state.ts";
+import type { Library } from "./library.ts";
 import { cacheProgress } from "../playback/timeline.ts";
 import { element } from "./controls.ts";
 
 /** 根据缓存状态和源文件可用性决定按钮边界, 不让播放隐式触发构建. */
-export function cacheActions(entry: CacheEntry): Record<"play" | "retry" | "stop" | "delete", boolean> {
+export function cacheActions(entry: CacheEntry): CacheActions {
+  const phase = entry.status.phase;
   return {
     play: entry.source_path !== null && entry.status.buffered_until > 0
-      && !["loading", "stopping"].includes(entry.status.phase),
-    retry: entry.source_path !== null && ["ready", "failed"].includes(entry.status.phase),
-    stop: ["running", "stopping"].includes(entry.status.phase),
+      && !["loading", "stopping"].includes(phase),
+    encoding: phase === "running" ? "stop"
+      : entry.source_path !== null && ["ready", "failed"].includes(phase) ? "retry" : null,
+    encodingLabel: ["running", "stopping"].includes(phase) ? "Pause encoding"
+      : phase === "loading" ? "Preparing..." : phase === "completed" ? "Completed" : "Retry / resume",
     delete: true,
   };
 }
@@ -21,11 +25,12 @@ export function cacheActions(entry: CacheEntry): Record<"play" | "retry" | "stop
 /** 将共享缓存 Map 渲染为可独立展开的缓存文件夹列表. */
 export class CacheList {
   /** 绑定缓存管理按钮和明确的删除确认. */
-  constructor(store: CacheStore, play: (handleId: string) => void, media: (path: string | null) => MediaInfo | null) {
+  constructor(store: CacheStore, play: (handleId: string) => void, library: Library) {
     this.store = store;
     this.play = play;
-    this.media = media;
+    this.library = library;
     store.addEventListener("change", () => this.render());
+    library.addEventListener("change", () => this.render());
     this.container.addEventListener("click", (event) => this.click(event));
     element<HTMLButtonElement>("#cache-delete-cancel").onclick = () => this.dialog.close();
     element<HTMLButtonElement>("#cache-delete-confirm").onclick = () => {
@@ -60,14 +65,17 @@ export class CacheList {
     const rows = entries.map((entry) => this.row(entry));
     this.container.replaceChildren(...rows);
     if (!rows.length) this.container.textContent = "No cache folders yet. Create one from a media file.";
+    for (const path of new Set(entries.map((entry) => entry.source_path))) {
+      if (path) void this.library.ensureMetadata(path);
+    }
   }
 
   /** 共享缓存状态的唯一数据源. */
   private store: CacheStore;
   /** 缓存列表播放回调. */
   private play: (handleId: string) => void;
-  /** 查找已加载媒体信息的回调. */
-  private media: (path: string | null) => MediaInfo | null;
+  /** 媒体 metadata 的唯一内存数据源及加载入口. */
+  private library: Library;
   /** 任务列表容器. */
   private container = element<HTMLDivElement>("#caches");
   /** 删除确认对话框. */
@@ -100,11 +108,10 @@ export class CacheList {
     const entry = this.store.entries.get(handleId);
     if (!entry) return;
     const action = button.dataset.action;
-    if (action === "play" && cacheActions(entry).play) this.play(handleId);
-    else if (action === "retry" && cacheActions(entry).retry) {
-      void this.store.retry(handleId).catch((error) => console.error("Cache retry failed", error));
-    } else if (action === "stop" && cacheActions(entry).stop) {
-      void this.store.stop(handleId).catch((error) => console.error("Cache pause failed", error));
+    const enabled = cacheActions(entry);
+    if (action === "play" && enabled.play) this.play(handleId);
+    else if (action === "encoding" && enabled.encoding) {
+      void this.store[enabled.encoding](handleId).catch((error) => console.error("Cache encoding control failed", error));
     } else if (action === "delete") {
       this.deleting = handleId;
       element("#cache-delete-name").textContent = entry.source_path ?? handleId;
@@ -116,8 +123,9 @@ export class CacheList {
   private row(entry: CacheEntry): HTMLDetailsElement {
     const expanded = this.expanded.has(entry.handle_id);
     const row = document.createElement("details");
-    row.className = `cache-row${entry.handle_id === this.active ? " active" : ""}`;
+    row.className = `cache-row${entry.status.phase === "completed" ? " completed" : ""}${entry.handle_id === this.active ? " active" : ""}`;
     row.dataset.handleId = entry.handle_id;
+    row.dataset.phase = entry.status.phase;
     row.open = expanded;
 
     const summary = document.createElement("summary");
@@ -128,17 +136,32 @@ export class CacheList {
     const identifier = document.createElement("code");
     identifier.textContent = entry.handle_id.slice(0, 12);
     identifier.title = entry.handle_id;
-    const duration = this.media(entry.source_path)?.metadata.duration ?? 0;
+    const duration = this.library.info(entry.source_path)?.metadata.duration ?? 0;
     const progress = cacheProgress(entry.status, duration, entry.resources);
     const status = document.createElement("span");
     status.className = "cache-summary-state";
     status.dataset.phase = entry.status.phase;
-    status.textContent = progress.text;
+    status.textContent = progress.state;
     const usage = entry.resources;
     const resources = document.createElement("span");
     resources.className = "cache-summary-resources";
-    resources.textContent = `Worker ${usage.encoder_slots}/1 / ${usage.ffmpeg_threads} threads`;
-    summary.append(name, identifier, status, resources);
+    resources.textContent = `${usage.encoder_slots} worker / ${usage.ffmpeg_threads} threads`;
+    const meter = document.createElement("span");
+    meter.className = "cache-summary-progress";
+    const percentage = document.createElement("span");
+    percentage.className = "cache-progress-percent";
+    percentage.textContent = progress.determinate ? `${progress.percent.toFixed(1)}%` : "--";
+    const timing = document.createElement("span");
+    timing.className = "cache-progress-time";
+    timing.textContent = progress.timing;
+    const metadataError = this.library.metadataError(entry.source_path);
+    timing.title = metadataError ?? progress.timing;
+    const bar = document.createElement("progress");
+    bar.max = 100;
+    if (progress.determinate) bar.value = progress.percent;
+    bar.setAttribute("aria-label", `${name.textContent}: ${progress.text}`);
+    meter.append(percentage, timing, bar);
+    summary.append(name, identifier, status, resources, meter);
     row.append(summary);
     if (expanded) row.append(this.details(entry, duration));
     return row;
@@ -163,16 +186,18 @@ export class CacheList {
     const status = document.createElement("p");
     status.className = "item-status";
     status.textContent = `State: ${entry.status.phase} / Published: ${entry.status.buffered_until.toFixed(2)}s${duration > 0 ? ` / Total: ${duration.toFixed(2)}s` : ""}`;
-    const progress = cacheProgress(entry.status, duration, entry.resources);
-    const bar = document.createElement("progress");
-    bar.max = 100;
-    if (duration > 0 || entry.status.phase === "completed") bar.value = progress.percent;
-    bar.setAttribute("aria-label", progress.text);
     const usage = entry.resources;
     const resources = document.createElement("p");
     resources.className = "item-status";
     resources.textContent = `Encoder ${usage.encoder_slots}/1 / process ${usage.process_slots}/1 / FFmpeg threads ${usage.ffmpeg_threads}`;
-    details.append(identity, source, spec, tracks, status, bar, resources);
+    details.append(identity, source, spec, tracks, status, resources);
+    const metadataError = this.library.metadataError(entry.source_path);
+    if (metadataError) {
+      const diagnostic = document.createElement("p");
+      diagnostic.className = "item-error";
+      diagnostic.textContent = `Source duration unavailable: ${metadataError}`;
+      details.append(diagnostic);
+    }
     if (entry.status.error) {
       const diagnostic = document.createElement("p");
       diagnostic.className = "item-error";
@@ -188,17 +213,29 @@ export class CacheList {
     const actions = document.createElement("div");
     actions.className = "item-actions cache-actions";
     const enabled = cacheActions(entry);
-    for (const action of ["play", "retry", "stop", "delete"] as const) {
+    for (const action of ["play", "encoding", "delete"] as const) {
       const button = document.createElement("button");
       button.type = "button";
       button.dataset.handleId = entry.handle_id;
       button.dataset.action = action;
       button.textContent = {
-        play: "Play", retry: "Retry / resume", stop: "Pause encoding", delete: "Delete cache",
+        play: "Play", encoding: enabled.encodingLabel, delete: "Delete cache",
       }[action];
       button.disabled = this.store.pending.has(entry.handle_id) || !enabled[action];
       actions.append(button);
     }
     return actions;
   }
+}
+
+/** 描述缓存操作权限和单个编码切换按钮的当前动作. */
+interface CacheActions {
+  /** 已发布内容是否允许播放. */
+  play: boolean;
+  /** 当前可执行的编码操作, null 表示不可切换. */
+  encoding: "retry" | "stop" | null;
+  /** 编码切换按钮对应当前阶段的文案. */
+  encodingLabel: string;
+  /** 是否允许用户显式删除缓存. */
+  delete: boolean;
 }

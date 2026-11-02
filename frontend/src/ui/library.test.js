@@ -1,6 +1,6 @@
 
 // frontend/src/ui/library.test.js
-// 验证媒体列表只在展开时请求 metadata 并仅创建缓存.
+// 验证媒体展开和缓存时长共享按需 metadata, 媒体操作仅创建缓存.
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
@@ -240,6 +240,11 @@ test("metadata errors are local and can be retried", async () => {
   const library = new Library(async () => {}, () => {});
   await library.load();
   const container = nodes.get("#files");
+  await library.ensureMetadata(file.path);
+  assert.match(library.metadataError(file.path), /cannot read media file/);
+  await library.ensureMetadata(file.path);
+  await library.ensureMetadata(file.path);
+  assert.equal(metadataCalls, 1);
   container.emit("click", row(container, file.path).children[0]);
   await until(() => action(row(container, file.path), "metadata"));
   assert.match(row(container, file.path).findAll((child) => child.className === "item-error")[0].textContent,
@@ -247,6 +252,85 @@ test("metadata errors are local and can be retried", async () => {
   container.emit("click", action(row(container, file.path), "metadata"));
   await until(() => select(row(container, file.path), "video"));
   assert.equal(metadataCalls, 2);
+  assert.equal(library.metadataError(file.path), null);
+});
+
+// 缓存摘要可在媒体折叠时加载时长, 同内容和媒体展开共享一个在途请求.
+test("cache duration loading shares metadata without expanding source rows", async () => {
+  const nodes = dom();
+  globalThis.localStorage = { getItem: () => "path", setItem() {} };
+  const first = entry("/media/episode.mkv", "d".repeat(32));
+  const copy = entry("/media/copy.mkv", first.file_id);
+  let files = [first, copy];
+  let metadataCalls = 0;
+  let resolveMetadata;
+  globalThis.fetch = async (url) => {
+    if (url === "/api/media") return Response.json(files);
+    assert.equal(url, `/api/media/${first.file_id}/metadata`);
+    metadataCalls++;
+    return new Promise((resolve) => { resolveMetadata = resolve; });
+  };
+  const library = new Library(async () => {}, () => {});
+  await library.ensureMetadata(first.path);
+  assert.equal(metadataCalls, 0);
+  await library.load();
+  const pending = library.ensureMetadata(first.path);
+  assert.equal(library.ensureMetadata(copy.path), pending);
+  assert.equal(metadataCalls, 1);
+  assert.equal(nodes.get("#files").children.every((item) => !item.open), true);
+  resolveMetadata(Response.json(info()));
+  await pending;
+  assert.equal(library.info(first.path).metadata.duration, 120);
+  assert.equal(library.info(copy.path).metadata.duration, 120);
+  await library.ensureMetadata(first.path);
+  assert.equal(metadataCalls, 1);
+
+  // 后续扫描新增同内容路径时, 已缓存 metadata 仍需初始化新路径的可构建轨道.
+  const added = entry("/media/new-copy.mkv", first.file_id);
+  files = [...files, added];
+  await library.load();
+  const container = nodes.get("#files");
+  container.emit("click", row(container, added.path).children[0]);
+  assert.equal(action(row(container, added.path), "build").disabled, false);
+  assert.equal(select(row(container, added.path), "video").value, "4");
+  assert.equal(metadataCalls, 1);
+});
+
+// 重扫期间返回的旧 metadata 不得覆盖重新请求的总时长, 也不得清理新在途状态.
+test("rescan invalidates metadata already requested by a collapsed cache summary", async () => {
+  const nodes = dom();
+  globalThis.localStorage = { getItem: () => "path", setItem() {} };
+  const file = entry("/media/rescanned.mkv", "e".repeat(32));
+  const responses = [];
+  globalThis.fetch = async (url, options) => {
+    if (url === "/api/media") return Response.json([file]);
+    if (url === "/api/media/rescan") {
+      assert.equal(JSON.parse(options.body), file.path);
+      return Response.json(file);
+    }
+    assert.equal(url, `/api/media/${file.file_id}/metadata`);
+    return new Promise((resolve) => { responses.push(resolve); });
+  };
+  const library = new Library(async () => {}, () => {});
+  await library.load();
+  const old = library.ensureMetadata(file.path);
+  const container = nodes.get("#files");
+  container.emit("click", row(container, file.path).children[0]);
+  assert.equal(responses.length, 1);
+  container.emit("click", action(row(container, file.path), "scan"));
+  await until(() => responses.length === 2);
+  const current = library.ensureMetadata(file.path);
+  assert.notEqual(current, old);
+  responses[0](Response.json(info()));
+  await old;
+  assert.equal(library.info(file.path), null);
+  assert.equal(library.ensureMetadata(file.path), current);
+  const updated = info();
+  updated.metadata.duration = 240;
+  responses[1](Response.json(updated));
+  await current;
+  assert.equal(library.info(file.path).metadata.duration, 240);
+  assert.equal(responses.length, 2);
 });
 
 // 排序依据轻量路径和已加载的 metadata, 不修改源数组.

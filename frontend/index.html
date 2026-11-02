@@ -35,16 +35,33 @@
         </div>
       </div>
       <div class="player-controls">
+        <div id="fullscreen-title" class="fullscreen-title"></div>
         <label class="seek-label" for="seek">Playback position</label>
         <input id="seek" type="range" min="0" max="0" value="0" step="0.1" disabled aria-label="Playback position" />
         <div class="control-buttons">
-          <button id="toggle-play" type="button" disabled>Play</button>
-          <button id="stop" type="button">Stop</button>
-          <button id="restart" type="button">Start over</button>
-          <output id="clock">0:00 / 0:00</output>
-          <button id="mute" type="button">Mute</button>
-          <input id="volume" type="range" min="0" max="1" value="1" step="0.05" aria-label="Volume" />
-          <button id="fullscreen" type="button">Fullscreen</button>
+          <div class="control-group">
+            <button id="toggle-play" class="icon-button" type="button" aria-label="Play" title="Play (K)" disabled>
+              <svg class="icon-play" viewBox="0 0 24 24" aria-hidden="true"><path d="m8 5 11 7-11 7Z" /></svg>
+              <svg class="icon-pause" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14M16 5v14" /></svg>
+              <span id="play-label" class="button-label">Play</span>
+            </button>
+            <button id="stop" type="button">Stop</button>
+            <button id="restart" type="button">Start over</button>
+            <output id="clock">0:00 / 0:00</output>
+          </div>
+          <div class="control-group">
+            <button id="mute" class="icon-button" type="button" aria-label="Mute" aria-pressed="false" title="Mute (M)">
+              <svg class="icon-volume" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9h4l5-4v14l-5-4H4ZM17 8a6 6 0 0 1 0 8M20 5a10 10 0 0 1 0 14" /></svg>
+              <svg class="icon-muted" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9h4l5-4v14l-5-4H4ZM17 9l5 6M22 9l-5 6" /></svg>
+              <span id="mute-label" class="button-label">Mute</span>
+            </button>
+            <input id="volume" type="range" min="0" max="1" value="1" step="0.05" aria-label="Volume" />
+            <button id="fullscreen" class="icon-button" type="button" aria-label="Fullscreen" aria-pressed="false" title="Fullscreen (F)">
+              <svg class="icon-expand" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3H3v5M16 3h5v5M21 16v5h-5M8 21H3v-5" /></svg>
+              <svg class="icon-collapse" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 8h5V3M21 8h-5V3M16 21v-5h5M8 21v-5H3" /></svg>
+              <span id="fullscreen-label" class="button-label">Fullscreen</span>
+            </button>
+          </div>
         </div>
       </div>
       <div class="playback-feedback">

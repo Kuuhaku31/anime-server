@@ -112,7 +112,13 @@ export class Library extends EventTarget {
     this.errors = new Map([...this.errors].filter(([path]) => paths.has(path)));
     this.metadata = new Map([...this.metadata].filter(([fileId]) => fileIds.has(fileId)));
     this.metadataErrors = new Map([...this.metadataErrors].filter(([fileId]) => fileIds.has(fileId)));
-    this.loading = new Set([...this.loading].filter((fileId) => fileIds.has(fileId)));
+    this.loading = new Map([...this.loading].filter(([fileId]) => fileIds.has(fileId)));
+    for (const file of this.files) {
+      const info = this.metadata.get(file.file_id);
+      if (info && !validSelection(info, this.selections.get(file.path))) {
+        this.selections.set(file.path, initialSelection({ metadata: info.metadata, configs: file.configs }));
+      }
+    }
     this.render();
     this.dispatchEvent(new Event("change"));
     await Promise.all(this.files
@@ -127,16 +133,33 @@ export class Library extends EventTarget {
     return file ? this.metadata.get(file.file_id) ?? null : null;
   }
 
+  /** 为缓存摘要加载源时长, 与媒体展开共享在途请求和失败记录. */
+  ensureMetadata(path: string): Promise<void> {
+    const file = this.files.find((entry) => entry.path === path);
+    return file ? this.loadMetadata(file) : Promise.resolve();
+  }
+
+  /** 将源 metadata 诊断提供给缓存列表, 不把探测失败当作编码失败. */
+  metadataError(path: string | null): string | null {
+    const file = this.files.find((entry) => entry.path === path);
+    return file ? this.metadataErrors.get(file.file_id) ?? null : null;
+  }
+
+  /** 高亮与当前播放器源路径相同的媒体项. */
+  select(path: string | null): void {
+    if (path === this.active) return;
+    this.active = path;
+    this.render();
+  }
+
   /** 当前媒体列表的 DOM 容器. */
   private container = element<HTMLDivElement>("#files");
   /** 当前数据库登记的媒体路径列表. */
   private files: MediaEntry[] = [];
   /** 按数据库文件 ID 缓存的单文件 metadata. */
   private metadata = new Map<string, MediaInfo>();
-  /** 正在按需获取 metadata 的内容 ID. */
-  private loading = new Set<string>();
-  /** 使重扫前仍在途的 metadata 响应失效. */
-  private metadataVersions = new Map<string, number>();
+  /** 同内容共享的在途请求, 移除后旧响应不能覆盖重扫结果. */
+  private loading = new Map<string, Promise<void>>();
   /** 按内容 ID 缓存的 metadata 请求错误. */
   private metadataErrors = new Map<string, string>();
   /** 显示缓存构建请求的回调. */
@@ -188,17 +211,15 @@ export class Library extends EventTarget {
   }
 
   /** 加载单个 metadata 并在同内容列表项间共享结果. */
-  private async loadMetadata(file: MediaEntry, retry = false): Promise<void> {
-    if (this.metadata.has(file.file_id) || this.loading.has(file.file_id)) return;
-    if (this.metadataErrors.has(file.file_id) && !retry) return;
-    const version = this.metadataVersions.get(file.file_id) ?? 0;
-    this.metadataVersions.set(file.file_id, version);
-    this.loading.add(file.file_id);
+  private loadMetadata(file: MediaEntry, retry = false): Promise<void> {
+    if (this.metadata.has(file.file_id) || this.metadataErrors.has(file.file_id) && !retry) {
+      return Promise.resolve();
+    }
+    const pending = this.loading.get(file.file_id);
+    if (pending) return pending;
     this.metadataErrors.delete(file.file_id);
-    this.render();
-    try {
-      const info = await getMediaMetadata(file.file_id);
-      if (this.metadataVersions.get(file.file_id) !== version
+    const request = getMediaMetadata(file.file_id).then((info) => {
+      if (this.loading.get(file.file_id) !== request
         || !this.files.some((item) => item.file_id === file.file_id)) return;
       this.metadata.set(file.file_id, info);
       for (const item of this.files) {
@@ -209,18 +230,21 @@ export class Library extends EventTarget {
           this.selections.set(item.path, initialSelection(info));
         }
       }
-    } catch (error) {
-      if (this.metadataVersions.get(file.file_id) === version
+    }).catch((error: unknown) => {
+      if (this.loading.get(file.file_id) === request
         && this.files.some((item) => item.file_id === file.file_id)) {
         this.metadataErrors.set(file.file_id, error instanceof Error ? error.message : String(error));
       }
-    } finally {
-      if (this.metadataVersions.get(file.file_id) === version) {
+    }).finally(() => {
+      if (this.loading.get(file.file_id) === request) {
         this.loading.delete(file.file_id);
         this.render();
         this.dispatchEvent(new Event("change"));
       }
-    }
+    });
+    this.loading.set(file.file_id, request);
+    this.render();
+    return request;
   }
 
   /** 保存展开详情中的临时流选择, 不写入观看配置. */
@@ -273,7 +297,6 @@ export class Library extends EventTarget {
       this.selections.delete(path);
       const previous = this.files.find((file) => file.path === path);
       if (previous) {
-        this.metadataVersions.set(previous.file_id, (this.metadataVersions.get(previous.file_id) ?? 0) + 1);
         this.loading.delete(previous.file_id);
         this.metadata.delete(previous.file_id);
         this.metadataErrors.delete(previous.file_id);
@@ -287,13 +310,6 @@ export class Library extends EventTarget {
       this.scanning.delete(path);
       this.render();
     }
-  }
-
-  /** 高亮与当前播放器源路径相同的媒体项. */
-  select(path: string | null): void {
-    if (path === this.active) return;
-    this.active = path;
-    this.render();
   }
 
   /** 按展开集合和排序结果渲染紧凑行, 所有文本通过 textContent 设置. */
@@ -326,6 +342,7 @@ export class Library extends EventTarget {
     const position = configs.position === null ? "Not watched" : `Watched ${formatTime(configs.position)}`;
     detail.textContent = info
       ? `${formatTime(info.metadata.duration)} / ${info.metadata.format} / ${position}` : position;
+    detail.title = detail.textContent;
     summary.append(name, detail);
     row.append(summary);
 

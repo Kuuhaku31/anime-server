@@ -10,7 +10,10 @@ test("cache generation shows verified time independently of playback and complet
   // 播放目标和浏览器缓冲不参与百分比, 完成标记将舍入不足的末端显示为 100%.
   const cache: CacheStatus = { buffered_until: 30, phase: "running", error: null };
   const resources = { encoder_slots: 1, process_slots: 1, ffmpeg_threads: 2 };
-  assert.deepEqual(cacheProgress(cache, 120, resources), { percent: 25, text: "Generating: 25.0% / 0:30 of 2:00" });
+  assert.deepEqual(cacheProgress(cache, 120, resources), {
+    percent: 25, determinate: true, state: "Generating", timing: "0:30 of 2:00",
+    text: "Generating: 25.0% / 0:30 of 2:00",
+  });
   assert.match(cacheProgress({ ...cache, phase: "loading" }, 120, resources).text, /^Preparing \/ queued/);
   assert.match(cacheProgress({ ...cache, phase: "ready" }, 120, resources).text, /^Ready/);
   assert.match(cacheProgress({ ...cache, phase: "stopping" }, 120, resources).text, /^Stopping/);
@@ -23,6 +26,13 @@ test("cache generation shows verified time independently of playback and complet
     /^Queued \/ preparing/);
   assert.match(cacheProgress(cache, 0, resources).text, /duration unavailable/);
   assert.equal(cacheProgress(cache, 0, resources).percent, 0);
+  assert.equal(cacheProgress(cache, 0, resources).determinate, false);
+  assert.equal(cacheProgress(cache, Number.NaN, resources).determinate, false);
+  assert.equal(cacheProgress({ ...cache, buffered_until: -1 }, 120, resources).percent, 0);
+  const unknownComplete = cacheProgress({ ...cache, phase: "completed" }, 0, resources);
+  assert.equal(unknownComplete.determinate, true);
+  assert.equal(unknownComplete.percent, 100);
+  assert.match(unknownComplete.text, /100.0%.*duration unavailable/);
 });
 
 test("fractional HLS source offsets preserve the original timeline", () => {
