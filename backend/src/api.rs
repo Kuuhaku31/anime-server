@@ -39,9 +39,11 @@ async fn list_media() -> Result<Json<Vec<(PathBuf, MediaInfo)>>, ApiError> {
     let records = services::database().list_paths_with_configs().await.map_err(ApiError::internal)?;
     let mut media = Vec::with_capacity(records.len());
     for record in records {
-        let source_path = services::scanner().resolve(&record.path).await.map_err(ApiError::media)?;
+        let path = record.0;
+        let configs = record.1;
+        let source_path = services::scanner().resolve(&path).await.map_err(ApiError::media)?;
         let metadata = services::process().probe(&source_path).await.map_err(ApiError::media)?;
-        media.push((record.path, MediaInfo { metadata, configs: record.configs }));
+        media.push((path, MediaInfo { metadata, configs }));
     }
     Ok(Json(media))
 }
@@ -70,7 +72,7 @@ async fn rescan_media(
     let metadata = services::process().probe(&file.path).await.map_err(ApiError::media)?;
     let record = services::database().get_file_by_path(&file.path).await.map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::missing("media path was removed during rescan"))?;
-    Ok(Json(Some((file.path, MediaInfo { metadata, configs: record.configs }))))
+    Ok(Json(Some((file.path, MediaInfo { metadata, configs: record.1 }))))
 }
 
 /// 按路径替换完整的共享播放配置.

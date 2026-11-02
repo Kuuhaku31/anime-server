@@ -18,33 +18,16 @@ mod tests;
 
 pub(crate) use media::{Attachment, MediaConfigs, MediaInfo, MediaMetadata, StreamInfo};
 
-/// 保存内容标识对应的共享播放配置.
-#[derive(Debug, sqlx::FromRow)]
-pub(crate) struct FileRecord {
-    /// 媒体内容主键.
-    pub(crate) media_id: String,
-    /// 同内容的所有路径共享的播放配置.
-    #[sqlx(flatten)]
-    pub(crate) configs: MediaConfigs,
-}
+// /// 保存内容标识对应的共享播放配置.
+// #[derive(Debug, sqlx::FromRow)]
+// pub(crate) struct FileRecord {
+//     /// 媒体内容主键.
+//     pub(crate) media_id: String,
+//     /// 同内容的所有路径共享的播放配置.
+//     #[sqlx(flatten)]
+//     pub(crate) configs: MediaConfigs,
+// }
 
-/// 保存数据库中的媒体路径关联.
-#[derive(Debug, sqlx::FromRow)]
-pub(crate) struct PathRecord {
-    /// 路径对应的媒体内容标识.
-    pub(crate) media_id: String,
-    /// 容器内媒体绝对路径.
-    pub(crate) path: String,
-}
-
-/// 保存媒体列表所需的路径和共享配置.
-#[derive(Debug)]
-pub(crate) struct PathConfigs {
-    /// 容器内媒体绝对路径.
-    pub(crate) path: PathBuf,
-    /// 该路径当前关联的共享播放配置.
-    pub(crate) configs: MediaConfigs,
-}
 
 /// 保存一次文件扫描得到的内容身份.
 #[derive(Debug)]

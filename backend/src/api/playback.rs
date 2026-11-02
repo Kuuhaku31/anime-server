@@ -40,16 +40,19 @@ async fn create_playback(
     let metadata = services::process().probe(&file.path).await.map_err(ApiError::media)?;
     let record = services::database().get_file_by_path(&file.path).await.map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::missing("media path was removed during playback creation"))?;
-    if file.media_id != record.media_id {
+    let media_id = record.0;
+    let configs = record.1;
+
+    if file.media_id != media_id {
         return Err(ApiError::media("media path changed during playback creation; retry the request"));
     }
-    let spec = select_streams(file.media_id, &query, &metadata, &record.configs)?;
+    let spec = select_streams(file.media_id, &query, &metadata, &configs)?;
     let cache = services::cache().open(spec.clone(), file.path, metadata.clone(),
         services::config(), services::process()).await.map_err(ApiError::internal)?;
     let session_id = services::sessions().create(cache.folder.clone()).await.map_err(ApiError::internal)?;
     Ok(Json(PlaybackStart {
         url: format!("/playback/{session_id}/index.m3u8"), session_id, cache,
-        media: MediaInfo { metadata, configs: record.configs },
+        media: MediaInfo { metadata, configs },
         video_stream_index: spec.video_stream_index,
         audio_stream_index: spec.audio_stream_index,
         subtitle_stream_index: spec.subtitle_stream_index,

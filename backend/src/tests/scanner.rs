@@ -19,12 +19,14 @@ async fn scanning_updates_changed_content_and_deletes_only_missing_paths() -> Re
     let scanner = ScannerManager::new(root).await?;
     let changes = scanner.scan_all(&database).await?;
     assert_eq!((changes.added, changes.updated, changes.total), (2, 0, 2));
-    let first_id = database.get_file_by_path(&first).await?.unwrap().media_id;
-    assert_eq!(database.get_file_by_path(&copy).await?.unwrap().media_id, first_id);
+    let (first_media_id, _) = database.get_file_by_path(&first).await?.unwrap();
+    let (copy_media_id, _) = database.get_file_by_path(&copy).await?.unwrap();
+    assert_eq!(copy_media_id, first_media_id);
     tokio::fs::write(&first, b"other media").await?;
     let changes = scanner.scan_all(&database).await?;
     assert_eq!((changes.updated, changes.total), (1, 2));
-    assert_ne!(database.get_file_by_path(&first).await?.unwrap().media_id, first_id);
+    let (updated_media_id, _) = database.get_file_by_path(&first).await?.unwrap();
+    assert_ne!(updated_media_id, first_media_id);
     tokio::fs::remove_file(&copy).await?;
     assert!(scanner.scan_one(&database, &copy).await?.is_none());
     assert!(database.get_file_by_path(&copy).await?.is_none());
@@ -65,8 +67,10 @@ async fn moving_media_and_reusing_its_old_path_preserves_configs() -> Result<()>
     tokio::fs::rename(&first, &moved).await?;
     tokio::fs::write(&first, b"different media").await?;
     scanner.scan_all(&database).await?;
-    assert_eq!(database.get_file_by_path(&moved).await?.unwrap().configs, configs);
-    assert_eq!(database.get_file_by_path(&first).await?.unwrap().configs.position, None);
+    let (_, moved_configs) = database.get_file_by_path(&moved).await?.unwrap();
+    let (_, replacement_configs) = database.get_file_by_path(&first).await?.unwrap();
+    assert_eq!(moved_configs, configs);
+    assert_eq!(replacement_configs.position, None);
     database.shutdown().await;
     Ok(())
 }

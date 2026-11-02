@@ -4,12 +4,19 @@
 
 use std::path::{Path, PathBuf};
 
+use sqlx::SqlitePool;
+
+use crate::models::{MediaConfigs, ScannedFile};
+
+
 use anyhow::{Context, Result};
-use sqlx::{sqlite::{SqliteConnectOptions, SqlitePoolOptions}, SqlitePool};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
-use crate::models::{FileRecord, MediaConfigs, PathConfigs, PathRecord, ScannedFile};
+type SqlxErr = sqlx::Error; // 为 sqlx::Error 定义别名, 便于统一管理错误类型.
 
-mod repository;
+type PathAndConfigsList = Vec<(PathBuf, MediaConfigs)>;
+type PathAndIdentityList = Vec<(PathBuf, String)>;
+type OptionIdAndConfigs = Option<(String, MediaConfigs)>;
 
 #[cfg(test)]
 #[path = "tests/db.rs"]
@@ -22,6 +29,7 @@ pub(crate) struct DatabaseManager {
 }
 
 impl DatabaseManager {
+
     /// 执行新 schema, 对旧数据库明确报错而不迁移或删除数据.
     pub(crate) async fn initialize(path: &Path) -> Result<Self> {
         let options = SqliteConnectOptions::new()
@@ -34,43 +42,146 @@ impl DatabaseManager {
         Ok(Self { pool })
     }
 
-    /// 返回媒体列表所需的路径和共享配置.
-    pub(crate) async fn list_paths_with_configs(&self) -> Result<Vec<PathConfigs>, sqlx::Error> {
-        repository::list_paths_with_configs(&self.pool).await
+    /// 等待全部数据库连接关闭.
+    pub(crate) async fn shutdown(&self) { self.pool.close().await; }
+
+    /// 返回所有路径及其对应的配置
+    pub(crate) async fn list_paths_with_configs(&self) 
+    -> Result<PathAndConfigsList, SqlxErr>
+    {
+        let sql = "
+            SELECT fp.path,
+                   f.position,
+                   f.video_stream_index,
+                   f.audio_stream_index,
+                   f.subtitle_stream_index
+            FROM file_path AS fp
+            JOIN file AS f ON f.media_id = fp.media_id ORDER BY fp.path
+        ";
+        type Row = (String, Option<f64>, Option<i32>, Option<i32>, Option<i32>);
+
+        let rows = sqlx::query_as::<_, Row>(sql).fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(|(ph, po, v_s, a_s, s_s)|(
+            PathBuf::from(ph),
+            MediaConfigs {
+                position: po,
+                video_stream_index: v_s,
+                audio_stream_index: a_s,
+                subtitle_stream_index: s_s
+            }
+        )).collect())
     }
 
-    /// 返回扫描器需要比较的全部路径关联.
-    pub(crate) async fn list_paths(&self) -> Result<Vec<PathRecord>, sqlx::Error> {
-        repository::list_paths(&self.pool).await
+    /// 返回所有路径
+    pub(crate) async fn list_paths(&self) -> Result<PathAndIdentityList, SqlxErr> {
+       type Row = (String, String);
+       let sql = "SELECT path, media_id FROM file_path ORDER BY path";
+       let rows = sqlx::query_as::<_, Row>(sql).fetch_all(&self.pool).await?;
+       Ok(rows.into_iter().map(|(path, media_id)| (PathBuf::from(path), media_id)).collect())
     }
 
-    /// 按路径读取当前内容身份和共享配置.
-    pub(crate) async fn get_file_by_path(&self, path: &Path) -> Result<Option<FileRecord>, sqlx::Error> {
-        repository::get_file_by_path(&self.pool, path).await
+    /// 根据路径获取身份和配置
+    pub(crate) async fn get_file_by_path(&self, path: &Path)
+    -> Result<OptionIdAndConfigs, SqlxErr>
+    {
+        let path = path.to_str().ok_or_else(|| sqlx::Error::Protocol(format!("non-UTF-8 media path: {}", path.display())))?;
+
+        let sql = "
+            SELECT f.media_id,
+                   f.position,
+                   f.video_stream_index,
+                   f.audio_stream_index,
+                   f.subtitle_stream_index
+            FROM file AS f
+            JOIN file_path AS fp ON fp.media_id = f.media_id
+            WHERE fp.path = ?
+        ";
+        type Row = (String, Option<f64>, Option<i32>, Option<i32>, Option<i32>);
+        let rows = sqlx::query_as::<_, Row>(sql).bind(path).fetch_optional(&self.pool).await?;
+        Ok(rows.map(|(id, pos, v_s, a_s, s_s)| (
+            id,
+            MediaConfigs {
+                position: pos,
+                video_stream_index: v_s,
+                audio_stream_index: a_s,
+                subtitle_stream_index: s_s
+            }
+        )))
     }
 
-    /// 按路径替换完整的播放配置.
-    pub(crate) async fn save_configs_by_path(&self, path: &Path, configs: &MediaConfigs) -> Result<(), sqlx::Error> {
-        repository::save_configs_by_path(&self.pool, path, configs).await
+    /// 设置指定路径的播放配置
+    pub(crate) async fn
+    save_configs_by_path(&self, path: &Path, configs: &MediaConfigs)
+    -> Result<(), SqlxErr>
+    {
+        let path = path.to_str().ok_or_else(|| SqlxErr::Protocol(format!("non-UTF-8 media path: {}", path.display())))?;
+
+        let sql = "
+            UPDATE file SET
+                position = ?,
+                video_stream_index = ?,
+                audio_stream_index = ?,
+                subtitle_stream_index = ?
+            WHERE media_id = (SELECT media_id FROM file_path WHERE path = ?)
+        ";
+        let result = sqlx::query(sql)
+        .bind(configs.position)
+        .bind(configs.video_stream_index)
+        .bind(configs.audio_stream_index)
+        .bind(configs.subtitle_stream_index)
+        .bind(path)
+        .execute(&self.pool).await?;
+
+        if result.rows_affected() == 0 { Err(SqlxErr::RowNotFound) }
+        else { Ok(()) }
     }
 
     /// 在事务中替换路径的内容关联
-    pub(crate) async fn replace_scanned_path(&self, file: &ScannedFile) -> Result<(), sqlx::Error> {
-        repository::replace_scanned_paths(&self.pool, std::slice::from_ref(file), &[]).await
-    }
-
-    /// 原子应用全量扫描结果
-    pub(crate) async fn replace_scanned_paths(&self, files: &[ScannedFile], removed: &[PathBuf]) -> Result<(), sqlx::Error> {
-        repository::replace_scanned_paths(&self.pool, files, removed).await
+    pub(crate) async fn replace_scanned_path(&self, file: &ScannedFile)
+    -> Result<(), SqlxErr>
+    {
+        self.replace_scanned_paths(std::slice::from_ref(file), &[]).await
     }
 
     /// 删除已失效的路径
-    pub(crate) async fn delete_scanned_paths(&self, paths: &[PathBuf]) -> Result<(), sqlx::Error> {
-        repository::replace_scanned_paths(&self.pool, &[], paths).await
+    pub(crate) async fn delete_scanned_paths(&self, paths: &[PathBuf])
+    -> Result<(), SqlxErr>
+    {
+        self.replace_scanned_paths(&[], paths).await
     }
 
-    /// 等待全部数据库连接关闭.
-    pub(crate) async fn shutdown(&self) {
-        self.pool.close().await;
+    /// 原子应用全量扫描结果
+    pub(crate) async fn
+    replace_scanned_paths(&self, new_files: &[ScannedFile], removed: &[PathBuf])
+    -> Result<(), SqlxErr>
+    {
+        let mut transaction = self.pool.begin().await?;
+
+        // 删除已失效的路径
+        for path in removed {
+            let path = path.to_str().ok_or_else(|| SqlxErr::Protocol(format!("non-UTF-8 media path: {}", path.display())))?;
+
+            sqlx::query("DELETE FROM file_path WHERE path = ?")
+            .bind(path).execute(&mut *transaction).await?;
+        }
+
+        for file in new_files {
+            let path = file.path.to_str().ok_or_else(|| SqlxErr::Protocol(format!("non-UTF-8 media path: {}", file.path.display())))?;
+
+            // 删除原有路径关联
+            sqlx::query("DELETE FROM file_path WHERE path = ?")
+            .bind(path).execute(&mut *transaction).await?;
+
+            // 插入文件表
+            sqlx::query("INSERT INTO file (media_id) VALUES (?) ON CONFLICT (media_id) DO NOTHING")
+            .bind(&file.media_id).execute(&mut *transaction).await?;
+
+            // 插入路径关联
+            sqlx::query("INSERT INTO file_path (media_id, path) VALUES (?, ?)")
+            .bind(&file.media_id).bind(path).execute(&mut *transaction).await?;
+        }
+
+        // 提交事务
+        transaction.commit().await
     }
 }

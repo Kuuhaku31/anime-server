@@ -52,7 +52,7 @@ impl ScannerManager {
     pub(crate) async fn scan_all(&self, database: &DatabaseManager) -> Result<ScanChanges> {
         let _guard = self.lock.lock().await;
         let known: HashMap<_, _> = database.list_paths().await?.into_iter()
-            .map(|record| (PathBuf::from(record.path), record.media_id)).collect();
+            .map(|record| (PathBuf::from(record.0), record.1)).collect();
         let root = self.root.clone();
         let paths = tokio::task::spawn_blocking(move || collect_paths(&root)).await??;
         let mut found = HashSet::new();
