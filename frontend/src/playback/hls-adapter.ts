@@ -1,18 +1,19 @@
+
+// frontend/src/playback/hls-adapter.ts
 // 按浏览器能力选择 HLS 引擎并管理媒体加载与释放.
 import Hls from "hls.js";
 
-// Safari 优先原生 HLS, 其他支持 MSE 的浏览器优先 hls.js, 加载失败后不切换引擎重试.
+/** Safari 优先原生 HLS, 其他支持 MSE 的浏览器优先 hls.js. */
 export function preferNativeHls(nativeSupport: boolean, mseSupport: boolean, vendor: string): boolean {
   return nativeSupport && (vendor === "Apple Computer, Inc." || !mseSupport);
 }
 
+/** 维护当前媒体引擎和事件清理流程. */
 export class MediaAdapter {
-  private hls: Hls | null = null;
-  private cleanup: (() => void) | null = null;
-  private video: HTMLVideoElement;
-
+  /** 绑定唯一的视频元素. */
   constructor(video: HTMLVideoElement) { this.video = video; }
 
+  /** 挂载 HLS 清单并将加载失败交给控制器. */
   attach(url: string, position: number, signal: AbortSignal, fatal: (error: Error) => void): Promise<void> {
     this.destroy();
     signal.throwIfAborted();
@@ -85,7 +86,7 @@ export class MediaAdapter {
     });
   }
 
-  // 先解除旧加载回调再重置 video, 避免旧媒体事件污染新会话.
+  /** 先解除旧加载回调再重置 video, 避免旧事件污染新会话. */
   destroy(): void {
     this.cleanup?.();
     this.cleanup = null;
@@ -95,4 +96,11 @@ export class MediaAdapter {
     this.video.removeAttribute("src");
     this.video.load();
   }
+
+  /** 当前 MSE 播放引擎, 原生 HLS 时为 null. */
+  private hls: Hls | null = null;
+  /** 当前媒体事件和定时器的清理函数. */
+  private cleanup: (() => void) | null = null;
+  /** 实际播放视频的浏览器元素. */
+  private video: HTMLVideoElement;
 }

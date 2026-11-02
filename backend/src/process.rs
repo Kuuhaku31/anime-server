@@ -1,9 +1,10 @@
-//! 统一管理媒体子进程、资源限流与执行流水线.
+
+// backend/src/process.rs
+//! 统一管理媒体子进程, 资源限流和执行流水线.
 
 use std::{process::Stdio, sync::Arc, time::Duration};
 
 use anyhow::{bail, Context, Result};
-use serde::Serialize;
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
     process::Command,
@@ -12,41 +13,29 @@ use tokio::{
 };
 use tracing::info;
 
-pub(crate) mod assets;
-pub(crate) mod ffmpeg;
-pub(crate) mod fragment;
-pub(crate) use assets::{clean_startup, RenderAssets};
+mod assets;
+mod ffmpeg;
+mod fragment;
+mod metadata;
+mod worker;
+pub(crate) use assets::RenderAssets;
 pub(crate) use ffmpeg::{
-    atomic_file, command, has_video_after, media_filename, read_playlist, recover,
-    regular_bytes, segment_name, sync_directory, validate_segment, write_playlist, CachedMedia,
+    atomic_file, media_filename, read_playlist, regular_bytes, segment_name,
+    sync_directory, write_playlist, CachedMedia,
 };
 pub(crate) use fragment::{normalize, Init, Tail};
+pub(crate) use worker::EncodingWorker;
 
-/// 进程或线程资源的使用快照.
-// 预留给 API 资源监视, 当前尚未开放 HTTP 路由.
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-pub(crate) struct ResourceUsage {
-    pub(crate) total: usize,
-    pub(crate) used: usize,
-    pub(crate) available: usize,
-}
+#[cfg(test)]
+#[path = "tests/process.rs"]
+mod tests;
 
-/// 媒体子进程, 编码器与线程预算的使用情况快照.
-// 预留给 API 资源监视, 当前尚未开放 HTTP 路由.
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-pub(crate) struct ProcessUsage {
-    pub(crate) process_slots: ResourceUsage,
-    pub(crate) encoder_slots: ResourceUsage,
-    pub(crate) thread_permits: ResourceUsage,
-}
-
-// 正常停止有独立错误类型, 不能顺带吞掉同一时刻发生的磁盘或清理错误.
+/// 区分正常取消和磁盘, 解码或进程回收失败.
 #[derive(Debug)]
 pub(crate) struct Cancelled;
 
 impl std::fmt::Display for Cancelled {
+    /// 提供可记录的取消原因.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("media operation cancelled")
     }
@@ -54,91 +43,47 @@ impl std::fmt::Display for Cancelled {
 
 impl std::error::Error for Cancelled {}
 
-/// 检查取消信号, 并在已收到取消时返回 Cancelled 错误.
-pub(crate) fn check_cancel(cancel: &watch::Receiver<bool>) -> Result<()> {
-    if *cancel.borrow() { return Err(Cancelled.into()); }
-    Ok(())
-}
-
-/// 发送端消失也视为取消, 避免所有者退出后子任务永久等待.
-pub(crate) async fn cancelled(receiver: &mut watch::Receiver<bool>) {
-    while !*receiver.borrow_and_update() {
-        if receiver.changed().await.is_err() { break; }
-    }
-}
-
-/// 媒体任务的共享资源管理器, 用来控制 FFmpeg 和 ffprobe 的并发量与资源预算.
+/// 只保存三组共享资源许可, 任务中的克隆仍使用相同预算.
 #[derive(Clone)]
 pub(crate) struct ProcessManager {
-    pub(crate) slots: Arc<Semaphore>, // 媒体子进程总数
-    pub(crate) encoders: Arc<Semaphore>, // 并行编码任务数, 不能用线程许可替代进程名额
-    threads: Arc<Semaphore>, // 编码线程预算, 不能用进程名额替代线程许可
-    #[allow(dead_code)] // 仅供 usage 快照计算总量
-    total_slots: usize,
-    #[allow(dead_code)]
-    total_encoders: usize,
-    #[allow(dead_code)]
-    total_threads: usize,
+    /// 媒体探测, 编码和分片校验共用的进程名额.
+    process_slots: Arc<Semaphore>,
+    /// 编码任务名额, 至少为解码校验保留一个进程位置.
+    encoder_slots: Arc<Semaphore>,
+    /// 所有编码任务共享的线程预算.
+    thread_permits: Arc<Semaphore>,
 }
 
 impl ProcessManager {
+    /// 根据已校验的配置建立全局资源预算.
     pub(crate) fn new(total: usize, thread_budget: usize) -> Self {
-        let total_encoders = total.saturating_sub(1);
         Self {
-            slots: Arc::new(Semaphore::new(total)),
+            process_slots: Arc::new(Semaphore::new(total)),
             // 至少空出一个媒体名额, 避免编码进程全部等待各自的解码校验.
-            encoders: Arc::new(Semaphore::new(total_encoders)),
-            threads: Arc::new(Semaphore::new(thread_budget)),
-            total_slots: total,
-            total_encoders,
-            total_threads: thread_budget,
+            encoder_slots: Arc::new(Semaphore::new(total.saturating_sub(1))),
+            thread_permits: Arc::new(Semaphore::new(thread_budget)),
         }
     }
 
-    /// 获取只读使用量快照.
-    // 预留给 API 资源监视, 当前尚未开放 HTTP 路由.
-    #[allow(dead_code)]
-    pub(crate) fn usage(&self) -> ProcessUsage {
-        let available_slots = self.slots.available_permits();
-        let available_encoders = self.encoders.available_permits();
-        let available_threads = self.threads.available_permits();
-        ProcessUsage {
-            process_slots: ResourceUsage {
-                total: self.total_slots,
-                used: self.total_slots.saturating_sub(available_slots),
-                available: available_slots,
-            },
-            encoder_slots: ResourceUsage {
-                total: self.total_encoders,
-                used: self.total_encoders.saturating_sub(available_encoders),
-                available: available_encoders,
-            },
-            thread_permits: ResourceUsage {
-                total: self.total_threads,
-                used: self.total_threads.saturating_sub(available_threads),
-                available: available_threads,
-            },
-        }
-    }
-
-    pub(crate) async fn encoding_threads(&self, base: usize, desired: usize,
+    /// 原子取得基础线程预算, 再尝试利用空闲许可.
+    pub(crate) async fn encoding_budget(&self, base: usize, desired: usize,
         cancel: &mut watch::Receiver<bool>) -> Result<OwnedSemaphorePermit> {
         anyhow::ensure!(base > 0 && desired >= base && desired <= 32, "invalid encoder thread request");
         // 一次取得基础预算, 再非阻塞补充许可, 不持有不足以启动的部分基础预算.
         let mut permit = tokio::select! {
             biased;
             _ = cancelled(cancel) => return Err(Cancelled.into()),
-            permit = self.threads.clone().acquire_many_owned(base as u32) => permit?,
+            permit = self.thread_permits.clone().acquire_many_owned(base as u32) => permit?,
         };
-        self.extend_encoding_threads(&mut permit, desired)?;
+        self.extend_encoding_budget(&mut permit, desired)?;
         Ok(permit)
     }
 
     /// 只拿当前空闲的额外预算, 不为追求最大线程数阻塞或抢占其他编码任务.
-    pub(crate) fn extend_encoding_threads(&self, permit: &mut OwnedSemaphorePermit, desired: usize) -> Result<()> {
+    pub(crate) fn extend_encoding_budget(&self, permit: &mut OwnedSemaphorePermit, desired: usize) -> Result<()> {
         anyhow::ensure!(desired >= permit.num_permits() && desired <= 32, "invalid encoder thread target");
         for _ in permit.num_permits()..desired {
-            match self.threads.clone().try_acquire_owned() {
+            match self.thread_permits.clone().try_acquire_owned() {
                 Ok(extra) => permit.merge(extra),
                 Err(tokio::sync::TryAcquireError::NoPermits) => break,
                 Err(error) => return Err(error.into()),
@@ -147,14 +92,29 @@ impl ProcessManager {
         Ok(())
     }
 
+    /// 在统一进程名额和超时约束下执行短命令.
     pub(crate) async fn output(&self, command: &mut Command, seconds: u64) -> Result<Vec<u8>> {
-        let _permit = timeout(Duration::from_secs(seconds), self.slots.acquire())
+        let _permit = timeout(Duration::from_secs(seconds), self.process_slots.acquire())
             .await
             .context("timed out waiting for a media process slot")??;
         checked_output(command, seconds).await
     }
 }
 
+/// 检查取消信号, 防止已取消任务继续启动子进程或发布文件.
+pub(crate) fn check_cancel(cancel: &watch::Receiver<bool>) -> Result<()> {
+    if *cancel.borrow() { return Err(Cancelled.into()); }
+    Ok(())
+}
+
+/// 将发送端退出视为取消, 避免任务失去所有者后永久等待.
+pub(crate) async fn cancelled(receiver: &mut watch::Receiver<bool>) {
+    while !*receiver.borrow_and_update() {
+        if receiver.changed().await.is_err() { break; }
+    }
+}
+
+/// 执行启动依赖检查等不属于播放任务的短命令.
 pub(crate) async fn checked_output(command: &mut Command, seconds: u64) -> Result<Vec<u8>> {
     let (_sender, mut cancel) = watch::channel(false);
     match checked_output_cancellable(command, seconds, &mut cancel).await {
@@ -173,6 +133,7 @@ pub(super) async fn checked_output_cancellable(
     seconds: u64,
     cancel: &mut watch::Receiver<bool>,
 ) -> Result<Vec<u8>> {
+    check_cancel(cancel)?;
     info!("运行媒体命令: {:?}", command);
     command
         .kill_on_drop(true)
@@ -225,4 +186,3 @@ pub(crate) async fn read_tail(mut reader: impl AsyncRead + Unpin) -> Result<Stri
     }
     Ok(String::from_utf8_lossy(&tail).into_owned())
 }
-

@@ -1,3 +1,6 @@
+
+<!-- frontend/index.html -->
+<!-- 定义常驻播放器和右侧路径型媒体列表. -->
 <!doctype html>
 <html lang="en">
 
@@ -46,6 +49,10 @@
       </div>
       <div class="track-controls">
         <label>
+          <span>Video</span>
+          <select id="video-track" disabled></select>
+        </label>
+        <label>
           <span>Audio</span>
           <select id="audio-track" disabled></select>
         </label>
@@ -65,7 +72,7 @@
         <div id="error" role="alert"></div>
         <div id="error-actions" hidden>
           <button id="retry" type="button">Retry</button>
-          <button id="retry-probe" type="button">Retry probe</button>
+          <button id="retry-probe" type="button">Rescan and retry</button>
         </div>
       </div>
       <div id="meta">Select a video from the library</div>
@@ -85,9 +92,9 @@
           <option value="path">Path</option>
           <option value="name-asc">Name A-Z</option>
           <option value="name-desc">Name Z-A</option>
-          <option value="size-desc">Size largest first</option>
-          <option value="size-asc">Size smallest first</option>
-          <option value="recent">Recently watched</option>
+          <option value="duration-desc">Duration longest first</option>
+          <option value="duration-asc">Duration shortest first</option>
+          <option value="progress-desc">Playback progress</option>
         </select>
       </label>
       <div id="files" class="files-list"></div>

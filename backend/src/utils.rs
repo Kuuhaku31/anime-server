@@ -1,4 +1,6 @@
-//! 工具函数和辅助模块.
+
+// backend/src/utils.rs
+//! 提供健康检查, 媒体工具检查和内容标识辅助函数.
 
 use std::fs::File;
 use std::path::Path;
@@ -14,7 +16,7 @@ use std::io::Read;
 use md5::Digest;
 
 
-// 确认 http 服务存活
+/// 确认本机固定端口的 HTTP 健康接口可用.
 pub(crate) fn http_check() -> Result<()> {
     use std::io::{Read, Write};
     let mut stream = std::net::TcpStream::connect_timeout(
@@ -50,37 +52,13 @@ pub(crate) async fn check_tools() -> Result<()> {
 }
 
 
-/// 检查字符串是否符合预期的文件名 MD5 哈希格式, 自动转换为小写十六进制字符.
-pub(crate) fn check_md5(input: &str) -> Result<String, String> {
-
-    if !(input.len() == 32 && input.bytes().all(|byte| byte.is_ascii_hexdigit())) {
-        return Err(format!("invalid MD5 hash: {}", input));
-    }
-
-    Ok(input.to_ascii_lowercase())
-}
-
+/// 检查稳定身份是否为完整的十六进制 MD5.
 pub(crate) fn check_md5_ok(input: &str) -> bool {
-
-    if !(input.len() == 32 && input.bytes().all(|byte| byte.is_ascii_hexdigit())) {
-        return false;
-    }
-    else { return true; }
-}
-
-/// 检查字符串是否符合预期的文件名 SHA256 哈希格式, 自动转换为小写十六进制字符.
-#[allow(dead_code)]
-fn check_sha256(input: &str) -> Result<String, String> {
-
-    if !(input.len() == 64 && input.bytes().all(|byte| byte.is_ascii_hexdigit())) {
-        return Err(format!("invalid SHA256 hash: {}", input));
-    }
-
-    Ok(input.to_ascii_lowercase())
+    input.len() == 32 && input.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 
-// 输入文件路径和大小限制, 计算文件从头开始指定范围的 MD5 哈希前缀.
+/// 读取文件指定长度前缀并计算 MD5 内容身份.
 pub(crate) fn md5_hash_prefix(path: &Path, limit: u64) -> Result<String, String> {
 
     let mut file = File::open(path).map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
@@ -104,6 +82,7 @@ pub(crate) fn md5_hash_prefix(path: &Path, limit: u64) -> Result<String, String>
 }
 
 
+/// 从操作系统随机源生成不透明的 128 位标识.
 pub(crate) fn random_id() -> Result<String> {
     let mut bytes = [0_u8; 16];
     File::open("/dev/urandom")?.read_exact(&mut bytes)?;

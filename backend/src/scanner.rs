@@ -1,138 +1,123 @@
-//! 扫描媒体目录并同步文件索引.
 
-use std::{collections::HashSet, path::{Path, PathBuf}};
-use anyhow::Result;
-use tracing::info;
+// backend/src/scanner.rs
+//! 串行扫描媒体目录并同步内容身份与路径关联.
+
+use std::{collections::{HashMap, HashSet}, path::{Component, Path, PathBuf}};
+
+use anyhow::{ensure, Context, Result};
+use tokio::sync::Mutex;
 use walkdir::WalkDir;
 
-use crate::{
-    AppState, constants::{self, EXTENSIONS}, db, models::{ScanChanges, ScannedFile},
-};
+use crate::{constants::EXTENSIONS, db::DatabaseManager, models::{ScanChanges, ScannedFile}};
 
+#[cfg(test)]
+#[path = "tests/scanner.rs"]
+mod tests;
 
-/// 扫描媒体目录, 同步数据库索引, 返回扫描摘要:
-///
-/// 遍历媒体目录, 对每个视频文件:
-///  - 检查该文件地址是否在数据库 file_path 表内
-///  - 如果不在数据库 file_path 表内, 计算文件前 16MiB 的 MD5 哈希, 并将文件地址和哈希写入数据库
-///  - 如果在数据库内, 检查文件大小是否变化, 如果变化则重新计算哈希并更新数据库
-///  - 统计好实际导致插入更新数据库的文件地址数量
-///  - 获得一个媒体目录下所有视频文件地址列表
-/// 获取数据库 file_path 表所有地址, 和媒体目录下所有视频文件地址列表进行比对,
-/// 删除 file_path 表内存在但媒体目录下不存在的地址, 统计删除数量.
-/// 最后返回一个 ScanChanges 结构体, 包含新增, 删除和总计的文件数量.
-pub(crate) async fn scan_root(state: &AppState) -> Result<ScanChanges, String> {
+/// 保存媒体根目录和扫描锁, 不持有数据库管理器.
+pub(crate) struct ScannerManager {
+    /// 已规范化的媒体根目录.
+    root: PathBuf,
+    /// 串行化全量扫描和播放前的单路径重扫.
+    lock: Mutex<()>,
+}
 
-    // 整轮扫描持有锁, 防止手动和后台扫描交错更新.
-    info!("准备扫描媒体目录: {}", constants::video_root_path().display());
-    let _scan = state.scan_lock.lock().await;
-    info!("扫描媒体目录开始: {}", constants::video_root_path().display());
+impl ScannerManager {
+    /// 校验媒体根目录并创建独立扫描器.
+    pub(crate) async fn new(root: PathBuf) -> Result<Self> {
+        let root = tokio::fs::canonicalize(root).await.context("cannot resolve media root")?;
+        ensure!(tokio::fs::metadata(&root).await?.is_dir(), "media root is not a directory");
+        Ok(Self { root, lock: Mutex::new(()) })
+    }
 
-    let path_and_size_in_db = db::get_paths_and_size(&state.db).await
-    .map_err(|error| format!("failed to read paths and sizes from database: {error}"))?;
-    let root = tokio::fs::canonicalize(constants::video_root_path()).await
-    .map_err(|error| format!("cannot resolve media directory: {error}"))?;
+    /// 检查请求地址没有越界或父目录跳转, 不读取目标文件.
+    pub(crate) fn check_path(&self, path: &Path) -> Result<()> {
+        ensure!(path.is_absolute() && path.starts_with(&self.root) && path != self.root
+            && path.to_str().is_some() && is_video(path)
+            && !path.components().any(|part| matches!(part, Component::ParentDir | Component::CurDir)),
+            "invalid media path: {}", path.display());
+        Ok(())
+    }
 
-    let mut paths_in_folder = Vec::new();
-    let mut added = 0;
+    /// 验证现存文件实际位于媒体目录内, 保留列表展示的路径身份.
+    pub(crate) async fn resolve(&self, path: &Path) -> Result<PathBuf> {
+        self.check_path(path)?;
+        let resolved = tokio::fs::canonicalize(path).await?;
+        ensure!(resolved.starts_with(&self.root) && tokio::fs::metadata(&resolved).await?.is_file(),
+            "media path must resolve to a file inside media root: {}", path.display());
+        Ok(resolved)
+    }
 
-    // 边遍历边写入, 哈希交给阻塞线程, 每个文件的两表更新独立提交.
-    for entry in WalkDir::new(&root).sort_by_file_name() {
+    /// 全量重算内容身份, 只删除本次确实未发现的已登记路径.
+    pub(crate) async fn scan_all(&self, database: &DatabaseManager) -> Result<ScanChanges> {
+        let _guard = self.lock.lock().await;
+        let known: HashMap<_, _> = database.list_paths().await?.into_iter()
+            .map(|record| (PathBuf::from(record.path), record.media_id)).collect();
+        let root = self.root.clone();
+        let paths = tokio::task::spawn_blocking(move || collect_paths(&root)).await??;
+        let mut found = HashSet::new();
+        let mut changes = ScanChanges::default();
+        let mut replacements = Vec::new();
+        let mut failures = Vec::new();
+        for path in paths {
+            found.insert(path.clone());
+            let hash_path = self.resolve(&path).await?;
+            let file = tokio::task::spawn_blocking(move || ScannedFile::new(&hash_path)).await?;
+            let mut file = match file {
+                Ok(file) => file,
+                Err(error) => {
+                    failures.push(format!("{}: {error:#}", path.display()));
+                    continue;
+                },
+            };
+            file.path = path.clone();
+            if known.get(&path) == Some(&file.media_id) { continue; }
+            replacements.push(file);
+            if known.contains_key(&path) { changes.updated += 1; }
+            else { changes.added += 1; }
+        }
+        let removed: Vec<_> = known.keys().filter(|path| !found.contains(*path)).cloned().collect();
+        database.replace_scanned_paths(&replacements, &removed).await?;
+        changes.removed = removed.len() as u64;
+        changes.total = database.list_paths().await?.len() as u64;
+        ensure!(failures.is_empty(), "some media files could not be scanned: {}", failures.join("; "));
+        Ok(changes)
+    }
 
-        let entry = entry.map_err(|error| format!("failed to read media directory entry: {error}"))?;
-        let path = entry.path();
-
-        if !entry.file_type().is_file() || !is_video(path) { continue; } // 只处理视频文件
-        paths_in_folder.push(path.to_path_buf());
-        let size = tokio::fs::metadata(path).await
-        .map_err(|error| format!("failed to read media file metadata {}: {error}", path.display()))?.len();
-
-        if path_and_size_in_db.get(path) == Some(&size) { continue; } // 同地址同大小不重算哈希
-
-        // 单文件写入失败记录完整地址和错误后继续, 仅成功提交的地址计入 added.
-        let file = match ScannedFile::new(path) {
-            Ok(file) => file,
-            Err(error) => {
-                tracing::error!(path = %path.display(), "failed to scan media file: {error}");
-                continue;
+    /// 播放或手动重扫前重新计算内容身份, 文件消失时删除原路径关联.
+    pub(crate) async fn scan_one(&self, database: &DatabaseManager, path: &Path) -> Result<Option<ScannedFile>> {
+        let _guard = self.lock.lock().await;
+        self.check_path(path)?;
+        let resolved = match self.resolve(path).await {
+            Ok(resolved) => resolved,
+            Err(error) if error.downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) => {
+                database.delete_scanned_paths(&[path.to_owned()]).await?;
+                return Ok(None);
             },
+            Err(error) => return Err(error),
         };
+        let mut file = tokio::task::spawn_blocking(move || ScannedFile::new(&resolved)).await??;
+        file.path = path.to_owned();
+        database.replace_scanned_path(&file).await?;
+        Ok(Some(file))
+    }
+}
 
-        match db::upsert_file(&state.db, &file).await {
-            Ok(()) => added += 1,
-            Err(error) => tracing::error!(path = %file.path().display(), "failed to update scanned file: {error}"),
+/// 在阻塞线程中遍历实际文件, 不跟随媒体根目录内的符号链接.
+fn collect_paths(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for entry in WalkDir::new(root).sort_by_file_name() {
+        let entry = entry?;
+        if entry.file_type().is_file() && is_video(entry.path()) {
+            paths.push(entry.path().to_owned());
         }
     }
-
-    let mut removed = 0;
-    let total = paths_in_folder.len() as u64;
-
-    // 查找数据库中已知但在文件夹中不存在的路径, 作为删除列表.
-    let paths_in_folder_set: HashSet<&Path> = paths_in_folder.iter().map(|p| p.as_path()).collect();
-    let need_delete: Vec<PathBuf> = path_and_size_in_db.keys()
-        .filter(|path| !paths_in_folder_set.contains(path.as_path()))
-        .cloned()
-        .collect();
-    if !need_delete.is_empty() {
-        db::delete_paths(&state.db, &need_delete).await.map_err(|error| error.to_string())?;
-        removed = need_delete.len() as u64;
-    }
-
-    let changes = ScanChanges {
-        added, removed, total,
-    };
-
-    info!("扫描媒体目录完成: {}, 添加: {}, 删除: {}, 总计: {}", constants::video_root_path().display(), added, removed, total);
-    Ok(changes)
+    Ok(paths)
 }
 
-
-/// 强制重新读取单个地址, 不沿用全目录增量扫描的跳过哈希策略.
-pub(crate) async fn scan_file(state: &AppState, path: &Path) -> Result<Option<ScannedFile>, String> {
-
-    let p = path.to_owned();
-    let file = tokio::task::spawn_blocking(move || -> Result<Option<ScannedFile>, String> {
-    let path = &p;
-    let root = std::fs::canonicalize(constants::video_root_path()).map_err(|error| format!("cannot resolve media directory: {error}"))?;
-    if !path.is_absolute() || !path.starts_with(&root)
-        || path.components().any(|part| matches!(part, std::path::Component::ParentDir))
-        || !is_video(path)
-    {
-        return Err(format!("invalid media file path: {:?}", path));
-    }
-
-    let resolved = match std::fs::canonicalize(path) {
-        Ok(resolved) => resolved,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(None);
-        },
-        Err(error) => return Err(format!("cannot resolve media file: {error}")),
-    };
-    if !resolved.starts_with(&root) || !resolved.is_file() {
-        return Err(format!("media path must resolve to a file inside media directory: {:?}", path));
-    }
-    Ok(Some(ScannedFile::new(path)?))
-    }).await.map_err(|error| format!("failed to join scan thread: {error}"))??;
-
-    // 如果扫描结果为 None, 说明文件不存在或不在媒体目录内, 删除数据库中对应路径记录.
-    // 如果扫描结果为 Some, 则将扫描结果写入数据库, 覆盖原有路径关联.
-    if let Some(f) = file.as_ref() {
-        info!("服务端完成单文件扫描请求: {:?}, hash: {:?}", path, f.pre16mib_md5());
-        db::upsert_file(&state.db, f).await.map_err(|error| error.to_string())?;
-    } else {
-        info!("服务端完成单文件扫描请求: {:?}, 文件不存在或不在媒体目录内", path);
-        db::delete_path(&state.db, path).await.map_err(|error| error.to_string())?;
-    };
-
-    Ok(file)
-}
-
+/// 按不区分大小写的扩展名白名单识别媒体文件.
 fn is_video(path: &Path) -> bool {
-    path.extension()
-    .and_then(|value| value.to_str())
-    .map(|value| {
-        EXTENSIONS
-        .iter().any(|extension| value.eq_ignore_ascii_case(extension))
-    })
-    .unwrap_or(false)
+    path.extension().and_then(|value| value.to_str())
+        .is_some_and(|value| EXTENSIONS.iter().any(|extension| value.eq_ignore_ascii_case(extension)))
 }

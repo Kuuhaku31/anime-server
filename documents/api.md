@@ -1,302 +1,245 @@
 # HTTP API
 
-业务路由定义在 `backend/src/api.rs`, 播放路由定义在 `backend/src/api/playback.rs`.
-主路由通过 `.merge(playback::router())` 合并播放接口, `.with_state(state)` 注入共享应用状态.
-注册路由不会执行扫描或创建播放任务.
+业务路由位于 `backend/src/api.rs` 和 `backend/src/api/playback.rs`.
+请求使用同源地址和 `Content-Type: application/json`.
+当前没有用户鉴权, 不应直接暴露到公网.
 
-本文示例使用 `http://localhost:56080`, 实际地址取决于宿主机端口映射.
-接口没有用户鉴权, 不应直接暴露到公网. JSON 请求使用 `Content-Type: application/json`.
+本次契约使用媒体绝对路径, 不接受客户端提供的媒体内容标识, 缓存键或编码版本.
+旧 `/api/files/*`, `/api/scan*`, `/status`, `/target` 和 `/heartbeat` 接口已经删除,
+不提供兼容别名.
 
-- `{file_id}` 是源文件前 16 MiB 的 MD5, 对应代码中的 `{pre16mib_md5}`.
-- `{session_id}` 是创建播放会话时返回的不透明 ID, 与文件 ID 和缓存键不同.
-- 播放配置和缓存键由服务端生成, 客户端不能提供媒体路径或直接访问缓存目录.
+## 路由
 
-## 路由总览
+| 方法   | 路径                                  | 作用                       |
+| ------ | ------------------------------------- | -------------------------- |
+| GET    | `/api/config`                         | 读取前端默认主题           |
+| GET    | `/api/media`                          | 获取 `[path, MediaInfo][]` |
+| POST   | `/api/media/scan`                     | 全量扫描媒体目录           |
+| POST   | `/api/media/rescan`                   | 按路径重扫并重新探测单文件 |
+| PUT    | `/api/media/configs`                  | 按路径保存完整播放配置     |
+| POST   | `/api/playback`                       | 创建最小播放会话           |
+| GET    | `/api/playback/{session_id}`          | 查询缓存快照               |
+| DELETE | `/api/playback/{session_id}`          | 幂等释放会话映射           |
+| GET    | `/playback/{session_id}/{asset_name}` | 获取已发布 HLS 资源        |
+| GET    | `/health`                             | 检查 HTTP 服务存活         |
 
-| 方法     | 路径                                   | 功能                                |
-| -------- | -------------------------------------- | ----------------------------------- |
-| `GET`    | `/api/files`                           | 查询视频列表                        |
-| `GET`    | `/api/files/{file_id}`                 | 查询视频详情和所有存储路径          |
-| `POST`   | `/api/files/{file_id}/identify`        | 模拟识别, 不调用真实 DandanPlay API |
-| `GET`    | `/api/files/{file_id}/progress`        | 查询观看进度                        |
-| `PUT`    | `/api/files/{file_id}/progress`        | 保存观看进度                        |
-| `GET`    | `/api/config`                          | 查询 Web 配置                       |
-| `POST`   | `/api/scan`                            | 扫描媒体目录并同步数据库            |
-| `POST`   | `/api/scan/file`                       | 按地址强制重扫单文件并更新数据库    |
-| `GET`    | `/api/files/{file_id}/streams`         | 查询轨道信息, 优先使用探测缓存      |
-| `POST`   | `/api/files/{file_id}/probe`           | 强制重新探测轨道信息                |
-| `POST`   | `/api/files/{file_id}/playback`        | 创建播放会话并激活共享缓存          |
-| `GET`    | `/api/playback/{session_id}/status`    | 查询会话状态并保活                  |
-| `POST`   | `/api/playback/{session_id}/heartbeat` | 显式保活                            |
-| `POST`   | `/api/playback/{session_id}/target`    | 更新会话目标位置                    |
-| `DELETE` | `/api/playback/{session_id}`           | 释放会话租约                        |
-| `GET`    | `/playback/{session_id}/{asset_name}`  | 获取已发布的 HLS 资源               |
-| `GET`    | `/health`                              | 检查 HTTP 服务存活                  |
+## 媒体列表
 
-## 文件查询与识别
-
-`GET /api/files` 返回 `200` 和视频记录数组. 每条记录包含 `pre16mib_md5`, `name`, `size`,
-`audio_stream_index`, `subtitle_stream_index`,
-`ddp_epi_id`, `danmaku_offset`, `watch_pos`, `watched_datetime`, `path`.
-`path` 是完整容器内绝对文件地址, `name` 仅为从该地址提取的显示文件名.
-大小单位为字节, 观看位置和弹幕偏移单位为秒. 尚无业务数据的可空字段返回 `null`.
-同一指纹存在多个副本时分别返回每个地址, 客户端以完整服务器地址作为列表主键,
-不按指纹去重. 播放, 识别和观看进度接口仍通过指纹关联业务数据.
-
-前端支持按地址, 文件名升降序, 大小升降序和最近观看排序.
-排序只在浏览器进行, 选项保存在当前站点的 localStorage
-(`anime-server.library-sort`), 页面刷新和重新扫描后继续沿用, 不修改服务端数据.
-文件名按自然编号排序, 相同排序值按完整地址排序, 未观看文件在最近观看模式中排在最后.
-
-`GET /api/files/{file_id}` 返回 `200`:
+`GET /api/media` 返回 `200`:
 
 ```json
-{
-  "video": {
-    "pre16mib_md5": "35af6d912b6dffadc112df2ca94bbe2f",
-    "name": "episode.mkv",
-    "size": 104857600,
-    "audio_stream_index": 1,
-    "subtitle_stream_index": null,
-    "ddp_epi_id": null,
-    "danmaku_offset": 0.0,
-    "watch_pos": 125.5,
-    "watched_datetime": "2026-10-10T07:00:00.000Z",
-    "path": "/media/series/episode.mkv"
-  },
-  "paths": ["/media/series/episode.mkv"]
-}
+[
+  [
+    "/media/series/episode.mkv",
+    {
+      "metadata": {
+        "duration": 1400.0,
+        "format": "matroska,webm",
+        "video_streams": [
+          {
+            "stream_index": 0,
+            "codec_name": "h264",
+            "language": null,
+            "title": null,
+            "is_default": true,
+            "is_forced": false
+          }
+        ],
+        "audio_streams": [],
+        "subtitle_streams": []
+      },
+      "configs": {
+        "position": 125.5,
+        "video_stream_index": 0,
+        "audio_stream_index": null,
+        "subtitle_stream_index": null
+      }
+    }
+  ]
+]
 ```
 
-`paths` 包含该指纹的全部完整绝对文件地址, 无需客户端拼接.
-详情接口不检查每个副本当前是否仍存在, 也不返回原始媒体播放 URL.
-播放前会重新查找可用副本并验证规范化路径仍位于媒体根目录.
+每个路径单独展示, 相同内容共享 configs.
+metadata 每次按路径实时探测, 任一文件探测失败返回错误,
+不伪造空元数据或静默省略该项.
+流索引是 ffprobe 的容器全局索引, 不是数组下标.
+视频封面和字体附件不作为可选流返回, 不提供外挂字幕.
 
-`POST /api/files/{file_id}/identify` 无需请求体, 当前只将 `ddp_epi_id` 设置为 `1`.
-成功返回 `200` 和 `{"ok":true,"mode":"mock","ddp_epi_id":1}`.
-这不是实际番剧识别, 配置 DandanPlay 地址也不会改变此接口的 mock 行为.
+## 扫描与配置
 
-## 观看进度
-
-`GET /api/files/{file_id}/progress` 返回 `200`:
+`POST /api/media/scan` 不需要请求体. 成功返回:
 
 ```json
-{
-  "pre16mib_md5": "35af6d912b6dffadc112df2ca94bbe2f",
-  "watch_pos": 125.5,
-  "watched_datetime": "2026-10-10T07:00:00.000Z",
-  "audio_stream_index": 1,
-  "subtitle_stream_index": null
-}
+{ "added": 3, "updated": 1, "removed": 2, "total": 40 }
 ```
 
-未保存进度时, `watch_pos` 和 `watched_datetime` 为 `null`.
-该响应还包含文件保存的默认音轨和字幕轨索引, 没有选择的轨道为 `null`.
-`PUT /api/files/{file_id}/progress` 接收 `{"position":125.5}`, 成功返回 `204`, 无响应体.
-位置必须为有限且非负的原视频绝对秒数, 当前此接口不校验是否超过视频时长.
-保存时同时更新 UTC 观看时间. 进度按文件指纹持久化, 不随会话释放或缓存淘汰删除.
+全量扫描重新计算每个媒体的前 16 MiB MD5.
+目录遍历或数据库操作失败会报错, 单文件哈希失败也会在处理后显式报错.
+total 是扫描完成后数据库中的路径数量, 多副本分别计数.
 
-## 配置与扫描
-
-`GET /api/config` 返回 `200` 和 Web 配置, 当前形如 `{"default_dark_mode":true}`.
-不会返回播放资源预算, DandanPlay 配置或完整 `config.json`.
-
-`POST /api/scan` 无需请求体, 等待媒体目录收集及数据库同步完成后返回
-`200` 和 `{"ok":true,"scanned":744}`. `scanned` 是本次扫描得到的文件路径数量,
-同一内容的多个副本分别计数, 不是去重后的指纹数量.
-扫描先读取数据库全部路径及关联文件大小, 与目录列表比对,
-对新路径或大小变化的路径读取前 16 MiB 计算 MD5 并记录大小.
-同地址同大小不重算哈希或写入, 即使内容被同大小文件替换.
-扫描摘要的 `added` 包含新增和大小变化的写入地址数, `removed` 统计删除地址数,
-`total` 统计实际视频地址数; HTTP 响应中的 `scanned` 仍对应 `total`.
-扫描期间每个新增或大小变化的文件立即用独立事务更新数据库.
-单文件数据库写入失败打印地址和错误后继续, 不计入 `added`, 完整遍历后仍清理失效路径.
-目录读取或哈希失败仍返回错误并保留此前成功写入, 不执行失效路径清理.
-完整遍历成功后在一个事务内删除失效路径,
-保留没有现存副本的 `file` 记录及观看进度等业务数据.
-扫描不探测默认轨道, 新文件记录的轨道偏好保存为 `null`.
-
-### 单文件重新扫描
-
-文件列表每行的 `Rescan` 按钮调用 `POST /api/scan/file`, 请求不包含文件指纹:
+`POST /api/media/rescan`:
 
 ```json
 { "path": "/media/series/episode.mkv" }
 ```
 
-`path` 是该行展示副本的完整服务器地址, 必须存在于数据库路径记录中.
-客户端列表以此完整地址为主键, 同指纹的不同地址分别展示并独立维护扫描状态和高亮.
-服务端按地址查询当前指纹, 因此请求不依赖客户端可能过时的 MD5.
-未知地址返回 `404`, 越界, 非视频或不可读取的文件返回 `422`.
-单文件重扫与全目录扫描共用互斥锁, 强制重新读取前 16 MiB 的 MD5 和大小,
-在一个事务中删除原地址关联并写入新关联, 不扫描其他文件.
-成功返回 `200` 和 `{"ok":true,"scanned":1,"pre16mib_md5":"新指纹"}`.
-文件已消失时只删除该路径, 返回 `{"ok":true,"scanned":0,"pre16mib_md5":null}`.
-原指纹的观看进度, 轨道偏好和识别记录仍保留; 新指纹不会继承旧指纹的业务数据.
-重扫后清理相关内存探测结果, 前端刷新列表, 不中断已经创建的播放会话.
-指纹只覆盖前 16 MiB, 此范围之外的改动不会改变身份或自动清除已有 HLS 缓存.
+成功返回 `200` 和最新的 `[path, MediaInfo]`.
+文件已经消失时删除其路径关联并返回 JSON `null`.
+路径必须位于媒体根目录, 不允许父目录跳转或指向目录外的符号链接.
+重扫不终止已创建的播放会话.
 
-## 媒体探测
-
-`GET /api/files/{file_id}/streams` 和 `POST /api/files/{file_id}/probe` 成功均返回
-`200` 和媒体信息:
+`PUT /api/media/configs`:
 
 ```json
 {
-  "duration": 1400.0,
-  "video_tracks": [
-    {
-      "stream_index": 0,
-      "codec_name": "h264",
-      "language": null,
-      "title": null,
-      "is_default": true,
-      "is_forced": false
-    }
-  ],
-  "audio_tracks": [],
-  "subtitle_tracks": []
-}
-```
-
-轨道索引是容器全局流索引, 不是数组下标. 只列出容器内轨道, 不包含外挂字幕,
-字体附件和内部源时间偏移. 示例省略了音轨和字幕轨内容.
-
-`streams` 优先复用内存探测结果, 未缓存时执行 ffprobe.
-失败结果也会缓存, 后续普通查询返回该错误, 不自动重试.
-`probe` 绕过旧结果并重新探测, 无需请求体, 用于显式 Retry probe.
-服务重启会清空探测缓存, 两个接口都不启动播放转码.
-
-## 创建播放会话
-
-默认播放只提交文件 ID, 不需要先读取轨道或历史进度:
-
-```bash
-curl -X POST http://localhost:56080/api/files/FILE_ID/playback
-```
-
-服务端查询文件和 `watch_pos`, 选择第一条视频轨, 默认音轨或第一条音轨,
-以及默认或强制字幕. 没有对应轨道时关闭音轨或字幕.
-距结尾不足 2 秒的历史进度从 0 开始. 响应同时返回媒体信息及实际选择.
-
-换轨可以使用响应中的真实流索引, 并提交当前绝对播放位置:
-
-```bash
-curl -X POST http://localhost:56080/api/files/FILE_ID/playback \
-  -H 'Content-Type: application/json' \
-  -d '{"audio_stream_index":1,"subtitle_stream_index":3,"position":125.5}'
-```
-
-响应:
-
-```json
-{
-  "session_id": "SESSION_ID",
-  "url": "/playback/SESSION_ID/index.m3u8?revision=2",
-  "mime_type": "application/vnd.apple.mpegurl",
-  "start_time": 0.0,
-  "duration": 1400.0,
-  "position": 125.5,
-  "phase": "running",
-  "buffered_until": 0.0,
-  "media": {
-    "duration": 1400.0,
-    "video_tracks": [],
-    "audio_tracks": [],
-    "subtitle_tracks": []
-  },
-  "selection": {
-    "audio": 1,
-    "subtitle": 3
+  "path": "/media/series/episode.mkv",
+  "configs": {
+    "position": 125.5,
+    "video_stream_index": 0,
+    "audio_stream_index": 1,
+    "subtitle_stream_index": null
   }
 }
 ```
 
-`audio_stream_index: null` 表示关闭音轨, `subtitle_stream_index: null` 表示关闭字幕.
-省略轨道字段则使用数据库中保存的偏好, 不同于显式 `null`.
-扫描新文件时默认选中标记为 default 的音轨, 否则选第一条; 默认字幕优先选择 default 或 forced,
-没有匹配字幕则保存 `null`. 播放请求显式指定的轨道选择会覆盖并保存对应偏好,
-因此之后省略该字段时使用最近保存的选择. 某一个字段省略时只沿用该字段偏好, 不会覆盖它.
-客户端不能指定视频索引, 缓存键, 路径或编码配置版本, 未知请求字段会被拒绝.
-`position` 必须有限, 非负且小于视频时长; 省略或 `null` 表示读取数据库进度.
-位置只影响会话目标和下次启动时的线程申请, 不进入播放配置或缓存键.
-示例省略了轨道数组内容. `status` 返回相同的状态字段, 不重复返回 `media` 和 `selection`.
+成功返回 `204`, 未登记路径返回 `404`.
+这是完整替换而不是 PATCH, 未提供的可选配置字段成为 null.
+position 必须为 null 或有限非负秒数, 流索引必须为 null 或非负整数.
+此接口不执行媒体探测, 不检查位置上界或索引是否实际存在,
+实际播放时再对照实时 metadata 校验.
 
-创建成功返回 `200`, 但不表示目标位置已经可播.
-同一播放配置的会话共享活动缓存和生成任务, 创建响应会等待磁盘缓存加载完成,
-不会等待顺序生成追上目标位置.
+创建播放本身不保存偏好或观看进度, 由前端通过此接口显式保存.
+配置共享于同内容的所有路径, 不随 session 释放而删除.
 
-## 会话状态, 保活与目标位置
+`GET /api/config` 返回 `{"default_dark_mode":true}`, 不公开完整运行配置.
 
-`GET /api/playback/{session_id}/status` 返回 `200` 和上例中的会话状态字段,
-不包含 `media` 和 `selection`, 同时刷新存活时间.
-`POST /api/playback/{session_id}/heartbeat` 无需请求体, 刷新存活时间后返回 `204`.
+## 创建播放
 
-等待期间拖动进度条只更新当前会话:
+默认创建只提交路径:
 
 ```bash
-curl -X POST http://localhost:56080/api/playback/SESSION_ID/target \
-  -H 'Content-Type: application/json' -d '{"position":300.5}'
+curl --fail http://localhost:56080/api/playback \
+  -H 'Content-Type: application/json' \
+  -d '{"path":"/media/series/episode.mkv"}'
 ```
 
-`POST /api/playback/{session_id}/target` 接收有限且满足 `0 <= position < duration` 的位置,
-拒绝未知字段, 成功返回 `200` 和最新状态. 只改变会话目标, 不保存观看记录,
-不创建新会话, 不启动跳转位置的独立任务, 也不热调已运行编码器的线程数.
+也可以显式选择三类流:
 
-`phase` 是缓存文件夹的当前状态: `loading` 正在恢复磁盘缓存, `ready` 表示缓存不完整且空闲,
-`running` 表示正在生成或排队, `stopping` 表示正在安全停止, `complete` 表示缓存已完整验证,
-`failed` 表示恢复或生成失败. 状态响应不包含内部错误详情或编码线程数.
-首次激活先登记唯一活动元素再校验磁盘, 创建响应等待加载结果, 不把完整缓存误报为新空缓存.
-尚未返回 ID 的创建预留使用 `max(idle_timeout_seconds, 120)` 秒宽限,
-防止等待清理时提前过期, 也避免被中断的创建请求永久占用名额.
+```json
+{
+  "path": "/media/series/episode.mkv",
+  "video_stream_index": 0,
+  "audio_stream_index": 1,
+  "subtitle_stream_index": null
+}
+```
 
-前端在 `loading`, `running`, `stopping` 阶段每秒轮询状态,
-在 `ready`, `complete`, `failed` 阶段每 10 秒查询状态保活; 媒体请求也延长会话有效期.
-`buffered_until` 是从时间 0 开始已经生成的范围终点, 不是浏览器本地缓冲长度.
-目标必须满足 `target < buffered_until`; 相等仍需等待. 已发布前缀可以在后续生成失败后继续播放,
-未覆盖位置等待期间若失败则使用通用无进展超时报错, 不暴露底层错误详情.
-最后一个租约释放或过期后, 停止任务并从活动集合移除, 磁盘缓存保留到 LRU 淘汰.
+视频字段缺省或 null 时使用保存的视频偏好, 没有偏好时选择首条视频流.
+音频和字幕字段区分缺省与显式 null.
+缺省先使用非空保存偏好, 音频再选择默认流或第一条流,
+字幕再选择默认或强制字幕. 显式 null 始终关闭对应流.
+没有适用的音频或字幕时关闭.
+已保存的 null 不区分未选择和关闭, 因此前端恢复关闭偏好时显式发送 null.
+非法索引返回 `400`, 不静默替换为其他流.
 
-## 释放会话与媒体资源
+服务端在播放前重新计算媒体身份并探测 metadata, 不依赖陈旧的客户端列表.
+成功返回 `200`:
 
-`DELETE /api/playback/{session_id}` 返回 `204`, 无响应体.
-释放操作幂等, 不存在或已经释放的会话也返回成功.
-最后一个租约离开会触发后台停止, HTTP 响应不等待编码器完成最后一个分片.
-释放租约不会立即删除磁盘缓存, 也不会删除观看记录.
+```json
+{
+  "session_id": "9eb364b42c594741aa0c83a907d93d18",
+  "url": "/playback/9eb364b42c594741aa0c83a907d93d18/index.m3u8",
+  "cache": { "phase": "loading", "buffered_until": 0.0 },
+  "media": {
+    "metadata": {
+      "duration": 1400.0,
+      "format": "matroska,webm",
+      "video_streams": [],
+      "audio_streams": [],
+      "subtitle_streams": []
+    },
+    "configs": {
+      "position": 125.5,
+      "video_stream_index": 0,
+      "audio_stream_index": 1,
+      "subtitle_stream_index": null
+    }
+  },
+  "video_stream_index": 0,
+  "audio_stream_index": 1,
+  "subtitle_stream_index": null
+}
+```
 
-`GET /playback/{session_id}/{asset_name}` 只允许有效会话读取已发布资源:
+示例省略了 metadata 中的实际流数组内容.
+返回时缓存可能为 loading, ready, running 或 completed,
+不等待恢复或编码完成. session_id 是不透明映射, 与媒体和缓存标识无关.
+不同 session 可以共享同一个缓存实例, 每个会话仍有独立 URL.
 
-| 资源                                | MIME 类型                       |
-| ----------------------------------- | ------------------------------- |
-| `index.m3u8`                        | `application/vnd.apple.mpegurl` |
-| `init.mp4`                          | `video/mp4`                     |
-| `segment_000000.m4s` 等六位编号分片 | `video/iso.segment`             |
+PlaybackQuery 不包含 position. 前端从 media.configs.position 或本地用户操作确定目标,
+接近片尾的历史进度在前端从头播放. start_time, duration 和 selection
+不再作为旧会话状态字段返回, duration 位于 media.metadata 中.
 
-成功通常返回 `200`, Range 请求可返回 `206`. 底层使用 `ServeFile` 传输资源.
-资源接口不接受 variant-key, 不提供源视频直放, 字幕下载或私有工作目录访问.
-至少发布一个有效分片后才开放清单和 init, 分片索引必须落在已发布范围内.
-响应设置 `Cache-Control: no-store` 和 `X-Content-Type-Options: nosniff`,
-避免 HTTP 缓存掩盖 event 清单增长或会话失效.
+## 状态与等待
 
-## 存活检查与静态前端
+`GET /api/playback/{session_id}` 返回 `200`:
 
-`GET /health` 在 `backend/src/main.rs` 额外注册, 返回 `200` 和 `{"status":"ok"}`.
-只检查 HTTP 服务存活, 不执行媒体探测, 转码或缓存容量统计.
-未匹配的路径交给 `/app/web` 静态文件服务, 目录默认尝试 `index.html`,
-用于提供前端页面和资源, 不是业务 API.
+```json
+{ "phase": "running", "buffered_until": 128.0 }
+```
 
-## 错误响应
+只返回上述两个字段, 不包含媒体目录, 缓存键, session_id, 目标位置或心跳时间.
 
-业务处理函数生成的错误通常为 `{"error":"具体原因"}`.
-Axum 的 JSON 提取错误或静态文件服务错误可能使用框架自身的响应格式.
+| phase     | 含义                                 |
+| --------- | ------------------------------------ |
+| loading   | 正在恢复磁盘内容                     |
+| ready     | 已恢复的未完成实例, 可启动生成       |
+| running   | 正在等待预算或生成并验证分片         |
+| stopping  | 正在取消并回收写入任务               |
+| completed | 已生成到媒体结束并验证               |
+| failed    | 恢复或生成失败, 下次创建播放时可重试 |
 
-| 状态码 | 主要情况                                                                   |
-| ------ | -------------------------------------------------------------------------- |
-| `400`  | 播放请求 JSON 或字段无效, 轨道不存在, 目标位置越界, 保存进度为负或非有限值 |
-| `404`  | 文件记录不存在, 源媒体没有可用路径, 会话不存在或过期, 播放资源不可用       |
-| `422`  | 播放接口媒体探测失败, 包括复用已缓存的探测错误                             |
-| `500`  | 数据库或扫描失败, 会话创建或释放失败, 资源读取等内部错误                   |
+buffered_until 是从零开始的连续发布前缀终点, 不是浏览器下载缓冲.
+只有 `position < buffered_until` 才能播放, 等于终点时仍需等待.
+前端等待期间约每 500 ms 查询, 正常未完成阶段约每秒刷新,
+completed 不需要心跳或持续轮询.
+180 秒没有阶段或生成进度变化时报告等待失败, 不是固定总等待时限.
 
-错误类型取决于接口中的映射, 不保证每个底层错误都有独立状态码.
-异步字幕准备或编码失败会反映为状态中的 `phase: "failed"`, 不表示该 HTTP 状态查询本身失败.
-状态不返回底层错误详情. 已发布前缀仍可服务, 未覆盖目标等待无进展超时后需要手动 Retry.
+已验证前缀在后续生成失败后仍可播放.
+failed 且目标未覆盖时前端立即显示错误并释放映射,
+由用户手动重试, 不自动创建新 session.
+
+## 释放与媒体资源
+
+`DELETE /api/playback/{session_id}` 幂等返回 `204`.
+只删除映射, 不停止共享缓存生成, 不清理磁盘缓存或观看记录.
+会话无空闲过期机制, 未送达 DELETE 的映射保留到显式释放或服务重启.
+
+`GET /playback/{session_id}/{asset_name}`:
+
+| 资源                              | Content-Type                  |
+| --------------------------------- | ----------------------------- |
+| index.m3u8                        | application/vnd.apple.mpegurl |
+| init.mp4                          | video/mp4                     |
+| segment_000000.m4s 等六位编号分片 | video/iso.segment             |
+
+至少发布一个有效分片后才开放清单和 init.
+资源必须存在于正式清单, 不可读取 instance.json, complete 或私有工作文件.
+支持 Range, 成功返回 `200` 或 `206`.
+响应设置 `Cache-Control: no-store` 和 `X-Content-Type-Options: nosniff`.
+释放后的 session 不能读取状态或资源.
+
+## 错误与健康检查
+
+业务错误记录日志并返回 `{"error":"具体原因"}`.
+异步生成失败通过 phase 表达, 详细 FFmpeg 诊断位于服务日志.
+
+| 状态码 | 主要情况                                                       |
+| ------ | -------------------------------------------------------------- |
+| 400    | JSON 或字段无效, 路径形状不合法, 流选择不存在, 配置数值非法    |
+| 404    | 媒体路径未登记或已消失, session 不存在, 资源尚不可用或禁止访问 |
+| 422    | 媒体无法读取或探测, 单路径扫描失败                             |
+| 500    | 数据库, 全量扫描, 缓存或其他内部操作失败                       |
+
+`GET /health` 返回 `{"status":"ok"}`, 不扫描或探测媒体.
+其他路径交给 `/app/web` 的静态文件服务.

@@ -1,201 +1,164 @@
 
 // backend/src/models.rs
-//! 定义数据库记录和接口数据结构.
+//! 定义媒体索引, 播放请求响应和稳定缓存身份.
+
+use std::path::{Path, PathBuf};
+
+use anyhow::{ensure, Result};
+use md5::{Digest, Md5};
+use serde::{Deserialize, Serialize};
+
+use crate::{cache::HandleSnapshot, constants::HASH_LIMIT, utils};
 
 mod media;
 
-use std::path::{Path, PathBuf};
-use serde::{Deserialize, Deserializer, Serialize};
-use crate::{constants::HASH_LIMIT, sessions::SessionStatus, utils};
-pub(crate) use media::{Attachment, MediaInfo, PlaybackVariantConfig, Track};
-use anyhow::{Context, Result};
+#[cfg(test)]
+#[path = "tests/models.rs"]
+mod tests;
 
-#[derive(Debug, Serialize, sqlx::FromRow)]
-pub(crate) struct VideoFile {
-    pub(crate) pre16mib_md5: String,
-    pub(crate) name: String,
-    pub(crate) size: i64,
-    pub(crate) audio_stream_index: Option<i32>,
-    pub(crate) subtitle_stream_index: Option<i32>,
-    pub(crate) ddp_epi_id: Option<i64>,
-    danmaku_offset: f64,
-    pub(crate) watch_pos: Option<f64>,
-    watched_datetime: Option<String>,
+pub(crate) use media::{Attachment, MediaConfigs, MediaInfo, MediaMetadata, StreamInfo};
+
+/// 保存内容标识对应的共享播放配置.
+#[derive(Debug, sqlx::FromRow)]
+pub(crate) struct FileRecord {
+    /// 媒体内容主键.
+    pub(crate) media_id: String,
+    /// 同内容的所有路径共享的播放配置.
+    #[sqlx(flatten)]
+    pub(crate) configs: MediaConfigs,
+}
+
+/// 保存数据库中的媒体路径关联.
+#[derive(Debug, sqlx::FromRow)]
+pub(crate) struct PathRecord {
+    /// 路径对应的媒体内容标识.
+    pub(crate) media_id: String,
+    /// 容器内媒体绝对路径.
     pub(crate) path: String,
 }
 
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct ProgressInput {
-    pub(crate) position: f64,
+/// 保存媒体列表所需的路径和共享配置.
+#[derive(Debug)]
+pub(crate) struct PathConfigs {
+    /// 容器内媒体绝对路径.
+    pub(crate) path: PathBuf,
+    /// 该路径当前关联的共享播放配置.
+    pub(crate) configs: MediaConfigs,
 }
 
-/// 进度按文件指纹保存原视频绝对秒数, 跨路径副本和不同播放配置复用.
-#[derive(Debug, Serialize, sqlx::FromRow)]
-pub(crate) struct WatchProgress {
-    pre16mib_md5: String,
-    pub(crate) watch_pos: Option<f64>,
-    watched_datetime: Option<String>,
-    pub(crate) audio_stream_index: Option<i32>,
-    pub(crate) subtitle_stream_index: Option<i32>,
-}
-
-
-// 数据库操作对象
-
-/// 扫描文件夹得到的文件实例
+/// 保存一次文件扫描得到的内容身份.
 #[derive(Debug)]
 pub(crate) struct ScannedFile {
-    pre16mib_md5: String,
-    size: i64,
-    path: PathBuf, // 绝对地址
+    /// 文件前 16 MiB 的 MD5 内容标识.
+    pub(crate) media_id: String,
+    /// 已通过媒体目录边界检查的绝对路径.
+    pub(crate) path: PathBuf,
 }
 
 impl ScannedFile {
-
-    pub(crate) fn new(path: &Path) -> Result<Self, String> {
-        // 地址始终为完整绝对文件地址, 不规范化符号链接以保留原路径身份.
-        if !path.is_absolute() || path.to_str().is_none()
-            || path.components().any(|part| matches!(part, std::path::Component::ParentDir))
-        {
-            return Err(format!("invalid absolute file path: {}", path.display()));
-        }
-        let metadata = std::fs::metadata(path).map_err(|e| e.to_string())?;
-        if !metadata.is_file() { return Err(format!("not a file: {}", path.display())); }
-        let path_buf = path.to_path_buf();
-        let hash = utils::md5_hash_prefix(&path_buf, HASH_LIMIT)?;
-        Ok(Self {
-            pre16mib_md5: hash,
-            size: metadata.len() as i64,
-            path: path_buf,
-        })
+    /// 读取媒体文件前缀并计算内容标识, 由扫描器放入阻塞任务执行.
+    pub(crate) fn new(path: &Path) -> Result<Self> {
+        ensure!(path.is_absolute() && path.to_str().is_some()
+            && !path.components().any(|part| matches!(part, std::path::Component::ParentDir)),
+            "invalid absolute media path: {}", path.display());
+        ensure!(std::fs::metadata(path)?.is_file(), "not a media file: {}", path.display());
+        let media_id = utils::md5_hash_prefix(path, HASH_LIMIT).map_err(anyhow::Error::msg)?;
+        Ok(Self { media_id, path: path.to_owned() })
     }
-
-    // getters
-    pub(crate) fn pre16mib_md5      (&self) -> &str { &self.pre16mib_md5 }
-    pub(crate) fn size              (&self) -> i64 { self.size }
-    pub(crate) fn path              (&self) -> &PathBuf { &self.path }
 }
 
-
+/// 汇总一次全量扫描对媒体索引的变更.
+#[derive(Debug, Default, Serialize)]
 pub(crate) struct ScanChanges {
+    /// 新增路径数量.
     pub(crate) added: u64,
+    /// 内容身份发生变化的路径数量.
+    pub(crate) updated: u64,
+    /// 已移除的失效路径数量.
     pub(crate) removed: u64,
-    pub(crate) total: u64, // 所有现存视频路径数
+    /// 扫描完成后的索引路径总数.
+    pub(crate) total: u64,
 }
 
-
-// ========================================================================== //
-
-/// 客户端选轨和位置请求, 不接受客户端提供的完整编码配置.
-///
-/// 轨道字段缺省表示使用数据库偏好或服务端默认选择, 显式 null 表示关闭.
-/// `with_preferences` 补充缺省轨道, `with_saved_position` 保存数据库进度.
-/// 位置字段由反序列化读取, 最终合法性由播放配置构造流程检查.
-#[derive(Debug, Default, Deserialize)]
+/// 按媒体路径请求播放, 不向后端传递等待位置或编码参数.
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct PlaybackRequest {
-    // 缺省表示服务端选轨, 显式 null 表示关闭, 两者不能混为一谈.
+pub(crate) struct PlaybackQuery {
+    /// 要播放的容器内媒体路径.
+    pub(crate) path: PathBuf,
+    /// 请求的视频全局流索引, 缺省时使用配置或首条视频流.
+    pub(crate) video_stream_index: Option<i32>,
+    /// 请求的音频索引, 缺省继承偏好, 显式 null 关闭音频.
     #[serde(default, deserialize_with = "track_choice")]
     pub(crate) audio_stream_index: Option<Option<i32>>,
+    /// 请求的字幕索引, 缺省继承偏好, 显式 null 关闭字幕.
     #[serde(default, deserialize_with = "track_choice")]
     pub(crate) subtitle_stream_index: Option<Option<i32>>,
-    pub(crate) position: Option<f64>,
-    #[serde(skip)]
-    saved_position: Option<f64>,
 }
 
-/// 创建播放会话的响应, 包含状态快照, 媒体信息和实际选中的轨道.
-///
-/// 状态字段通过 Serde flatten 展开, 不向客户端返回缓存键或执行参数.
-impl PlaybackRequest {
-    /// 仅将缺省字段补为数据库偏好, 显式 null 仍表示本次关闭对应轨道.
-    pub(crate) fn with_preferences(mut self, audio: Option<i32>, subtitle: Option<i32>) -> Self {
-        if self.audio_stream_index.is_none() { self.audio_stream_index = Some(audio); }
-        if self.subtitle_stream_index.is_none() { self.subtitle_stream_index = Some(subtitle); }
-        self
-    }
-
-    /// 合并数据库中的历史进度, 不覆盖请求显式提供的播放位置.
-    pub(crate) fn with_saved_position(mut self, position: Option<f64>) -> Self {
-        self.saved_position = position;
-        self
-    }
-
-    pub(crate) fn saved_position(&self) -> Option<f64> {
-        self.saved_position
-    }
-}
-
-// 为显式 null 保留外层 Some, 与未提供字段时的 None 区分.
-fn track_choice<'de, D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Option<Option<i32>>, D::Error> {
-    Option::<i32>::deserialize(deserializer).map(Some)
-}
-
-/// 播放响应中的实际音轨和字幕选择, 仅通过序列化向客户端提供.
-#[derive(Debug, Serialize)]
-struct Selection {
-    audio: Option<i32>,
-    subtitle: Option<i32>,
-}
-
-/// 创建播放会话的响应, 包含展开的状态快照, 媒体信息和实际轨道选择.
+/// 返回新播放映射, 初始缓存状态和实际媒体选择.
 #[derive(Debug, Serialize)]
 pub(crate) struct PlaybackStart {
-    #[serde(flatten)]
-    // 会话状态快照.
-    session: SessionStatus,
-    // 媒体信息, 播放开始时间等.
-    media: MediaInfo,
-    // 实际音轨和字幕选择.
-    selection: Selection,
+    /// 客户端持有的不透明播放会话标识.
+    pub(crate) session_id: String,
+    /// 该会话的同源 HLS 清单地址.
+    pub(crate) url: String,
+    /// 不包含内部缓存目录的初始状态快照.
+    pub(crate) cache: HandleSnapshot,
+    /// 当前路径重新探测的元数据和共享配置.
+    pub(crate) media: MediaInfo,
+    /// 服务端确认的视频流索引.
+    pub(crate) video_stream_index: i32,
+    /// 服务端确认的可选音频流索引.
+    pub(crate) audio_stream_index: Option<i32>,
+    /// 服务端确认的可选字幕流索引.
+    pub(crate) subtitle_stream_index: Option<i32>,
 }
 
-impl PlaybackStart {
-    /// 组装播放响应, 保持响应字段私有及原有 JSON 结构.
-    pub(crate) fn new(session: SessionStatus, media: MediaInfo, audio: Option<i32>, subtitle: Option<i32>) -> Self {
-        Self { session, media, selection: Selection { audio, subtitle } }
+/// 以固定字段顺序定义缓存身份和 instance.json 的唯一格式.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CacheSpec {
+    /// 源媒体前 16 MiB 的 MD5 标识.
+    pub(crate) media_id: String,
+    /// 实际使用的视频流索引.
+    pub(crate) video_stream_index: i32,
+    /// 实际使用的可选音频流索引.
+    pub(crate) audio_stream_index: Option<i32>,
+    /// 实际使用的可选字幕流索引.
+    pub(crate) subtitle_stream_index: Option<i32>,
+    /// 缓存和编码契约版本.
+    pub(crate) version: String,
+}
+
+impl CacheSpec {
+    /// 根据已验证的媒体身份和流选择构造缓存描述.
+    pub(crate) fn new(
+        media_id: String, video_stream_index: i32, audio_stream_index: Option<i32>,
+        subtitle_stream_index: Option<i32>, version: String,
+    ) -> Self {
+        Self { media_id, video_stream_index, audio_stream_index, subtitle_stream_index, version }
+    }
+
+    /// 从磁盘实例描述恢复稳定身份, 不依赖源路径仍然存在.
+    pub(crate) fn from_descriptor(bytes: &[u8]) -> Result<Self, serde_json::Error> {
+        serde_json::from_slice(bytes)
+    }
+
+    /// 对固定顺序且保留显式 null 的身份 JSON 计算 MD5.
+    pub(crate) fn handle_id(&self) -> Result<String, serde_json::Error> {
+        Ok(format!("{:x}", Md5::digest(self.descriptor()?)))
+    }
+
+    /// 序列化全部身份字段, 不包含路径, 会话, 位置或线程数.
+    pub(crate) fn descriptor(&self) -> Result<Vec<u8>, serde_json::Error> {
+        serde_json::to_vec(self)
     }
 }
 
-
-/// 服务端构造的单次播放执行参数.
-///
-/// 单次任务的执行参数, 只有 config 参与缓存身份计算, 其余字段用于媒体处理和调度.
-#[derive(Clone)]
-pub(crate) struct EncodeSpec {
-    pub(crate) config: PlaybackVariantConfig,
-    pub(super) source: PathBuf,
-    pub(crate) duration: f64,
-    // 容器时间轴原点可能为负数, 视频, 音频和字幕都要按同一原点归零.
-    pub(super) source_start: f64,
-    pub(super) info: MediaInfo,
-    pub(crate) subtitle: Option<Track>,
-    pub(super) hdr: bool,
+/// 区分 JSON 中未提供轨道字段与显式 null.
+fn track_choice<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Option<i32>>, D::Error> {
+    Option::<i32>::deserialize(deserializer).map(Some)
 }
-
-impl EncodeSpec {
-    pub(crate) fn from_config(config: PlaybackVariantConfig, source: PathBuf, info: MediaInfo) -> Result<Self> {
-        let video = info.video_tracks.iter().find(|track| track.stream_index == config.video_stream())
-            .context("configured video track does not exist")?;
-        {
-            let tracks: &[Track] = &info.audio_tracks;
-            let index = config.audio_stream();
-            let kind: &str = "audio";
-            index.map(|index| tracks.iter().find(|track| track.stream_index == index).cloned()
-                .with_context(|| format!("selected {kind} track does not exist"))).transpose()
-        }?;
-        let subtitle = {
-            let tracks: &[Track] = &info.subtitle_tracks;
-            let index = config.selection().1;
-            let kind: &str = "subtitle";
-            index.map(|index| tracks.iter().find(|track| track.stream_index == index).cloned()
-                .with_context(|| format!("selected {kind} track does not exist"))).transpose()
-        }?;
-        Ok(Self {
-            config, source, duration: info.duration, source_start: info.start_time,
-            hdr: video.is_hdr(), info, subtitle,
-        })
-    }
-}
-

@@ -1,148 +1,87 @@
 
 // backend/src/main.rs
-//! 启动 Web 服务并组装应用依赖.
+//! 启动全局管理器, 后台扫描和同源 HTTP 服务.
 
-use std::{net::SocketAddr, path::Path, sync::Arc};
-use tracing::error;
+use std::{net::SocketAddr, path::Path, time::Duration};
 
 use anyhow::Result;
 use axum::{routing::get, Json};
-use sqlx::SqlitePool;
-use tokio::{net::TcpListener, signal::unix::SignalKind};
+use tokio::{net::TcpListener, signal::unix::SignalKind, sync::watch};
 use tower_http::{services::ServeDir, trace::TraceLayer};
-
-mod api;
-mod config;
-mod db;
-mod process;
-mod cache;
-mod utils;
-mod constants;
-mod models;
-mod scanner;
-mod sessions;
-
-use config::AppConfig;
-use cache::CacheManager;
-use process::ProcessManager;
-use sessions::SessionManager;
-
-use tokio::time::{sleep, Duration};
 use tracing::{info, warn};
 
-use crate::models::ScanChanges;
+mod api;
+mod cache;
+mod config;
+mod constants;
+mod db;
+mod models;
+mod process;
+mod scanner;
+mod services;
+mod utils;
 
-#[derive(Clone)]
-/// 应用状态
-struct AppState {
-    db: SqlitePool, // 根模块私有字段仍可供其子模块访问.
-    config: Arc<AppConfig>, // 应用配置
-    scan_lock: Arc<tokio::sync::Mutex<()>>, // 扫描锁, 防止同时进行多个扫描任务
+#[cfg(test)]
+#[path = "tests/fixtures/runtime.rs"]
+mod testing;
 
-    session_manager: SessionManager, // 播放会话管理
-    cache_manager: CacheManager, // 媒体元数据和播放缓存
-    #[allow(dead_code)] // 预留给 API 读取 ProcessUsage 资源快照
-    process_manager: ProcessManager, // 媒体子进程与执行资源管理
-}
-
-
+/// 初始化唯一实例并在 HTTP 停止后依次回收后台任务和持久资源.
 #[tokio::main]
 async fn main() -> Result<()> {
-
-    println!("Anime Server v{} Starting...", env!("CARGO_PKG_VERSION"));
-
-    // 容器探针只检查已有 HTTP 服务, 不重新初始化数据库或争抢缓存独占锁.
     if std::env::args().any(|arg| arg == "--healthcheck") { return utils::http_check(); }
-    // 初始化 Rust 程序的日志系统, 设置日志过滤规则, 并将日志输出到终端
     tracing_subscriber::fmt().with_env_filter("anime_server=info,tower_http=info").init();
-
-    // 加载配置
     let config_path = std::env::var("ANIME_SERVER_CONFIG").unwrap_or_else(|_| "/config/config.json".to_string());
-    let config = AppConfig::load(Path::new(&config_path))?;
-    info!("loaded config from {}", config_path);
-
-    // 创建数据目录和缓存目录, 并检查 FFmpeg 等工具是否可用
-    std::fs::create_dir_all(constants::DATA_DIR)?;
-    std::fs::create_dir_all(constants::DDP_ANI_CACHE_DIR)?;
-    std::fs::create_dir_all(constants::DDP_DANMAKU_CACHE_DIR)?;
-    match utils::check_tools().await {
-        Ok(_) => (),
-        Err(e) => {
-            error!("tools check failed: {:#}", e);
-            error!("ffmpeg and ffprobe are required for media processing, please install them and ensure they are in the PATH");
-        },
-    }
-    info!("tools check passed, ffmpeg and ffprobe are available");
-
-
-    // 探测, 资源准备, 编码和解码校验共用进程预算, 防止不同模块各自突破全局上限.
-    let processes = ProcessManager::new(config.playback.max_processes, config.playback.max_total_ffmpeg_threads);
-    let database = db::initialize_database().await?;
-    let cache = CacheManager::new(constants::CACHE_DIR.into(), config.playback.clone(), database.clone(), processes.clone()).await?;
-
-    info!("cache manager initialized at {}", constants::CACHE_DIR);
-
-    let playback = SessionManager::new(config.playback.idle_timeout_seconds);
-
-    let state = AppState {
-        db: database,
-        config: Arc::new(config),
-        session_manager: playback.clone(),
-        cache_manager: cache.clone(),
-        process_manager: processes.clone(),
-        scan_lock: Arc::new(tokio::sync::Mutex::new(())),
-    };
-
-    // 启动后台扫描任务, 定期扫描视频目录并更新数据库索引.
-    let s = state.clone();
-    tokio::spawn(async move {
-        loop {
-            match scanner::scan_root(&s).await {
-                Ok(ScanChanges { added, removed, total }) => 
-                info!("video scan completed: {} files, {} added, {} removed", 
-                total, added, removed),
-                Err(e) => warn!("video scan failed: {}", e),
-            }
-            sleep(Duration::from_secs(s.config.scan_interval_seconds)).await;
-        }
-    });
-    state.session_manager.spawn_expiration(cache.clone()); // 定期回收失去联系的播放会话并维护磁盘缓存.
-    info!("background tasks started: video scan and playback session expiration");
-
-    // API 和前端静态文件由同一端口提供, 浏览器通过同源相对 URL 访问服务.
-    let app = api::router(state)
-    .route("/health", get(|| async { Json(serde_json::json!({"status": "ok"})) }))
-
-    // 前端静态文件服务: /app/web
-    .fallback_service(ServeDir::new("/app/web").append_index_html_on_directories(true))
-    .layer(TraceLayer::new_for_http());
+    services::initialize(Path::new(&config_path)).await?;
+    let (stop, receiver) = watch::channel(false);
+    let scanning = tokio::spawn(scan_periodically(receiver));
+    let app = api::router()
+        .route("/health", get(health))
+        .fallback_service(ServeDir::new("/app/web").append_index_html_on_directories(true))
+        .layer(TraceLayer::new_for_http());
     let addr: SocketAddr = "0.0.0.0:8080".parse()?;
     let listener = TcpListener::bind(addr).await?;
-
-    info!("Anime Server listening on http://{}", addr);
-
-    // 启动 HTTP 服务, 并在收到 SIGTERM 或 Ctrl+C 信号时优雅关闭, 等待子进程退出.
-    axum::serve(listener, app).with_graceful_shutdown(async move {
-
-        // 安装 SIGTERM 信号处理器
-        let mut terminate = tokio::signal::unix::signal(SignalKind::terminate()).expect("cannot install SIGTERM handler");
-
-        // 等待 SIGTERM 或 Ctrl+C 信号
-        tokio::select! {
-            result = tokio::signal::ctrl_c() => {
-                if let Err(error) = result { tracing::error!("signal handler failed: {error}"); }
-            },
-            _ = terminate.recv() => {},
-        }
-
-        // 等待分片边界落盘并回收子进程, 不依赖容器强制终止来结束转码.
-        playback.shutdown().await;
-        if let Err(error) = cache.shutdown().await {
-            tracing::error!("playback cache shutdown failed: {error:#}");
-        }
-    }).await?;
-
+    info!("Anime Server listening on http://{addr}");
+    let server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await;
+    // 先等待 HTTP 完全停止, 避免清理缓存时仍有请求创建新的写入任务.
+    stop.send_replace(true);
+    scanning.await?;
+    services::sessions().shutdown().await;
+    let caches = services::cache().shutdown().await;
+    services::database().shutdown().await;
+    server?;
+    caches?;
     info!("Anime Server exited gracefully");
-
     Ok(())
+}
+
+/// 返回不重新初始化任何管理器的健康状态.
+async fn health() -> Json<serde_json::Value> {
+    Json(serde_json::json!({"status": "ok"}))
+}
+
+/// 周期性同步媒体索引, 关闭时不再启动下一次扫描.
+async fn scan_periodically(mut stop: watch::Receiver<bool>) {
+    loop {
+        if *stop.borrow() { return; }
+        match services::scanner().scan_all(services::database()).await {
+            Ok(changes) => info!(total = changes.total, added = changes.added,
+                updated = changes.updated, removed = changes.removed, "media scan completed"),
+            Err(error) => warn!("media scan failed: {error:#}"),
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(services::config().scan_interval_seconds)) => {},
+            _ = stop.changed() => return,
+        }
+    }
+}
+
+/// 将 SIGTERM 或 Ctrl+C 转为 Axum 的停止接收信号.
+async fn shutdown_signal() {
+    let mut terminate = tokio::signal::unix::signal(SignalKind::terminate()).expect("cannot install SIGTERM handler");
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => {
+            if let Err(error) = result { tracing::error!("signal handler failed: {error}"); }
+        },
+        _ = terminate.recv() => {},
+    }
 }

@@ -1,100 +1,23 @@
-# 开发, 调试, 编译与部署
+# 开发, 部署与验证
 
-## 技术与目录
+## 环境与约定
 
-| 部分     | 技术                                   |
-| -------- | -------------------------------------- |
-| 后端     | Rust, Axum, Tokio, SQLx                |
-| 前端     | TypeScript, Vite, 原生 video, HLS.js   |
-| 媒体处理 | FFmpeg, ffprobe, libass, Noto CJK 字体 |
-| 数据库   | SQLite                                 |
-| 部署     | 单个 Docker 容器, Docker Compose       |
+后端使用 Rust, Tokio, Axum 和 SQLx, 前端使用 TypeScript, Vite 和 HLS.js.
+完整播放需要 FFmpeg, ffprobe, libass, libx264, AAC, HDR 转换滤镜和 Noto CJK 字体.
+Dockerfile 会检查和安装运行依赖, 启动缺少必要能力时明确失败, 不降级输出.
 
-根目录 `Cargo.toml` 定义 workspace, `backend/Cargo.toml` 定义后端 crate.
-后端入口是 `backend/src/main.rs`. `api.rs`, `db.rs`, `cache.rs`, `process.rs`
-声明各自同名目录下的子模块, 不使用 `mod.rs`.
-数据库初始化文件是 `backend/sql/init.sql`.
-六个核心模块 (API, Scanner, DB, SessionManager, CacheManager, Process) 的职责和调用白名单
-见 [architecture.md](architecture.md).
+根目录 Cargo.toml 定义 workspace, backend/Cargo.toml 定义二进制 crate.
+源码职责与数据流见 [architecture.md](architecture.md).
+不运行格式化工具, 不在未经确认时升级项目依赖.
+构建使用 Cargo.lock 和 frontend/package-lock.json 锁定版本.
 
-Rust 类型, 字段, 函数和模块默认私有. 仅供父模块内部共享的接口使用
-`pub(super)`, 必须跨模块使用的接口最高为 `pub(crate)`, 不使用无限制的 `pub`.
-Serde 序列化和反序列化不依赖字段公开, 不为接口响应字段额外扩大可见性.
-源文件中 crate 内可见的类型和方法写在前面, 私有辅助函数写在后面.
+源文件以空行, 相对路径注释和功能注释开头.
+新增类型, 字段和函数使用简短中文说明, 注释不用全角标点.
+公开接口在前, 私有辅助逻辑在后, 可见性限制为必要的 pub(crate) 或 pub(super).
 
-`process.rs` 是媒体进程模块入口, 提供 ProcessManager 并统一管理 FFmpeg/ffprobe 调用,
-子进程许可, 编码线程预算, 取消, 超时和子进程回收. 私有子模块 `process/ffmpeg.rs`
-负责命令构造, HLS 读写, 缓存媒体恢复和解码校验; `process/assets.rs` 管理临时字幕和字体;
-`process/fragment.rs` 校验 fMP4 分片并归一化时间轴; `process/models.rs` 保存 EncodeSpec.
-外部代码只使用 `crate::process::{...}` 的重导出接口, 不导入其私有子模块.
-`ProcessManager::usage` 返回 process slots, encoder slots 和 thread permits 的只读快照,
-预留给 API 资源监视, 当前不提供 HTTP 路由.
+## 四目录部署
 
-`cache.rs` 是 crate 层的缓存入口, 提供 CacheManager 和 CacheSnapshot.
-活动缓存共享, 生成生命周期和淘汰编排由入口管理. 私有 `cache/metadata.rs`
-负责 ffprobe 探测, 成功元数据缓存及过期清理; 私有 `cache/disk.rs`
-负责磁盘占用统计和目录访问时间持久化. CacheManager 通过 `crate::process`
-调用媒体执行能力, 并使用自己的 JoinSet 管理 load/generate Tokio worker.
-ProcessManager 只管理外部媒体进程, 两类 worker 生命周期不合并.
-
-`sessions.rs` 保留在 crate 层, 提供 SessionManager 和 SessionStatus,
-负责播放目标位置计算, 心跳和共享缓存租约. SessionManager 不持有 CacheManager,
-由 API 显式传入 `&CacheManager`.
-
-### 单元测试布局
-
-后端是二进制 crate, 单元测试需要访问模块私有项, 因此仍作为被测模块的子模块编译,
-但源文件统一集中在 `backend/src/tests/`, 目录结构与业务模块路径对应.
-业务文件只保留带 `#[path]` 的声明, 例如 `sessions.rs` 中:
-
-```rust
-#[cfg(test)]
-#[path = "tests/sessions.rs"]
-mod tests;
-```
-
-子目录模块的路径相对业务文件所在目录, 如 `process/ffmpeg.rs` 使用 `../tests/process/ffmpeg.rs`.
-业务文件中不得出现其他 `#[cfg(test)]` 函数或被注释的测试.
-
-- 测试文件: `tests/config.rs`, `tests/models.rs`, `tests/scanner.rs`, `tests/sessions.rs`,
-  `tests/db/repository.rs`, `tests/cache.rs`, `tests/cache/metadata.rs`,
-  `tests/process.rs`, `tests/process/ffmpeg.rs`, `tests/process/fragment.rs`.
-- 共享夹具: `tests/fixtures/process.rs` 作为 `process::testing` 加载, 提供测试媒体信息,
-  播放请求和已发布分片样本; `tests/fixtures/cache.rs` 作为 `cache::testing` 加载,
-  提供临时缓存目录, 内存数据库及预置元数据的 CacheManager, 测试不会调用 ffprobe.
-  两者仅在测试构建时加载.
-- 测试文件内测试函数在上, 私有辅助函数在下, 每个测试附中文注释说明验证意图.
-
-播放请求 `PlaybackRequest` 和创建响应 `PlaybackStart` 定义在 `models.rs`.
-请求选轨的缺省/null 区分及响应 flatten 结构不变.
-
-前端入口是 `frontend/src/main.ts`, 构建结果位于 `frontend/dist/`.
-后端从容器内 `/app/web` 提供静态文件, 前后端使用同源 HTTP 接口通信.
-
-## 环境准备
-
-完整运行推荐使用 Docker Compose. 本地编译还需要 Rust stable, Node.js 22.12 或更新的兼容版本,
-npm. 生成测试媒体需要本机安装 FFmpeg 和 ffprobe.
-
-```bash
-docker version
-docker compose version
-rustc --version
-cargo --version
-node --version
-npm --version
-```
-
-项目使用 `Cargo.lock` 和 `frontend/package-lock.json` 锁定依赖.
-不要运行格式化工具或未经确认的依赖升级命令.
-
-## 首次部署
-
-```bash
-cp examples/.env.example .env
-```
-
-编辑 `.env`:
+从 `examples/.env.example` 创建根目录 `.env`, 使用宿主机绝对路径:
 
 ```dotenv
 PORT=56080
@@ -104,421 +27,203 @@ DATA_DIR=/srv/anime-server/data
 CACHE_DIR=/srv/anime-server/cache
 ```
 
-| 变量         | 用途                                                    |
-| ------------ | ------------------------------------------------------- |
-| `PORT`       | 宿主机端口, 映射到容器 `8080`, 必须在 `1..65535` 范围内 |
-| `MEDIA_DIR`  | 视频目录, 只读挂载到 `/media`                           |
-| `CONFIG_DIR` | 配置目录, 只读挂载到 `/config`                          |
-| `DATA_DIR`   | 数据目录, 读写挂载到 `/data`                            |
-| `CACHE_DIR`  | 播放缓存目录, 读写挂载到 `/cache`, 必须指定             |
-
-使用绝对路径, 避免 `~` 在不同用户或 sudo 环境中展开到不同目录.
-先确保视频目录存在, 再准备配置, 数据和缓存目录:
+配置只读挂载为 `/config`, 媒体只读挂载为 `/media`,
+数据读写挂载为 `/data`, 播放缓存通过 CACHE_DIR 独立读写挂载为 `/cache`.
+端口映射为 `${PORT}:8080`, PORT 必须在 `1..65535` 内.
+CACHE_DIR 必填且使用宿主机绝对路径, 后端固定使用容器内的 `/cache`.
 
 ```bash
 mkdir -p /srv/anime-server/config /srv/anime-server/data /srv/anime-server/cache
 cp examples/config.example.json /srv/anime-server/config/config.json
-docker compose config
+docker compose config --quiet
 docker compose up -d --build
 docker compose ps
 curl --fail http://localhost:56080/health
 ```
 
-容器启动时检查 FFmpeg 编码器, 字幕滤镜, ffprobe, 字体和缓存目录写权限.
-`/health` 只返回服务存活状态, 不执行媒体探测或磁盘容量统计.
+不要让多个进程使用相同 DATA_DIR 或 CACHE_DIR. 当前没有缓存目录锁, 隔离由部署保证.
+如果用户没有 Docker socket 权限, 使用宿主机已授权的 Docker 访问方式,
+不要为方便调试修改 socket 为全员可写.
 
-修改端口或挂载后需要重新创建容器:
+本次架构不兼容旧配置, 数据库和 API.
+先停止并备份旧实例, 再用示例配置和空数据库重新扫描,
+不要直接让测试实例操作生产数据.
+已知哈希命名但缺少有效 instance.json 的旧缓存会在启动时清理.
 
-```bash
-docker compose up -d --force-recreate
-docker compose port anime-server 8080
-```
+## 运行配置
 
-不要同时让多个服务实例使用同一个 `DATA_DIR` 或 `CACHE_DIR`.
-缓存根目录使用独占锁, 第二个实例会明确报错. 服务启动时校验并修复完整或部分缓存,
-清理无效尾部及遗留中间文件, 不恢复客户端会话或自动启动编码.
-
-## 应用配置
-
-`/config/config.json` 示例:
+`/config/config.json` 为扁平对象:
 
 ```json
 {
-  "web": {
-    "default_dark_mode": true
-  },
+  "default_dark_mode": true,
   "scan_interval_seconds": 300,
-  "playback": {
-    "cache_max_bytes": 10737418240,
-    "max_processes": 2,
-    "ffmpeg_threads": 2,
-    "max_variant_threads": 8,
-    "max_total_ffmpeg_threads": 16,
-    "idle_timeout_seconds": 60,
-    "startup_timeout_seconds": 90
-  },
-  "dandanplay": {
-    "enabled": false,
-    "api_base": ""
-  }
+  "max_processes": 2,
+  "ffmpeg_threads": 2,
+  "max_total_ffmpeg_threads": 16,
+  "startup_timeout_seconds": 90
 }
 ```
 
-| 播放配置                   | 说明                                                                                           |
-| -------------------------- | ---------------------------------------------------------------------------------------------- |
-| `cache_max_bytes`          | 缓存容量字节数, 正整数 `u64`, 默认 `10737418240`, 即 10 GiB                                    |
-| `max_processes`            | 全部媒体进程上限, 范围 `2..16`, 默认 2. 编码器最多占用 `max_processes - 1`, 为解码校验保留名额 |
-| `ffmpeg_threads`           | 编码器启动需要的基础线程数, 默认 2, 必须不大于单变体上限                                       |
-| `max_variant_threads`      | 单个编码器线程上限, 默认 8, 最大 32                                                            |
-| `max_total_ffmpeg_threads` | 全部 H.264 编码器的加权线程预算, 默认 16, 范围为基础线程数到 256                               |
-| `idle_timeout_seconds`     | 无保活请求后的会话过期时间, 范围 `20..3600` 秒                                                 |
-| `startup_timeout_seconds`  | 字幕准备及首段生成各阶段的超时, 范围 `10..600` 秒                                              |
+| 字段                     | 约束和含义                                    |
+| ------------------------ | --------------------------------------------- |
+| default_dark_mode        | 前端默认主题, 默认 true                       |
+| scan_interval_seconds    | 正整数, 后台扫描间隔秒数, 默认 300            |
+| max_processes            | 2..16, 媒体探测, 编码和校验共用名额           |
+| ffmpeg_threads           | 1..32, 单个编码任务使用的固定线程数           |
+| max_total_ffmpeg_threads | ffmpeg_threads..256, 所有编码任务共享线程预算 |
+| startup_timeout_seconds  | 10..600, 字幕准备及首个可发布结果的超时       |
 
-缺少 `playback` 时使用上述默认值, 未知的播放配置字段会报错.
-修改应用配置后重启容器. DandanPlay 当前未实现真实 API 调用.
-Web 界面在缓存状态及生成范围连续 180 秒没有进展时显示错误.
-生成正常推进时允许继续等待较远的目标位置, 不设置 180 秒总时限.
-HLS 元数据加载最多等待 30 秒, 超时后显示错误并释放租约.
-最后一个租约释放时, 编码器最多再提交一个完整分片, 30 秒内仍未完成则强制停止.
+缺省字段使用默认值, 未知字段报错.
+旧 web/playback 嵌套对象, cache_max_bytes, idle_timeout_seconds 和 max_variant_threads 已删除.
+配置变更需要重启服务.
 
-缓存恢复与编码启动分两步. CacheManager 恢复磁盘状态并返回包含阶段, revision,
-`buffered_until` 和 duration 的窄快照,
-不读取或保存会话等待位置. SessionManager 在创建会话时聚合同一 variant 的最大 position;
-当该位置大于或等于快照尾部时请求 `max_variant_threads`, 否则请求基础线程数.
-CacheManager 校验线程数范围, 并在 FFmpeg 实际启动前接受并发会话更新的请求.
-普通 position 更新不通知 CacheManager. 预算不足时使用当前可取得且不低于基础值的数量启动.
-运行中的任务不热调, 不抢占其他任务的线程, 实际编码进程退出时归还许可.
-这个预算不包括解码器, 滤镜和工具内部辅助线程, 不是操作系统线程总数上限.
-默认 2 个进程名额仅容纳一个编码器加一个校验进程; 需要两个编码器时将 `max_processes` 设为 3.
+编码任务名额为 max_processes - 1, 至少留一个位置供分片校验.
+默认两个进程名额允许一个编码器与一个校验进程.
+预算不足时排队, 不根据用户等待位置动态提高线程数.
+线程预算指编码线程, 不是解码器, 滤镜或系统全部线程的硬上限.
 
-## 开发与编译
-
-后端:
+## 构建
 
 ```bash
-cargo check --locked
-cargo test --locked -p anime-server
-cargo build --locked -p anime-server
-cargo build --release --locked -p anime-server
-```
-
-产物分别是 `target/debug/anime-server` 和 `target/release/anime-server`.
-`--locked` 禁止构建过程改写依赖版本.
-
-前端首次安装和构建:
-
-```bash
-npm ci --prefix frontend
+CARGO_TARGET_DIR=/tmp/target cargo check --locked --manifest-path backend/Cargo.toml
+CARGO_TARGET_DIR=/tmp/target cargo build --locked --manifest-path backend/Cargo.toml
+CARGO_TARGET_DIR=/tmp/target cargo test --locked --manifest-path backend/Cargo.toml
 npm test --prefix frontend
 npm run build --prefix frontend
 ```
 
-前端热更新开发:
+只有缺少前端依赖时才使用 `npm ci --prefix frontend` 按锁文件安装.
+不运行依赖升级命令. Node.js 需兼容 Vite 8 与测试脚本的 TypeScript strip-types.
+Docker 构建使用 Node 22 和 Rust 镜像.
+
+前端 build 先执行 TypeScript 检查, 再构建 frontend/dist 并复制 HLS.js 许可证.
+若 node_modules/.vite-temp 或 dist 曾被 root 创建, 普通用户可能不能写入.
+可先使用独立输出目录定位问题, 不必重装或升级依赖:
+
+```bash
+cd frontend
+./node_modules/.bin/tsc --noEmit
+./node_modules/.bin/vite build --configLoader runner --outDir /tmp/anime-server-web-check
+```
+
+不使用 `--emptyOutDir` 指向共享或未知目录.
+这只是构建验证替代路径, 部署仍通过 Dockerfile 生成 `/app/web`.
+
+## 开发服务
 
 ```bash
 docker compose up -d
 npm run dev --prefix frontend
 ```
 
-打开 Vite 输出的地址, 默认是 `http://localhost:5173`.
-`frontend/vite.config.ts` 将 `/api`, `/playback`, `/health` 代理到 `http://127.0.0.1:56080`.
-如果修改了宿主机端口, 也需要调整此开发代理目标.
+Vite 默认地址为 `http://localhost:5173`, `/api`, `/playback`, `/health`
+代理到 `http://127.0.0.1:56080`. 改了宿主机端口时同步修改 frontend/vite.config.ts.
 
-直接运行 Rust:
+直接运行 Rust 仍使用固定 `/media`, `/data`, `/cache`, `/app/web` 和端口 8080,
+只允许通过 ANIME_SERVER_CONFIG 覆盖配置文件地址.
+没有准备这些目录时优先在容器中联调, 不修改共享宿主机目录以迁就测试.
 
-```bash
-cargo run --locked -p anime-server
+## 测试组织
+
+所有 Rust 测试集中在 backend/src/tests, 与业务模块路径对应.
+二进制 crate 通过被测模块的 cfg(test) 子模块访问私有实现,
+业务文件只保留测试模块声明. 例如 cache/handle.rs 使用:
+
+```rust
+// 仅在测试构建中加载集中保存的句柄回归测试.
+#[cfg(test)]
+#[path = "../tests/cache/handle.rs"]
+mod tests;
 ```
 
-本地运行仍使用固定路径 `/media`, `/data`, `/cache`, `/app/web`, 并监听 `8080`.
-只有配置文件路径可以通过 `ANIME_SERVER_CONFIG` 覆盖.
-不准备这些路径时, 应在容器中联调.
+tests/fixtures/runtime.rs 提供隔离临时目录和合成媒体.
+单元测试直接构造独立 Manager, 不注册或重置 OnceLock 全局实例.
+涉及 FFmpeg 的缓存测试使用短小合成媒体, 不读取用户的视频目录.
+测试通过 cfg(test) 编译, 不进入生产二进制.
 
-## Docker 构建与调试
+覆盖内容包括稳定身份, 缺省/null 选轨, 数据库多副本与路径替换,
+扫描边界, 状态矩阵, 并发打开, 排队取消, Failed 重试,
+完成缓存重启恢复, 损坏尾部修复和不覆盖前缀的真实续接.
+前端测试覆盖路径契约, 暂停状态换轨, 小数 seek, 半开区间等待,
+停止和解码失败释放, 本地目标不发送到服务端, 完成后无需心跳.
 
-```bash
-docker compose build
-docker compose up -d
-docker compose logs -f anime-server
-docker compose exec anime-server ffmpeg -version
-docker compose exec anime-server ffprobe -version
-```
+## Docker 验证
 
-Dockerfile 分为 Node.js 前端构建, Rust 后端构建和 Debian 运行三个阶段.
-运行镜像只包含后端程序, 前端静态文件, FFmpeg, 字体和必要运行依赖.
-前端构建使用 `npm ci`, 后端使用 `cargo build --release --locked`.
-
-源码修改后:
+验证必须使用全新数据目录, 缓存目录和独立容器, 不复用实际部署的数据库或缓存.
+以下示例中的目录需要提前准备合成媒体和示例配置:
 
 ```bash
-docker compose up -d --build
-```
-
-停止服务:
-
-```bash
-docker compose down
-```
-
-## 统一播放管线
-
-所有输入都使用同一种输出, 包括本来可以在浏览器直接播放的 MP4:
-
-| 项目         | 固定规则                                                                               |
-| ------------ | -------------------------------------------------------------------------------------- |
-| 视频         | libx264, High, 8-bit `yuv420p`, CRF 23, veryfast                                       |
-| 分辨率与帧率 | 保持比例, 不放大小视频, 最高 1920x1080; 按源声明帧率与 60 的较小值进行有理数恒帧率采样 |
-| HDR          | 转为 BT.709 SDR                                                                        |
-| 音频         | 选定一轨, AAC-LC, 双声道, 48 kHz, 192 kbps; 可选择无音轨                               |
-| 字幕         | 选定一轨服务端烧录, 或关闭字幕                                                         |
-| 传输         | fMP4 HLS, 目标分段长度 4 秒, event playlist                                            |
-| 浏览器       | Safari 原生 HLS, 其他支持 MSE 的浏览器使用 HLS.js                                      |
-
-传输适配在加载前选定. Chromium 即使声明可能支持原生 HLS, 也优先使用 HLS.js,
-避免将仍在生成的 fMP4 event playlist 交给不完整的原生实现.
-
-只支持容器内字幕轨, 索引使用 ffprobe 的真实流索引. 不扫描或加载外挂字幕.
-ASS/SSA 和其他文本字幕先提取到 `/cache/subtitles/<random-id>.ass`, 再由 libass 渲染.
-内嵌字体提取到 `/cache/fonts/<generation-id>/`, 文件名独立随机生成;
-缺少字体时使用运行镜像的回退字体. 位图字幕直接通过 overlay 烧录, 不提取 ASS.
-首次生成从时间 0 开始. 续接只编码未缓存的视频尾部, 但音频重采样和位图字幕状态依赖历史:
-第二路输入从源头读取音频和位图字幕, 不重新编码已有视频.
-文本字幕在原时间轴上烧录, 再归一化容器偏移和视频采样时钟.
-VFR 输入按同一恒帧率规则采样, 必要的重复或丢帧来自固定输出规则, 不是续接边界丢失.
-生成结束, 失败或停止后立即删除中间字幕和字体.
-
-切换音轨, 字幕或字幕关闭时:
-
-1. 保存原始视频时间及暂停/播放状态.
-2. 停止浏览器加载并释放旧会话.
-3. 以选定轨道和原始时间创建新租约, 复用或开始生成对应缓存.
-4. 当目标时间严格小于 `buffered_until` 时附加新流, 不额外等待 0.5 秒.
-5. 原先正在播放时继续播放, 原先暂停时保持暂停.
-
-服务端不按用户跳转位置创建新编码任务. 仅在恢复部分缓存时 seek 到已验证尾部附近,
-精确裁切并继续顺序生成.
-所有缓存的 `start_time` 固定为 0, 浏览器直接定位原视频时间,
-实际画面仍受源视频帧间隔约束.
-已生成范围内的 seek 可以直接使用当前流. 超出范围时保持同一租约,
-等待顺序生成覆盖目标位置后重新加载 HLS. 等待时仍可拖动到另一个位置或停止播放.
-浏览器阻止自动播放时会显示 `Press Play to start`, 需要用户点击播放.
-
-浏览器解码错误, HLS 致命错误或分段解析错误会直接显示, 停止加载并释放会话.
-不会请求另一种格式, 也不会自动重建播放会话.
-用户点击 Retry 才重新请求同样的输出. 普通网络分片重试不改变格式.
-
-## HTTP API
-
-全部路由, 请求与响应示例, 会话生命周期和错误码见 [HTTP API 文档](api.md).
-
-## 数据与资源管理
-
-`/data/main.db` 只保存业务数据和进度. CacheManager 维护按文件 MD5 索引的媒体元数据 Map,
-只缓存探测成功结果, 最多 1000 项且一小时未访问后过期. 缓存未命中时由 CacheManager
-查询数据库中的源文件路径并运行 ffprobe; 显式 probe 会跳过已有结果, 探测失败不会缓存.
-服务重启后元数据重新探测.
-
-播放请求和媒体文件路径由不同边界管理. `AppState` 分别持有 `SessionManager` 和 `CacheManager`,
-SessionManager 只保存会话 Map 和过期时间, 不持有 CacheManager.
-API 的 streams 和 probe 路由直接向 CacheManager 请求详细 `MediaInfo`;
-创建播放时 API 将 `&CacheManager`, file ID 和合并数据库偏好/观看进度后的 `PlaybackRequest`
-显式传给 `SessionManager::create`. SessionManager 按文件 MD5 查询 MediaInfo,
-构造不可变的 `PlaybackVariantConfig` 并计算 variant-key.
-创建, 状态, 心跳, 目标位置, 资源读取和释放等协调方法都显式接收 CacheManager,
-由 SessionManager 管理会话并按 position 决定线程数, 再调用 CacheManager 操作缓存.
-CacheManager 接收配置, 自行查询源路径并组装编码参数, 活动缓存 Map 仅在相应 variant
-被请求时创建条目. API 负责业务偏好和进度; 两个 Manager 的实例由 main 组装和关闭.
-
-Rust `PlaybackVariantConfig` 依次包含 `src_file_pre16mib_md5`, `video_stream`,
-`audio_stream`, `subtitle_stream`, `encoder_profile`.
-使用 `serde_json::to_vec` 按字段顺序生成紧凑 JSON, 保留空轨道的 `null`,
-计算 MD5 后得到 32 位小写 `variant-key`. 固定编码配置为 `h264-high-yuv420p-aac-fmp4-v2`.
-v2 固定无 B 帧, 视频时间基 90000, 音频时间基 48000, AAC 预热处理和有理数采样时钟,
-不能与旧 v1 缓存混用. 动态线程数不是配置字段, 同一配置的不同线程任务仍使用兼容的 init.
-路径, 请求位置和文件修改时间不参与计算. 文件改名或移动可以复用缓存,
-但仅修改前 16 MiB 之后的内容不会使缓存自动失效.
-此时需停止服务后删除对应缓存, 或随编码规则调整更新服务端 `encoder_profile`.
-该摘要只用于索引, 不提供鉴权.
-
-```text
-/cache/
-|-- playback/
-|   `-- <variant-key>/
-|       |-- complete
-|       |-- index.m3u8
-|       |-- init.mp4
-|       `-- segment_*.m4s
-|-- subtitles/
-`-- fonts/
-```
-
-相同播放配置共享一份缓存及一个生成任务, 不同音轨或字幕配置可以同时存在.
-每个客户端仍获得独立会话 ID 和媒体地址. 最多允许 32 个租约和 32 个排队或生成中的缓存任务.
-运行时 `HashMap<variant-key, Arc<CacheFolder>>` 只保存活动元素.
-SessionManager 保存会话到 variant-key 的关联, 各会话目标及保活时间, 并将同一变体的最大目标
-汇总以选择线程预算. `FolderPhase` 使用 `loading`, `ready`, `running`, `stopping`, `complete`,
-`failed` 六个状态, 取代相互独立的布尔标记. Loading 完成后转入 Ready 或 Complete;
-Ready 的 start 转入 Running, 生成到 EOF 转入 Complete, 显式内部 pause 在安全分片边界返回 Ready.
-运行失败转入 Failed, 下一次 acquire 在原活动条目内重试 Loading.
-最后一个会话离开时, Ready, Complete 和 Failed 立即从活动 Map 移除;
-Loading 先完成恢复再移除, Running 转入 Stopping 并最多提交一个完整分片.
-Stopping worker 收尾后从 Map 移除, 停止阶段的错误只记录日志, 不对外转换成 Failed.
-活动 Map 条目本身就是租约标记, FolderState 不保存 active 或 inactive 字段.
-查询播放状态时, CacheManager 返回包含 phase, revision, buffered_until 和 duration 的窄快照,
-SessionManager 据此构造 SessionStatus; 前端只根据 `position < buffered_until` 判断目标是否可播.
-释放后的缓存文件夹只由弱引用登记, 尚未退出的缓存任务引用暂时阻止 LRU 移动其目录.
-CacheManager 和 SessionManager 的 `media_path` 只返回已验证的路径, API 根据资源名设置 Content-Type.
-取得路径不会延长目录生命周期; 最后会话释放与资源打开并发时, 文件可能已被 LRU 移走而无法打开.
-状态和媒体请求必须通过 session 及活动集合, 不支持按客户端提供的缓存键访问磁盘.
-
-最后一个租约离开时, Loading 任务完成磁盘恢复后退出; Running 尚未启动 FFmpeg 时立即取消,
-正在编码时最多再验证和发布一个完整分片后停止. 30 秒未等到分片则强制终止并回收进程.
-进入 Stopping 后不再接纳新租约, acquire 立即返回停止错误, 不等待旧写入者退出.
-acquire 未命中时在锁外读取媒体信息; 若期间其他请求先激活同 variant, 返回并发激活错误,
-不自动重试或复用胜出条目. 客户端需重新请求播放; 已命中的 Loading 条目仍等待恢复完成.
-DELETE 不等待此过程. 服务正常关闭采用相同停止规则, Compose 的宽限期为 40 秒.
-
-不保存 `metadata.json` 或单独的持久缓存索引.
-FFmpeg 写入变体下的私有 `.work-<id>` 目录. 首次发布正式 init 后不再替换它.
-Rust 比较新旧 init 的轨道, timescale, AVC/AAC 描述和默认值, 去除可选 `sidx`,
-修正 `mfhd` 序号与逐轨 `tfdt`, 保持媒体负载不变.
-每段都与正式 init 执行实际解码, 通过后原子发布分片和 playlist.
-续接只追加已验证尾部, 不覆盖已有 init 或分片.
-
-音频从固定原点重采样, 仅编码少量预热音频和新尾部, 丢弃负时间的 AAC 预热包.
-读取旧音频或字幕历史有额外成本, 但不重编码已缓存的视频.
-任务正常到 EOF 并验证全部输出后原子写入 ENDLIST 和空 `complete` 标记,
-然后清理中间文件. 标记只表示媒体完整, 不表示后台清理已经结束.
-
-重启校验所有连续分片的 MP4 结构, 样本范围, 序号和逐轨时间轴, 并实际解码首段及尾段.
-损坏尾部从末端截断, 保留有效前缀; 已发布的中间段不会在每次恢复时全部重新解码.
-崩溃前已发布但尚未写入 playlist 的有效分片可以找回, 已写 ENDLIST 而未写标记时也可恢复完成状态.
-未完成缓存保留没有 ENDLIST 的 event playlist, 启动时不创建活动元素或自动续接.
-真正的恢复, 编码和清理错误均明确记录, 正常取消不会掩盖其他错误.
-启动清理仅针对服务生成的命名, 不删除未知名称的文件.
-只保留 FFmpeg 最近 4000 字节 stderr 作为错误详情, 不写持久转码日志.
-
-容量统计包含 HLS 和字幕, 字体中间文件的实际字节数.
-最后使用时间记录在内存中, 并通过变体目录修改时间跨重启保留;
-每 5 秒维护一次, 释放和生成完成时也执行维护, 避免每个分片请求都写盘.
-超过 `cache_max_bytes` 时, 按 LRU 删除活动集合外的完整或部分变体,
-直到满足上限或没有可淘汰条目. 尚未退出的缓存任务持有的旧元素引用同样受到保护.
-淘汰先在锁内原子改名, 再在锁外删除, 不长时间阻塞其他缓存的状态请求.
-停止清理中的变体仍受保护, 允许暂时超限; 超大单个变体在退出活动集合后也会被删除.
-不要在服务运行时手动删除缓存, 修改完成标记或接管中间文件.
-备份数据库前建议停止容器, 并保留整个数据目录中的 SQLite 数据及可能存在的 WAL 文件.
-
-## 验证
-
-```bash
-cargo test --locked -p anime-server
-npm test --prefix frontend
-npm run build --prefix frontend
-```
-
-完整媒体测试必须使用隔离实例. 测试会扫描媒体, 写入播放进度,
-创建和释放会话, 并在传入 `--container` 时暂停或终止测试编码器, 破坏测试缓存及重启容器.
-不要针对实际媒体库运行.
-
-```bash
-python3 backend/tests/playback_smoke.py \
-  --fixtures /tmp/anime-playback-media \
-  --font /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc
-
-mkdir /tmp/anime-playback-cache
-
-docker run -d --rm --name anime-server-test \
+docker build -t anime-server:verify .
+docker run -d --name anime-server-verify \
   -p 127.0.0.1:56081:8080 \
-  -e ANIME_SERVER_CONFIG=/config/config.example.json \
-  -v "$PWD/examples:/config:ro" \
-  -v /tmp/anime-playback-media:/media:ro \
-  -v /tmp/anime-playback-cache:/cache \
-  anime-server:dev
-
-curl --fail --retry 15 --retry-all-errors --retry-delay 1 http://127.0.0.1:56081/health
-
-python3 backend/tests/playback_smoke.py \
-  --url http://127.0.0.1:56081 \
-  --container anime-server-test
-
-docker stop anime-server-test
+  -v /tmp/anime-server-verify/config:/config:ro \
+  -v /tmp/anime-server-verify/media:/media:ro \
+  -v /tmp/anime-server-verify/data:/data \
+  -v /tmp/anime-server-verify/cache:/cache \
+  anime-server:verify
+curl --fail http://127.0.0.1:56081/health
+curl --fail -X POST http://127.0.0.1:56081/api/media/scan
+curl --fail http://127.0.0.1:56081/api/media
 ```
 
-每次完整测试使用新的空缓存目录, 不复用旧测试的生成结果.
-执行测试的用户需要 Docker 权限. 如果修改了测试实例的 `max_processes`,
-用同值的 `--max-processes` 参数运行测试. 全局线程预算和空闲时间有修改时,
-同时传入对应的 `--thread-budget` 和 `--idle-timeout`.
-验证两编码器预算分配可使用 `max_processes=3`, `max_total_ffmpeg_threads=10`,
-配合 `--max-processes 3 --thread-budget 10`.
-
-实际容量淘汰测试另建隔离实例, 使用独立的配置和空缓存目录,
-把 `playback.cache_max_bytes` 设为 `1`, 再运行:
+创建播放只传 path 和可选流索引, 再查询返回的 session_id:
 
 ```bash
-python3 backend/tests/playback_smoke.py \
-  --url http://127.0.0.1:56082 \
-  --container anime-server-eviction-test \
-  --eviction-only
+curl --fail http://127.0.0.1:56081/api/playback \
+  -H 'Content-Type: application/json' \
+  -d '{"path":"/media/sample.mkv","subtitle_stream_index":null}'
+curl --fail http://127.0.0.1:56081/api/playback/SESSION_ID
 ```
 
-测试覆盖统一编码, 帧率上限, 实际音轨信号, 文本和位图字幕画面,
-小数时间定位, 服务端进度与选轨, 共享租约, 同键单任务, 加权线程预算,
-排队取消, 分片边界停止, 新租约撤销停止, 30 秒强制回收和会话过期.
-续接检查原前缀的 inode 和摘要不变, 全部帧和音频样本数一致, 时间戳误差小于 1 毫秒,
-逐帧图像与逐窗口波形满足误差阈值, 包括文本字幕, 位图字幕, 44.1 kHz 重采样及 VFR 输入.
-另检查完整复用, 正常和强制重启, 损坏尾部修复, 部分缓存 LRU 和进度持久化.
-前端回归测试覆盖同租约跳转等待及改选目标, 暂停状态换轨和解码失败不自动发起新播放请求.
-原生 iOS Safari 的最终兼容性仍需在真实设备上确认.
+验证缓存进入 completed, 清单含 ENDLIST, 每个分片可以配合 init 真实解码.
+同内容不同路径应共享一份 instance.json 和输出, 但返回不同 session_id.
+删除其中一个 session 后另一个仍可读取资源, 缓存继续生成.
+
+保存配置后重启测试容器, 确认数据库配置和 completed 缓存保留,
+旧 session 消失且新会话复用缓存.
+在测试实例上验证失败重试和部分尾部恢复, 不破坏生产缓存.
+浏览器验证播放时间前进, 视频/音频/字幕切换, 暂停意图和目标范围等待.
+Safari 原生 HLS 的最终兼容性仍需真实设备验证.
+
+```bash
+docker logs anime-server-verify
+docker stop --time 40 anime-server-verify
+docker rm anime-server-verify
+```
+
+## 播放与资源生命周期
+
+所有输入统一转为 H.264 High, 8-bit yuv420p, 最高 1920x1080,
+帧率为源声明帧率与 60 的较小值, HDR 转 BT.709 SDR.
+可选音轨为双声道 48 kHz AAC-LC.
+文本字幕使用 libass 烧录, 位图字幕使用 overlay, 不加载外挂字幕.
+
+首次从零生成, 续接只编码未缓存视频尾部.
+音频和位图字幕需要读取历史以恢复状态, 但不重新编码已有视频.
+视频时基为 90000, 音频时基为 48000, 禁用 B 帧,
+分片只有通过时间轴和真实解码校验后才进入正式清单.
+
+每个 `.work-<random_id>/` 包含本次生成的临时 HLS, subtitle.ass 和 fonts/.
+成功, 失败或取消后清理该目录, 异常退出的遗留目录在恢复时清理.
+进程 stderr 只保留末尾诊断, 不无限累积转码日志.
+
+缓存与会话生命周期解耦. session 释放不会停止编码,
+没有自动过期, LRU 或缓存容量设置.
+Ready 和 Completed 等待复用, 仅显式删除, 无效实例清理或关闭流程执行 End.
+服务关闭先停止 HTTP, 再停止后台任务和缓存写入, 最后关闭数据库.
 
 ## 故障排查
 
-| 现象                   | 检查方式                                                                                    |
-| ---------------------- | ------------------------------------------------------------------------------------------- |
-| 启动后没有端口映射     | 检查 `docker compose config` 和 `docker compose port anime-server 8080`, 必要时重新创建容器 |
-| Docker socket 权限不足 | 使用具备 Docker 权限的用户; 修改用户组后重新登录, 或按宿主机策略使用 sudo                   |
-| 视频列表为空           | 检查 `/media` 挂载和读取权限, 然后点击 Scan videos                                          |
-| 长时间等待名额         | 检查进程名额和全局线程预算; 默认仅一个编码器, 需要两个时将 `max_processes` 设为 3           |
-| 恢复位置等待很久       | 新缓存从 0 连续生成, 等待生成范围覆盖目标; 可以拖回已生成位置                               |
-| 首段或续接启动很慢     | 检查 CPU, 字幕和字体; 首次配置从 0 编码, 续接仍需读取音频及字幕历史                         |
-| 字幕没有字形           | 检查内嵌字体和镜像的 Noto CJK 字体; 查看播放器返回的 FFmpeg 错误                            |
-| 探测失败被记住         | 点击 Retry probe, 或调用 `/probe`; 错误不会跨进程持久保存                                   |
-| 会话不存在或过期       | 页面后台休眠可能停止保活; 手动点击 Play 或 Retry 创建同格式的新会话                         |
-| 解码或 HLS 解析失败    | 查看播放器错误及容器日志. 不会自动请求其他编码或封装                                        |
-| 缓存目录被占用         | 检查是否有另一实例挂载相同 `CACHE_DIR`, 为测试实例使用独立目录                              |
-| 缓存超过配置大小       | 活动目录及缓存任务引用受保护, 等待最后租约释放和后台停止; 容量上限不是硬配额                |
-| 磁盘已满               | 停止服务后清理 `/cache` 中指定的变体或增加空间, 不要删除数据库                              |
-
-## 容器运行时目录结构
-
-```
-/
-├── app/
-│   ├── anime-server           # Rust 后端可执行文件
-│   └── web/                   # npm run build 输出的 frontend/dist
-│       ├── index.html
-│       ├── assets/
-│       │   ├── *.js
-│       │   └── *.css
-│       └── licenses/
-│           └── hls.txt
-├── config/                    # 宿主机 CONFIG_DIR, 只读挂载
-│   └── config.json
-├── media/                     # 宿主机 MEDIA_DIR, 只读挂载
-│   └── ...
-├── data/                      # 宿主机 DATA_DIR, 读写挂载
-│   ├── main.db
-│   ├── ddp-ani/
-│   └── ddp-danmaku/
-├── cache/                     # 宿主机 CACHE_DIR, 读写挂载
-│   ├── playback/
-│   │   └── <variant-key>/
-│   │       ├── complete       # 仅完整缓存存在此标记
-│   │       ├── index.m3u8
-│   │       ├── init.mp4
-│   │       └── segment_*.m4s
-│   ├── subtitles/             # 转码期间的临时字幕文件
-│   └── fonts/                 # 转码期间提取的字体附件
-└── usr/
-    ├── bin/                   # Debian 和 FFmpeg 等运行工具
-    └── share/fonts/           # 中文回退字体
-```
+| 现象                | 处理                                                 |
+| ------------------- | ---------------------------------------------------- |
+| 旧数据库启动失败    | 停止旧实例并备份, 换全新数据库重新扫描               |
+| 旧配置字段报错      | 使用新的扁平示例配置, 删除已取消字段                 |
+| 列表探测错误        | 查看服务日志中的具体路径, 修复或移除不可读媒体后重扫 |
+| 等待目标较慢        | 新缓存从零连续生成, 可拖回已生成范围                 |
+| failed 且目标未覆盖 | 查看 FFmpeg 诊断, 修复媒体或环境后手动 Retry         |
+| 字幕没有字形        | 检查内嵌字体和镜像的 Noto CJK 回退字体               |
+| 会话不存在          | 服务重启或已释放, 手动重新创建播放                   |
+| 缓存目录无法初始化  | 检查写权限, 未知条目和是否有其他实例共享目录         |
+| 磁盘空间不足        | 没有自动淘汰, 停服后仅清理明确需要移除的缓存实例     |
+| 构建目录权限错误    | 使用独立输出目录或按宿主机策略修复指定目录所有权     |

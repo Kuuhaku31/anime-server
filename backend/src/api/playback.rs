@@ -1,240 +1,113 @@
 
-//! 提供媒体探测、播放会话和播放资源的 HTTP API.
+// backend/src/api/playback.rs
+//! 校验媒体流选择并连接缓存句柄与不透明播放会话.
 
 use axum::{
-    body::{Body, Bytes},
-    extract::{rejection::JsonRejection, Path, Request, State},
-    http::{header, HeaderValue, StatusCode},
-    response::{IntoResponse, Response},
-    routing::{delete, get, post},
-    Json, Router,
+    body::Body, extract::{rejection::JsonRejection, Path, Request},
+    http::{header, HeaderValue, StatusCode}, response::Response,
+    routing::{get, post}, Json, Router,
 };
-use serde::Deserialize;
-use serde_json::json;
 use tower_http::services::ServeFile;
-use tracing::warn;
 
 use crate::{
-    AppState, db, models::{self, MediaInfo}, sessions::SessionStatus,
+    cache::HandleSnapshot, constants::CACHE_VERSION,
+    models::{CacheSpec, MediaConfigs, MediaInfo, MediaMetadata, PlaybackQuery, PlaybackStart, StreamInfo},
+    services,
 };
 
+use super::ApiError;
 
-/// 构建播放相关 API 路由.
-pub(super) fn router() -> Router<crate::AppState> {
+#[cfg(test)]
+#[path = "../tests/api/playback.rs"]
+mod tests;
+
+/// 公开创建, 查询, 释放会话和获取媒体资源的路由.
+pub(super) fn router() -> Router {
     Router::new()
-    .route("/api/files/{file_id}/streams", get(streams))
-    .route("/api/files/{file_id}/probe", post(probe))
-    .route("/api/files/{file_id}/playback", post(play))
-    .route("/api/playback/{session_id}/status", get(status))
-    .route("/api/playback/{session_id}/heartbeat", post(heartbeat))
-    .route("/api/playback/{session_id}/target", post(target))
-    .route("/api/playback/{session_id}", delete(release))
-    .route("/playback/{session_id}/{asset_name}", get(media))
+        .route("/api/playback", post(create_playback))
+        .route("/api/playback/{session_id}", get(playback_status).delete(release_playback))
+        .route("/playback/{session_id}/{asset_name}", get(playback_asset))
 }
 
-
-// ========================================================================== //
-
-/// 播放 API 错误.
-struct ApiError(StatusCode, String);
-
-impl ApiError {
-    fn bad(error: impl std::fmt::Display) -> Self {
-        Self(StatusCode::BAD_REQUEST, error.to_string())
+/// 重新计算媒体身份并探测元数据, 创建播放后不等待缓存编码.
+async fn create_playback(
+    input: Result<Json<PlaybackQuery>, JsonRejection>,
+) -> Result<Json<PlaybackStart>, ApiError> {
+    let Json(query) = input.map_err(ApiError::bad)?;
+    services::scanner().check_path(&query.path).map_err(ApiError::bad)?;
+    let file = services::scanner().scan_one(services::database(), &query.path).await.map_err(ApiError::media)?
+        .ok_or_else(|| ApiError::missing("media file not found"))?;
+    let metadata = services::process().probe(&file.path).await.map_err(ApiError::media)?;
+    let record = services::database().get_file_by_path(&file.path).await.map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::missing("media path was removed during playback creation"))?;
+    if file.media_id != record.media_id {
+        return Err(ApiError::media("media path changed during playback creation; retry the request"));
     }
-
-    fn media(error: impl std::fmt::Display) -> Self {
-        Self(StatusCode::UNPROCESSABLE_ENTITY, error.to_string())
-    }
-
-    fn internal(error: impl std::fmt::Display) -> Self {
-        Self(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
-    }
-
-    fn missing(error: impl std::fmt::Display) -> Self {
-        Self(StatusCode::NOT_FOUND, error.to_string())
-    }
+    let spec = select_streams(file.media_id, &query, &metadata, &record.configs)?;
+    let cache = services::cache().open(spec.clone(), file.path, metadata.clone(),
+        services::config(), services::process()).await.map_err(ApiError::internal)?;
+    let session_id = services::sessions().create(cache.folder.clone()).await.map_err(ApiError::internal)?;
+    Ok(Json(PlaybackStart {
+        url: format!("/playback/{session_id}/index.m3u8"), session_id, cache,
+        media: MediaInfo { metadata, configs: record.configs },
+        video_stream_index: spec.video_stream_index,
+        audio_stream_index: spec.audio_stream_index,
+        subtitle_stream_index: spec.subtitle_stream_index,
+    }))
 }
 
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        warn!(
-            status = self.0.as_u16(),
-            error = %self.1,
-            "playback API error"
-        );
-
-        (self.0, Json(json!({"error": self.1}))).into_response()
-    }
+/// 返回会话映射对应的缓存快照, 不维护目标位置或心跳.
+async fn playback_status(Path(session_id): Path<String>) -> Result<Json<HandleSnapshot>, ApiError> {
+    let folder = services::sessions().folder(&session_id).await.map_err(ApiError::missing)?;
+    services::cache().status(&folder).await.map(Json).map_err(ApiError::internal)
 }
 
-
-
-/// 获取已缓存的媒体流信息.
-async fn streams(State(s): State<AppState>, Path(file_id): Path<String>)
-    -> Result<Json<MediaInfo>, ApiError>
-{
-    let cache = s.cache_manager;
-    return match cache.media_info(&file_id).await {
-        Ok (media_info) => Ok (Json(media_info)),
-        Err(error) => Err(if error.to_string() == "video file not found" { ApiError::missing(error) }
-            else { ApiError::media(error) }),
-    };
+/// 只释放映射, 其他会话和持续缓存生成均不受影响.
+async fn release_playback(Path(session_id): Path<String>) -> StatusCode {
+    services::sessions().release(&session_id).await;
+    StatusCode::NO_CONTENT
 }
 
-/// 重新探测媒体文件.
-async fn probe(State(s): State<AppState>, Path(file_id): Path<String>)
-    -> Result<Json<MediaInfo>, ApiError>
-{
-    let cache = s.cache_manager;
-    return match cache.media_info_force(&file_id).await {
-        Ok(media_info) => Ok(Json(media_info)),
-        Err(error) => Err(if error.to_string() == "video file not found" { ApiError::missing(error) }
-            else { ApiError::media(error) }),
-    };
-}
-
-/// 创建播放会话.
-///
-/// 客户端只提交播放选项, 播放配置由服务端生成.
-///
-/// 定义了 POST /api/files/{file_id}/playback 的处理函数:
-/// 根据客户端请求和服务器数据创建播放会话, 最后返回 JSON 格式的会话信息.
-async fn play(
-    State(state): State<AppState>,
-    Path(file_id): Path<String>,
-    input: Bytes,
-) -> Result<Json<models::PlaybackStart>, ApiError>
-{
-    // 空请求体使用默认配置, 显式 null 仍交由 JSON 反序列化处理.
-    let input = if input.is_empty() { models::PlaybackRequest::default() }
-    else { serde_json::from_slice(&input).map_err(ApiError::bad)? };
-
-    // 读取数据库中保存的播放进度
-    let progress = db::get_progress(&state.db, &file_id).await
-    .map_err(ApiError::internal)?.ok_or_else(|| ApiError::missing("file not found"))?;
-
-    // 请求显式选择覆盖数据库偏好, 字段缺省才使用扫描或上次手动选择保存的轨道.
-    let audio_preference = input.audio_stream_index;
-    let subtitle_preference = input.subtitle_stream_index;
-    let request = input.with_preferences(progress.audio_stream_index, progress.subtitle_stream_index)
-        .with_saved_position(progress.watch_pos);
-
-    // 只保存本次请求显式提交的选择, null 也表示将对应偏好设为关闭.
-    db::save_track_preferences(&state.db, &file_id, audio_preference, subtitle_preference)
-    .await.map_err(ApiError::internal)?;
-
-    // 创建播放会话并返回结果.
-    let session = state.session_manager.create(&state.cache_manager, &file_id, request)
-        .await.map_err(ApiError::internal)?;
-
-    Ok(Json(session))
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TargetRequest {
-    position: f64,
-}
-
-/// 更新播放会话的目标位置, 不保存观看进度.
-async fn target(
-    State(s) : State<AppState>,
-    Path (session_id) : Path<String>,
-    input    : Result<Json<TargetRequest>, JsonRejection>
-) -> Result<Json<SessionStatus>, ApiError>
-{
-
-    let session     = s.session_manager;
-    let cache       = s.cache_manager;
-    let Json(input) = input.map_err(ApiError::bad)?;
-
-    let session_status = session.status(&cache, &session_id).await.map_err(ApiError::missing)?;
-
-    // 检查目标位置是否合法.
-    if !input.position.is_finite() || input.position < 0.0 || input.position >= session_status.duration {
-        return Err(ApiError::bad("position must be within the video duration"));
-    }
-
-    return match session.target(&cache, &session_id, input.position).await {
-        Ok(session_status) => Ok(Json(session_status)),
-        Err(error) => Err(ApiError::missing(error)),
-    };
-}
-
-/// 获取播放会话状态.
-async fn status(State(s): State<AppState>, Path(session_id): Path<String>)
-    -> Result<Json<SessionStatus>, ApiError>
-{
-    let session = s.session_manager;
-    let cache   = s.cache_manager;
-    return match session.status(&cache, &session_id).await {
-        Ok (session_status) => Ok (Json(session_status)),
-        Err(error) => Err(ApiError::missing(error)),
-    };
-}
-
-/// 刷新播放会话心跳.
-async fn heartbeat(State(s): State<AppState>, Path(session_id): Path<String>)
-    -> Result<StatusCode, ApiError>
-{
-    let session = s.session_manager;
-    let cache   = s.cache_manager;
-    return match session.heartbeat(&cache, &session_id).await {
-        Ok (_) => Ok(StatusCode::NO_CONTENT),
-        Err(error) => Err(ApiError::missing(error)),
-    };
-}
-
-/// 释放播放会话.
-async fn release(State(s): State<AppState>, Path(session_id): Path<String>)
-    -> Result<StatusCode, ApiError>
-{
-    let session = s.session_manager;
-    let cache   = s.cache_manager;
-    return match session.release(&cache, &session_id).await {
-        Ok (_) => Ok (StatusCode::NO_CONTENT),
-        Err(error) => Err(ApiError::missing(error)),
-    };
-}
-
-/// 返回播放会话中的媒体资源.
-async fn media(
-    State(s): State<AppState>,
-    Path((session_id, asset_name)): Path<(String, String)>,
-    request: Request,
+/// 从已发布清单中提供资源, 不允许读取实例描述或私有工作目录.
+async fn playback_asset(
+    Path((session_id, asset_name)): Path<(String, String)>, request: Request,
 ) -> Result<Response, ApiError> {
-
-    let session = s.session_manager;
-    let cache   = s.cache_manager;
-
-    // 会话只返回已验证的路径, 文件由 ServeFile 打开.
-    let path = session
-    .media_path(&cache, &session_id, &asset_name).await.map_err(ApiError::missing)?;
-
-    let response = ServeFile::new(path)
-    .try_call(request).await.map_err(ApiError::internal)?;
-
-    let mut response = response.map(Body::new);
-
+    let folder = services::sessions().folder(&session_id).await.map_err(ApiError::missing)?;
+    let path = services::cache().media_path(&folder, &asset_name).await.map_err(ApiError::missing)?;
+    let mut response = ServeFile::new(path).try_call(request).await.map_err(ApiError::internal)?.map(Body::new);
     if response.status().is_success() {
-        // HTTP 层统一设置媒体类型, 保持清单和分片的响应头不变.
-        let mime =
-        if asset_name.ends_with(".m3u8") { "application/vnd.apple.mpegurl" }
-        else if asset_name.ends_with(".m4s") { "video/iso.segment" }
-        else { "video/mp4" };
-        response.headers_mut()
-        .insert(header::CONTENT_TYPE, HeaderValue::from_static(mime));
+        let mime = if asset_name.ends_with(".m3u8") { "application/vnd.apple.mpegurl" }
+            else if asset_name.ends_with(".m4s") { "video/iso.segment" } else { "video/mp4" };
+        response.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static(mime));
     }
-
-    // 防止事件清单和分片的缓存掩盖会话状态变化.
-    response.headers_mut()
-    .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-
-    response.headers_mut().insert(
-        header::X_CONTENT_TYPE_OPTIONS,
-        HeaderValue::from_static("nosniff"),
-    );
-
+    response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response.headers_mut().insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     Ok(response)
+}
+
+/// 直接对照元数据校验实际流索引, 不引入额外选轨模型或静默回退.
+fn select_streams(
+    media_id: String, query: &PlaybackQuery, metadata: &MediaMetadata, configs: &MediaConfigs,
+) -> Result<CacheSpec, ApiError> {
+    let video_stream_index = query.video_stream_index.or(configs.video_stream_index)
+        .or_else(|| metadata.video_streams.first().map(|stream| stream.stream_index))
+        .ok_or_else(|| ApiError::media("media has no playable video stream"))?;
+    let audio_stream_index = query.audio_stream_index.unwrap_or_else(|| configs.audio_stream_index.or_else(||
+        metadata.audio_streams.iter().find(|stream| stream.is_default)
+            .or(metadata.audio_streams.first()).map(|stream| stream.stream_index)));
+    let subtitle_stream_index = query.subtitle_stream_index.unwrap_or_else(|| configs.subtitle_stream_index.or_else(||
+        metadata.subtitle_streams.iter().find(|stream| stream.is_default || stream.is_forced)
+            .map(|stream| stream.stream_index)));
+    check_stream(&metadata.video_streams, Some(video_stream_index), "video")?;
+    check_stream(&metadata.audio_streams, audio_stream_index, "audio")?;
+    check_stream(&metadata.subtitle_streams, subtitle_stream_index, "subtitle")?;
+    Ok(CacheSpec::new(media_id, video_stream_index, audio_stream_index, subtitle_stream_index, CACHE_VERSION.to_string()))
+}
+
+/// 验证索引属于请求的流类别, 显式关闭的可选流不需要查找.
+fn check_stream(streams: &[StreamInfo], stream_index: Option<i32>, kind: &str) -> Result<(), ApiError> {
+    if stream_index.is_some_and(|index| !streams.iter().any(|stream| stream.stream_index == index)) {
+        return Err(ApiError::bad(format!("selected {kind} stream does not exist")));
+    }
+    Ok(())
 }

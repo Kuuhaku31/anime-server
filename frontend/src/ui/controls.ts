@@ -1,23 +1,23 @@
+
+// frontend/src/ui/controls.ts
 // 绑定播放器控件, 将用户操作转交控制器并同步界面状态.
 import type { PlaybackController } from "../playback/playback-controller.ts";
 import { cacheProgress, formatTime } from "../playback/timeline.ts";
-import type { MediaInfo, Selection, Track } from "../state/player-state.ts";
+import type { MediaInfo, StreamSelection, StreamInfo } from "../state/player-state.ts";
 
+/** 读取必需页面元素, 缺失时明确报错. */
 export function element<T extends HTMLElement>(selector: string): T {
   const value = document.querySelector<T>(selector);
   if (!value) throw new Error(`Missing page element: ${selector}`);
   return value;
 }
 
-function label(track: Track): string {
-  return [track.title, track.language, track.codec_name.toUpperCase(), track.is_forced ? "forced" : null]
-    .filter(Boolean).join(" / ");
-}
-
+/** 绑定播放, 流选择和显示控件, 不在控件中维护业务状态. */
 export function attachControls(controller: PlaybackController, video: HTMLVideoElement): void {
   const play = element<HTMLButtonElement>("#toggle-play");
   const seek = element<HTMLInputElement>("#seek");
   const clock = element<HTMLOutputElement>("#clock");
+  const videoTrack = element<HTMLSelectElement>("#video-track");
   const audio = element<HTMLSelectElement>("#audio-track");
   const subtitles = element<HTMLSelectElement>("#subtitle-track");
   const volume = element<HTMLInputElement>("#volume");
@@ -42,13 +42,16 @@ export function attachControls(controller: PlaybackController, video: HTMLVideoE
     clock.textContent = `${formatTime(Number(seek.value))} / ${formatTime(controller.duration)}`;
   });
   seek.addEventListener("change", () => { controller.seek(Number(seek.value)); scrubbing = false; });
+  // 控件提交三类全局流索引, null 始终表示明确关闭可选流.
   const select = (): void => {
-    const selection: Selection = {
-      audio: audio.value === "off" ? null : Number(audio.value),
-      subtitle: subtitles.value === "off" ? null : Number(subtitles.value),
+    const selection: StreamSelection = {
+      video_stream_index: Number(videoTrack.value),
+      audio_stream_index: audio.value === "off" ? null : Number(audio.value),
+      subtitle_stream_index: subtitles.value === "off" ? null : Number(subtitles.value),
     };
     controller.select(selection);
   };
+  videoTrack.onchange = select;
   audio.onchange = select;
   subtitles.onchange = select;
   volume.oninput = () => { video.volume = Number(volume.value); video.muted = video.volume === 0; };
@@ -92,12 +95,14 @@ export function attachControls(controller: PlaybackController, video: HTMLVideoE
     // 仅媒体信息变化时重建选项, 普通进度刷新只同步服务端确认的轨道选择.
     if (info && previousInfo !== info) {
       previousInfo = info;
-      audio.replaceChildren(new Option("No audio", "off"), ...info.audio_tracks.map((track) => new Option(label(track), String(track.stream_index))));
-      subtitles.replaceChildren(new Option("Off", "off"), ...info.subtitle_tracks.map((track) => new Option(label(track), String(track.stream_index))));
+      videoTrack.replaceChildren(...info.metadata.video_streams.map((track) => new Option(label(track), String(track.stream_index))));
+      audio.replaceChildren(new Option("No audio", "off"), ...info.metadata.audio_streams.map((track) => new Option(label(track), String(track.stream_index))));
+      subtitles.replaceChildren(new Option("Off", "off"), ...info.metadata.subtitle_streams.map((track) => new Option(label(track), String(track.stream_index))));
     }
-    audio.value = controller.selection.audio === null ? "off" : String(controller.selection.audio);
-    subtitles.value = controller.selection.subtitle === null ? "off" : String(controller.selection.subtitle);
-    audio.disabled = subtitles.disabled = !info || controller.pending;
+    videoTrack.value = String(controller.selection?.video_stream_index ?? "");
+    audio.value = controller.selection?.audio_stream_index == null ? "off" : String(controller.selection.audio_stream_index);
+    subtitles.value = controller.selection?.subtitle_stream_index == null ? "off" : String(controller.selection.subtitle_stream_index);
+    videoTrack.disabled = audio.disabled = subtitles.disabled = !controller.selection || controller.pending;
     play.disabled = !controller.file || controller.pending;
     play.textContent = video.paused ? "Play" : "Pause";
     seek.disabled = !controller.info;
@@ -108,9 +113,9 @@ export function attachControls(controller: PlaybackController, video: HTMLVideoE
     }
     seek.style.setProperty("--played", `${100 * controller.position / (controller.duration || 1)}%`);
     seek.style.setProperty("--buffered", `${100 * controller.buffered / (controller.duration || 1)}%`);
-    cachePanel.hidden = !controller.session;
-    if (controller.session) {
-      const progress = cacheProgress(controller.session);
+    cachePanel.hidden = !controller.cache;
+    if (controller.cache) {
+      const progress = cacheProgress(controller.cache, controller.duration);
       cacheBar.value = progress.percent;
       cacheBar.setAttribute("aria-valuetext", progress.text);
       cacheText.textContent = progress.text;
@@ -122,7 +127,13 @@ export function attachControls(controller: PlaybackController, video: HTMLVideoE
     element("#playback-status").textContent = controller.message;
     element("#error").textContent = controller.error;
     element("#error-actions").hidden = !controller.error;
-    element("#meta").textContent = controller.file?.name ?? "Select a video from the library";
+    element("#meta").textContent = controller.file?.[0] ?? "Select a video from the library";
     panel.setAttribute("aria-busy", String(controller.pending));
   });
+}
+
+/** 组合可读的流标签, 保留语言, 编码和强制字幕提示. */
+function label(track: StreamInfo): string {
+  return [track.title, track.language, track.codec_name.toUpperCase(), track.is_forced ? "forced" : null]
+    .filter(Boolean).join(" / ");
 }

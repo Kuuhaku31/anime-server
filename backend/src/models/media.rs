@@ -1,118 +1,90 @@
 
 // backend/src/models/media.rs
-//! 媒体探测和播放配置相关数据结构.
+//! 定义实时媒体元数据与数据库保存的播放配置.
 
-use md5::{Digest, Md5};
-use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
-use crate::models::PlaybackRequest;
-
-
+/// 描述一个容器内的媒体流.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct Track {
+pub(crate) struct StreamInfo {
+    /// 容器内全局流索引, 不是数组下标.
     pub(crate) stream_index: i32,
+    /// 流的编解码器名称.
     pub(crate) codec_name: String,
+    /// 可选语言标签.
     pub(crate) language: Option<String>,
+    /// 可选轨道标题.
     pub(crate) title: Option<String>,
+    /// 是否为容器默认流.
     pub(crate) is_default: bool,
+    /// 是否为强制字幕流.
     pub(crate) is_forced: bool,
-    #[serde(skip_serializing)]
+    /// 仅供内部 HDR 转换使用的传递函数.
+    #[serde(skip)]
     pub(crate) color_transfer: Option<String>,
 }
 
-impl Track {
+impl StreamInfo {
+    /// 判断字幕是否需要按位图叠加而不是文本烧录.
     pub(crate) fn is_bitmap(&self) -> bool {
         matches!(self.codec_name.as_str(), "hdmv_pgs_subtitle" | "dvd_subtitle" | "dvb_subtitle" | "xsub")
     }
 
+    /// 判断视频是否需要 HDR 到 SDR 色调映射.
     pub(crate) fn is_hdr(&self) -> bool {
         matches!(self.color_transfer.as_deref(), Some("smpte2084" | "arib-std-b67"))
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// 描述字幕渲染可使用的容器附件.
+#[derive(Debug, Clone)]
 pub(crate) struct Attachment {
+    /// 附件在容器附件流中的顺序编号.
     pub(crate) ordinal: usize,
+    /// 通过白名单检查的字体扩展名, 非字体附件为 None.
     pub(crate) font_extension: Option<String>,
 }
 
-
-/// 媒体探测结果, 可序列化为视频, 音频和字幕轨道信息.
-///
-/// 轨道选择使用容器内全局流索引. 时间轴原点和字体附件只供模块内部处理,
-/// 不随 API 响应公开, 调用方无需自行解析 ffprobe 输出.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct MediaInfo {
+/// 保存 ProcessManager 按路径实时探测的媒体信息.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct MediaMetadata {
+    /// 归一化时间轴上的有效播放时长.
     pub(crate) duration: f64,
-    #[serde(skip_serializing)]
+    /// ffprobe 返回的容器格式名称.
+    pub(crate) format: String,
+    /// 排除封面附件后的可播放视频流.
+    pub(crate) video_streams: Vec<StreamInfo>,
+    /// 可选择的音频流.
+    pub(crate) audio_streams: Vec<StreamInfo>,
+    /// 可选择的内嵌字幕流.
+    pub(crate) subtitle_streams: Vec<StreamInfo>,
+    /// 供内部音视频时间轴归零使用的容器起点.
+    #[serde(skip)]
     pub(crate) start_time: f64,
-    pub(crate) video_tracks: Vec<Track>,
-    pub(crate) audio_tracks: Vec<Track>,
-    pub(crate) subtitle_tracks: Vec<Track>,
-    #[serde(skip_serializing)]
+    /// 供内部字幕渲染使用的字体附件信息.
+    #[serde(skip)]
     pub(crate) attachments: Vec<Attachment>,
 }
 
-
-/// 稳定的缓存身份配置, 不等同于客户端播放请求.
-///
-/// `variant_key()` 按字段声明顺序序列化, 保留可选轨道的 null, 再计算 MD5.
-/// 配置只包含源文件指纹, 视频/音频/字幕流索引和编码契约.
-/// 不应将文件路径, 会话 ID, 播放位置或动态线程数加入配置.
-/// 缓存身份只由源文件指纹, 全局流索引和编码契约决定, 不包含路径或播放位置.
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
-pub(crate) struct PlaybackVariantConfig {
-
-    src_file_pre16mib_md5: String,
-    video_stream: i32,
-    audio_stream: Option<i32>,
-    subtitle_stream: Option<i32>,
-    encoder_profile: String,
-
-    #[serde(skip)]
-    variant_key: String,
+/// 保存同一媒体内容的播放进度和流偏好.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, sqlx::FromRow)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MediaConfigs {
+    /// 上次播放的绝对秒数, None 表示没有记录.
+    pub(crate) position: Option<f64>,
+    /// 上次选择的视频全局流索引.
+    pub(crate) video_stream_index: Option<i32>,
+    /// 上次选择的可选音频全局流索引.
+    pub(crate) audio_stream_index: Option<i32>,
+    /// 上次选择的可选字幕全局流索引.
+    pub(crate) subtitle_stream_index: Option<i32>,
 }
 
-fn select(tracks: &[Track], index: Option<i32>, kind: &str) -> Result<Option<Track>> {
-    index.map(|index| tracks.iter().find(|track| track.stream_index == index).cloned()
-        .with_context(|| format!("selected {kind} track does not exist"))).transpose()
-}
-
-impl PlaybackVariantConfig {
-
-    /// 根据媒体信息和播放请求固定所选轨道及编码契约.
-    pub(crate) fn new(file_id: &str, info: &MediaInfo, request: &PlaybackRequest) -> Result<Self> {
-        ensure!(crate::utils::check_md5_ok(file_id), "invalid source file ID");
-        let video = info.video_tracks.first().context("media has no playable video stream")?;
-        let audio_index = request.audio_stream_index.unwrap_or_else(|| {
-            info.audio_tracks.iter().find(|track| track.is_default)
-                .or(info.audio_tracks.first()).map(|track| track.stream_index)
-        });
-        let subtitle_index = request.subtitle_stream_index.unwrap_or_else(|| {
-            info.subtitle_tracks.iter().find(|track| track.is_default || track.is_forced)
-                .map(|track| track.stream_index)
-        });
-        let audio = select(&info.audio_tracks, audio_index, "audio")?;
-        let subtitle = select(&info.subtitle_tracks, subtitle_index, "subtitle")?;
-        let config = Self {
-            src_file_pre16mib_md5: file_id.to_string(),
-            video_stream: video.stream_index,
-            audio_stream: audio.map(|track| track.stream_index),
-            subtitle_stream: subtitle.as_ref().map(|track| track.stream_index),
-            encoder_profile: crate::constants::ENCODER_PROFILE.to_string(),
-            variant_key: String::new(), // 临时占位
-        };
-        // 字段声明顺序和显式 null 都参与哈希, 不能排序字段或省略空音轨与字幕.
-        let variant_key = format!("{:x}", Md5::digest(serde_json::to_vec(&config)?));
-        Ok(Self { variant_key, ..config })
-    }
-
-    // getters
-
-    pub(crate) fn variant_key(&self) -> &str { &self.variant_key }
-    pub(crate) fn video_stream(&self) -> i32 { self.video_stream }
-    pub(crate) fn audio_stream(&self) -> Option<i32> { self.audio_stream }
-    pub(crate) fn src_file_pre16mib_md5(&self) -> &str { &self.src_file_pre16mib_md5 }
-    pub(crate) fn selection(&self) -> (Option<i32>, Option<i32>) { (self.audio_stream, self.subtitle_stream) }
+/// 组合前端所需的实时元数据和持久化配置.
+#[derive(Debug, Serialize)]
+pub(crate) struct MediaInfo {
+    /// 当前路径的实时媒体元数据.
+    pub(crate) metadata: MediaMetadata,
+    /// 当前媒体内容身份对应的配置.
+    pub(crate) configs: MediaConfigs,
 }

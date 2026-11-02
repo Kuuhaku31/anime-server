@@ -1,17 +1,30 @@
-// 使用轻量 DOM 替身验证单文件重扫地址, 按钮状态和错误恢复.
+
+// frontend/src/ui/library.test.js
+// 验证路径列表, 单文件重扫和新媒体字段排序.
+
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Library, sortFiles } from "./library.ts";
 
+/** 提供列表事件委托需要的最小 DOM 替身. */
 class Element {
+  /** 当前子节点列表. */
   children = [];
+  /** 行和按钮的数据属性. */
   dataset = {};
+  /** 可见文本. */
   textContent = "";
+  /** 按钮是否被禁用. */
   disabled = false;
+  /** 高亮切换的替身. */
   classList = { toggle() {} };
+  /** 追加模拟子节点. */
   append(...children) { this.children.push(...children); }
+  /** 替换全部模拟子节点. */
   replaceChildren(...children) { this.children = children; }
+  /** 保存容器点击监听器. */
   addEventListener(_, listener) { this.click = listener; }
+  /** 查找全部单文件扫描按钮. */
   querySelectorAll() {
     return this.children.flatMap((child) => [
       ...(child instanceof Button && child.dataset.action === "scan" ? [child] : []),
@@ -19,108 +32,108 @@ class Element {
     ]);
   }
 }
+
+/** 区分按钮和其他 DOM 节点. */
 class Button extends Element {}
 
-test("rescan submits the displayed path once and restores the button after errors", async () => {
-  // 延迟网络响应以确认重复点击不会提交第二次重扫.
+/** 构造只包含路径和 MediaInfo 的列表条目. */
+function entry(path, duration = 120, position = null) {
+  return [path, {
+    metadata: { duration, format: "matroska", video_streams: [], audio_streams: [], subtitle_streams: [] },
+    configs: { position, video_stream_index: null, audio_stream_index: null, subtitle_stream_index: null },
+  }];
+}
+
+/** 安装列表需要的最小 DOM 环境. */
+function dom() {
   globalThis.HTMLButtonElement = Button;
   const nodes = new Map(["#files", "#files-count", "#scan", "#files-sort"].map((selector) => [selector, new Element()]));
-  globalThis.localStorage = { getItem: () => "name-asc", setItem() {} };
   globalThis.document = {
     querySelector: (selector) => nodes.get(selector),
     createElement: (tag) => tag === "button" ? new Button() : new Element(),
   };
-  const file = {
-    pre16mib_md5: "a".repeat(32), name: "episode.part.MKV", size: 100, ddp_epi_id: null,
-    path: "/media/series/episode.part.MKV",
-  };
-  const copy = { ...file, path: "/media/copies/episode.part.MKV" };
+  return nodes;
+}
+
+// 同内容的两个路径是独立列表项, 重扫其中一项不应禁用另一个按钮.
+test("rescan submits the displayed path once and restores the button after errors", async () => {
+  const nodes = dom();
+  globalThis.localStorage = { getItem: () => "name-asc", setItem() {} };
+  const file = entry("/media/series/episode.part.MKV");
+  const copy = entry("/media/copies/episode.part.MKV");
   const calls = [];
   const errors = [];
   let complete;
   globalThis.fetch = async (url, options) => {
     calls.push({ url, options });
-    if (url === "/api/files") return { ok: true, status: 200, json: async () => [file, copy] };
+    if (url === "/api/media") return Response.json([file, copy]);
     return new Promise((resolve) => { complete = resolve; });
   };
   const library = new Library(() => assert.fail("rescan must not start playback"), (error) => errors.push(error));
   await library.load();
   const container = nodes.get("#files");
-  const button = container.querySelectorAll().find((button) => button.dataset.path === file.path);
-  const other = container.querySelectorAll().find((button) => button.dataset.path === copy.path);
+  const button = container.querySelectorAll().find((button) => button.dataset.path === file[0]);
+  const other = container.querySelectorAll().find((button) => button.dataset.path === copy[0]);
   container.click({ target: button });
   container.click({ target: button });
   assert.equal(button.disabled, true);
-  assert.equal(button.textContent, "Scanning...");
-  // 同指纹的另一地址是独立项目, 不因当前地址正在扫描而禁用.
   assert.equal(other.disabled, false);
   assert.equal(calls.length, 2);
-  assert.equal(calls[1].url, "/api/scan/file");
-  assert.equal(calls[1].options.method, "POST");
-  assert.deepEqual(JSON.parse(calls[1].options.body), { path: "/media/series/episode.part.MKV" });
-  complete({ ok: false, status: 422, text: async () => "cannot read media file" });
+  assert.equal(calls[1].url, "/api/media/rescan");
+  assert.deepEqual(JSON.parse(calls[1].options.body), { path: file[0] });
+  complete(new Response("cannot read media file", { status: 422 }));
   await new Promise(setImmediate);
   assert.equal(errors.length, 1);
   assert.equal(button.disabled, false);
   assert.equal(button.textContent, "Rescan");
   container.click({ target: button });
-  file.pre16mib_md5 = "b".repeat(32);
-  complete({ ok: true, status: 200, json: async () => ({ ok: true, scanned: 1 }) });
+  complete(Response.json(file));
   await new Promise(setImmediate);
-  assert.equal(calls.filter((call) => call.url === "/api/files").length, 2);
-  assert.equal(container.querySelectorAll().find((button) => button.dataset.path === file.path).disabled, false);
+  assert.equal(calls.filter((call) => call.url === "/api/media").length, 2);
+  assert.equal(container.querySelectorAll().find((button) => button.dataset.path === file[0]).disabled, false);
 });
 
-test("sort options order copies independently without mutating the input", () => {
-  // 自然文件名排序兼容剧集编号, 相同大小按地址稳定排序.
+// 文件名由路径推导, 时长和进度取自 MediaInfo, 排序不修改原数组.
+test("path tuples sort by name duration and playback progress without mutation", () => {
   const files = [
-    { name: "episode10.mkv", path: "/media/b.mkv", size: 20, watched_datetime: null },
-    { name: "episode2.mkv", path: "/media/a.mkv", size: 10, watched_datetime: "2026-10-10T09:00:00Z" },
-    { name: "episode1.mkv", path: "/media/c.mkv", size: 20, watched_datetime: "2026-10-11T09:00:00Z" },
+    entry("/media/b/episode10.mkv", 20),
+    entry("/media/a/episode2.mkv", 10, 4),
+    entry("/media/c/episode1.mkv", 20, 16),
   ];
-  const paths = (order) => sortFiles(files, order).map((file) => file.path);
-  assert.deepEqual(paths("path"), ["/media/a.mkv", "/media/b.mkv", "/media/c.mkv"]);
-  assert.deepEqual(paths("name-asc"), ["/media/c.mkv", "/media/a.mkv", "/media/b.mkv"]);
-  assert.deepEqual(paths("name-desc"), ["/media/b.mkv", "/media/a.mkv", "/media/c.mkv"]);
-  assert.deepEqual(paths("size-asc"), ["/media/a.mkv", "/media/b.mkv", "/media/c.mkv"]);
-  assert.deepEqual(paths("size-desc"), ["/media/b.mkv", "/media/c.mkv", "/media/a.mkv"]);
-  assert.deepEqual(paths("recent"), ["/media/c.mkv", "/media/a.mkv", "/media/b.mkv"]);
-  assert.equal(files[0].path, "/media/b.mkv");
+  const paths = (order) => sortFiles(files, order).map((file) => file[0].split("/")[2]);
+  assert.deepEqual(paths("path"), ["a", "b", "c"]);
+  assert.deepEqual(paths("name-asc"), ["c", "a", "b"]);
+  assert.deepEqual(paths("name-desc"), ["b", "a", "c"]);
+  assert.deepEqual(paths("duration-asc"), ["a", "b", "c"]);
+  assert.deepEqual(paths("duration-desc"), ["b", "c", "a"]);
+  assert.deepEqual(paths("progress-desc"), ["c", "a", "b"]);
+  assert.equal(files[0][0], "/media/b/episode10.mkv");
 });
 
-test("sort preference survives new library instances and refreshes without refetching on change", async () => {
-  // 共享浏览器存储模拟刷新页面, 确认选择持久化且排序操作不发出 API 请求.
-  let saved = "size-desc";
+// 已移除的旧排序值回到路径排序, 有效偏好在刷新后保留.
+test("sort preference survives refreshes without refetching on local changes", async () => {
+  let saved = "duration-desc";
   globalThis.localStorage = { getItem: () => saved, setItem: (_, value) => { saved = value; } };
-  const nodes = new Map(["#files", "#files-count", "#scan", "#files-sort"].map((selector) => [selector, new Element()]));
-  globalThis.document = {
-    querySelector: (selector) => nodes.get(selector),
-    createElement: (tag) => tag === "button" ? new Button() : new Element(),
-  };
+  const nodes = dom();
   let requests = 0;
   globalThis.fetch = async () => {
     requests++;
-    return { ok: true, status: 200, json: async () => [
-      { name: "small.mkv", path: "/media/small.mkv", size: 1, ddp_epi_id: null },
-      { name: "large.mkv", path: "/media/large.mkv", size: 10, ddp_epi_id: null },
-    ] };
+    return Response.json([entry("/media/short.mkv", 1), entry("/media/long.mkv", 10)]);
   };
   const fail = (error) => assert.fail(String(error));
   const library = new Library(() => {}, fail);
   await library.load();
   const sort = nodes.get("#files-sort");
-  assert.equal(sort.value, "size-desc");
-  assert.equal(nodes.get("#files").children[0].dataset.filePath, "/media/large.mkv");
-  sort.value = "size-asc";
+  assert.equal(sort.value, "duration-desc");
+  assert.equal(nodes.get("#files").children[0].dataset.filePath, "/media/long.mkv");
+  sort.value = "duration-asc";
   sort.onchange();
-  assert.equal(saved, "size-asc");
+  assert.equal(saved, "duration-asc");
   assert.equal(requests, 1);
-  assert.equal(nodes.get("#files").children[0].dataset.filePath, "/media/small.mkv");
-  const restored = new Library(() => {}, fail);
-  assert.equal(sort.value, "size-asc");
-  await restored.load();
-  assert.equal(nodes.get("#files").children[0].dataset.filePath, "/media/small.mkv");
-  saved = "invalid-old-option";
+  assert.equal(nodes.get("#files").children[0].dataset.filePath, "/media/short.mkv");
+  await new Library(() => {}, fail).load();
+  assert.equal(sort.value, "duration-asc");
+  saved = "size-desc";
   new Library(() => {}, fail);
   assert.equal(sort.value, "path");
 });

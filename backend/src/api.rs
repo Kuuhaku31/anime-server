@@ -1,187 +1,143 @@
-//! 定义业务 API 路由和处理函数.
-//! 提供文件查询, 观看进度, 媒体扫描和播放 API 路由.
+
+// backend/src/api.rs
+//! 聚合全局 Manager 并公开按媒体路径操作的 HTTP 契约.
+
+use std::path::PathBuf;
 
 use axum::{
-    extract::{Json, Path, State},
-    http::StatusCode,
-    response::IntoResponse,
-    routing::{get, post},
-    Router,
+    extract::rejection::JsonRejection, http::StatusCode,
+    response::{IntoResponse, Response}, routing::{get, post, put}, Json, Router,
 };
 use serde::Deserialize;
 use serde_json::json;
-use tracing::info;
 
-use crate::{
-    AppState, db, models::ProgressInput, scanner,
-};
+use crate::{models::{MediaConfigs, MediaInfo, ScanChanges}, services};
 
 mod playback;
+mod sessions;
 
-/// 构建业务 API 路由.
-pub(crate) fn router(state: AppState) -> Router {
+pub(crate) use sessions::SessionManager;
+
+/// 组装业务路由, 不向 Axum 注入业务 AppState.
+pub(crate) fn router() -> Router {
     Router::new()
-    .route("/api/files", get(list_files))
-    .route("/api/files/{pre16mib_md5}", get(get_file))
-    .route("/api/files/{pre16mib_md5}/identify", post(identify_file))
-    .route("/api/scan/file", post(scan_file))
-    .route("/api/files/{pre16mib_md5}/progress", get(get_progress).put(save_progress),)
-    .route("/api/config", get(get_config))
-    .route("/api/scan", post(scan))
-    .merge(playback::router())
-    .with_state(state) // 将应用状态传递给所有路由处理函数
+        .route("/api/config", get(get_config))
+        .route("/api/media", get(list_media))
+        .route("/api/media/scan", post(scan_media))
+        .route("/api/media/rescan", post(rescan_media))
+        .route("/api/media/configs", put(save_media_configs))
+        .merge(playback::router())
 }
 
-/// 获取 Web 前端配置.
-async fn get_config(State(state): State<AppState>) -> impl IntoResponse {
-    (StatusCode::OK, Json(state.config.web.clone()))
+/// 提供前端初始化主题所需的公开配置.
+async fn get_config() -> Json<serde_json::Value> {
+    Json(json!({"default_dark_mode": services::config().default_dark_mode}))
 }
 
-/// 获取全部视频记录.
-async fn list_files(State(state): State<AppState>) -> impl IntoResponse {
-    match db::get_video_files(&state.db).await {
-        Ok(items) => (StatusCode::OK, Json(items)).into_response(),
-        Err(error) => internal_error(error),
+/// 逐路径探测元数据并聚合数据库配置, 任一失败都显式返回错误.
+async fn list_media() -> Result<Json<Vec<(PathBuf, MediaInfo)>>, ApiError> {
+    let records = services::database().list_paths_with_configs().await.map_err(ApiError::internal)?;
+    let mut media = Vec::with_capacity(records.len());
+    for record in records {
+        let source_path = services::scanner().resolve(&record.path).await.map_err(ApiError::media)?;
+        let metadata = services::process().probe(&source_path).await.map_err(ApiError::media)?;
+        media.push((record.path, MediaInfo { metadata, configs: record.configs }));
     }
+    Ok(Json(media))
 }
 
-/// 获取视频记录及其所有存储路径.
-async fn get_file(
-    State(state): State<AppState>,
-    Path(pre16mib_md5): Path<String>,
-) -> impl IntoResponse {
-    let video = match db::get_video_by_file_id(&state.db, &pre16mib_md5).await {
-        Ok(Some(video)) => video,
-        Ok(None) => return not_found(),
-        Err(error) => return internal_error(error),
-    };
-
-    let paths = match db::get_video_paths_by_file_id(&state.db, &pre16mib_md5).await {
-        Ok(paths) => paths,
-        Err(error) => return internal_error(error),
-    };
-
-    (
-        StatusCode::OK,
-        Json(json!({
-            "video": video,
-            "paths": paths,
-        })),
-    )
-        .into_response()
+/// 请求扫描器同步全部媒体路径.
+async fn scan_media() -> Result<Json<ScanChanges>, ApiError> {
+    services::scanner().scan_all(services::database()).await.map(Json).map_err(ApiError::internal)
 }
 
-/// 当前识别仅写入演示剧集 ID, 不调用真实 DandanPlay 服务.
-async fn identify_file(
-    State(state): State<AppState>,
-    Path(pre16mib_md5): Path<String>,
-) -> impl IntoResponse {
-    match db::set_mock_identification(&state.db, &pre16mib_md5).await {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(json!({
-                "ok": true,
-                "mode": "mock",
-                "ddp_epi_id": 1,
-            })),
-        )
-            .into_response(),
-        Err(sqlx::Error::RowNotFound) => not_found(),
-        Err(error) => internal_error(error),
-    }
-}
-
-/// 获取视频观看进度.
-async fn get_progress(
-    State(state): State<AppState>,
-    Path(pre16mib_md5): Path<String>,
-) -> impl IntoResponse {
-    match db::get_progress(&state.db, &pre16mib_md5).await {
-        Ok(Some(progress)) => (StatusCode::OK, Json(progress)).into_response(),
-        Ok(None) => not_found(),
-        Err(error) => internal_error(error),
-    }
-}
-
-/// 保存视频观看进度.
-async fn save_progress(
-    State(state): State<AppState>,
-    Path(pre16mib_md5): Path<String>,
-    Json(input): Json<ProgressInput>,
-) -> impl IntoResponse {
-    if !input.position.is_finite() || input.position < 0.0 {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "error": "position must be finite and non-negative"
-            })),
-        )
-            .into_response();
-    }
-
-    match db::save_progress(&state.db, &pre16mib_md5, input.position).await {
-        Ok(()) => (StatusCode::NO_CONTENT, "").into_response(),
-        Err(sqlx::Error::RowNotFound) => not_found(),
-        Err(error) => internal_error(error),
-    }
-}
-
-/// 执行一次媒体目录扫描.
-async fn scan(State(state): State<AppState>) -> impl IntoResponse {
-    match scanner::scan_root(&state).await {
-        Ok(change) => (
-            StatusCode::OK,
-            Json(json!({
-                "ok": true,
-                "scanned": change.total,
-            })),
-        )
-            .into_response(),
-        Err(error) => internal_error(error),
-    }
-}
-
-/// 单文件扫描请求, 服务器完整地址是唯一定位信息.
+/// 定位需要重扫的单个媒体路径.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct FileScanInput {
-    path: std::path::PathBuf,
+struct MediaPathInput {
+    /// 容器内的媒体绝对路径.
+    path: PathBuf,
 }
 
-/// 重新扫描指定记录的单个完整地址, 与全目录扫描共用锁并原子替换路径关联.
-async fn scan_file(
-    State(state): State<AppState>,
-    Json(input): Json<FileScanInput>,
-) -> axum::response::Response {
-
-    info!("服务端收到单文件扫描请求: {:?}, 正在等待锁", input.path);
-    let _scan = state.scan_lock.lock().await;
-    info!("服务端获得扫描锁, 开始扫描: {:?}", input.path);
-
-    // 扫描
-    let file = match crate::scanner::scan_file(&state, &input.path).await {
-        Ok(f) => f,
-        Err(error) => {
-            tracing::warn!("single file scan failed: {error}, path: {:?}", input.path);
-            return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"error": error}))).into_response();
-        },
-    };
-
-
-    let res = (StatusCode::OK, Json(json!({
-        "ok": true, "scanned": usize::from(file.is_some()),
-        "pre16mib_md5": file.as_ref().map(|f| f.pre16mib_md5()),
-    }))).into_response();
-
-    res
+/// 重扫单路径并返回最新媒体条目, 文件已删除时返回 null.
+async fn rescan_media(
+    input: Result<Json<MediaPathInput>, JsonRejection>,
+) -> Result<Json<Option<(PathBuf, MediaInfo)>>, ApiError> {
+    let Json(input) = input.map_err(ApiError::bad)?;
+    services::scanner().check_path(&input.path).map_err(ApiError::bad)?;
+    let Some(file) = services::scanner().scan_one(services::database(), &input.path).await.map_err(ApiError::media)?
+        else { return Ok(Json(None)); };
+    let metadata = services::process().probe(&file.path).await.map_err(ApiError::media)?;
+    let record = services::database().get_file_by_path(&file.path).await.map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::missing("media path was removed during rescan"))?;
+    Ok(Json(Some((file.path, MediaInfo { metadata, configs: record.configs }))))
 }
 
-/// 构造 404 响应.
-fn not_found() -> axum::response::Response {
-    (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response()
+/// 按路径替换完整的共享播放配置.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SaveMediaConfigsInput {
+    /// 容器内媒体路径.
+    path: PathBuf,
+    /// 要保存的进度和全部流偏好.
+    configs: MediaConfigs,
 }
 
-/// 构造 500 响应.
-fn internal_error(error: impl std::fmt::Display) -> axum::response::Response {
-    (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": error.to_string()}))).into_response()
+/// 校验配置形状后保存, 不把前端的等待目标当作播放进度.
+async fn save_media_configs(
+    input: Result<Json<SaveMediaConfigsInput>, JsonRejection>,
+) -> Result<StatusCode, ApiError> {
+    let Json(input) = input.map_err(ApiError::bad)?;
+    services::scanner().check_path(&input.path).map_err(ApiError::bad)?;
+    if input.configs.position.is_some_and(|position| !position.is_finite() || position < 0.0) {
+        return Err(ApiError::bad("position must be finite and non-negative"));
+    }
+    if [input.configs.video_stream_index, input.configs.audio_stream_index, input.configs.subtitle_stream_index]
+        .into_iter().flatten().any(|index| index < 0) {
+        return Err(ApiError::bad("stream indices must be non-negative"));
+    }
+    services::database().save_configs_by_path(&input.path, &input.configs).await.map_err(|error| {
+        if matches!(error, sqlx::Error::RowNotFound) { ApiError::missing(error) }
+        else { ApiError::internal(error) }
+    })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// 保存业务错误状态和可记录的诊断文本.
+#[derive(Debug)]
+struct ApiError {
+    /// HTTP 响应状态.
+    status: StatusCode,
+    /// 返回并记录的错误说明.
+    message: String,
+}
+
+impl ApiError {
+    /// 表示客户端请求格式或选择不合法.
+    fn bad(error: impl std::fmt::Display) -> Self {
+        Self { status: StatusCode::BAD_REQUEST, message: error.to_string() }
+    }
+
+    /// 表示源媒体无法探测或读取.
+    fn media(error: impl std::fmt::Display) -> Self {
+        Self { status: StatusCode::UNPROCESSABLE_ENTITY, message: error.to_string() }
+    }
+
+    /// 表示内部 I/O 或管理器操作失败.
+    fn internal(error: impl std::fmt::Display) -> Self {
+        Self { status: StatusCode::INTERNAL_SERVER_ERROR, message: error.to_string() }
+    }
+
+    /// 表示媒体, 会话或资源不存在.
+    fn missing(error: impl std::fmt::Display) -> Self {
+        Self { status: StatusCode::NOT_FOUND, message: error.to_string() }
+    }
+}
+
+impl IntoResponse for ApiError {
+    /// 统一记录并序列化 API 错误, 不提供成功形状的默认数据.
+    fn into_response(self) -> Response {
+        tracing::warn!(status = self.status.as_u16(), error = self.message, "API request failed");
+        (self.status, Json(json!({"error": self.message}))).into_response()
+    }
 }

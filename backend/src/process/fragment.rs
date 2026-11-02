@@ -1,8 +1,14 @@
+
+// backend/src/process/fragment.rs
 //! 校验 fMP4 样本结构并续接逐轨解码时间轴.
 
 use std::ops::Range;
 
 use anyhow::{ensure, Context, Result};
+
+#[cfg(test)]
+#[path = "../tests/process/fragment.rs"]
+mod tests;
 
 
 const VIDEO_TIMESCALE: u32 = 90_000;
