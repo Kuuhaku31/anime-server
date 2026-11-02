@@ -1,6 +1,6 @@
 # HTTP API
 
-业务路由位于 `backend/src/api.rs` 和 `backend/src/api/playback.rs`.
+业务路由位于 `backend/src/api.rs`.
 请求使用同源地址和 `Content-Type: application/json`.
 当前没有用户鉴权, 不应直接暴露到公网.
 
@@ -14,9 +14,10 @@
 | 方法   | 路径                                 | 作用                              |
 | ------ | ------------------------------------ | --------------------------------- |
 | GET    | `/api/config`                        | 读取配置                          |
-| GET    | `/api/media`                         | 获取 `[path, MediaInfo][]`        |
+| GET    | `/api/media`                         | 获取媒体 ID, 路径和播放配置       |
+| GET    | `/api/media/{file_id}/metadata`      | 探测单个媒体的实时 metadata       |
 | POST   | `/api/media/scan`                    | 全量扫描媒体目录                  |
-| POST   | `/api/media/rescan`                  | 按路径重扫并重新探测单文件        |
+| POST   | `/api/media/rescan`                  | 按路径重扫并返回轻量媒体条目      |
 | PUT    | `/api/media/configs`                 | 按路径保存完整播放配置            |
 | POST   | `/api/cache`                         | 使用 PlaybackQuery 构建或复用缓存 |
 | GET    | `/api/cache`                         | 获取全部缓存及 worker 占用合计    |
@@ -33,39 +34,54 @@
 
 ```json
 [
-  [
-    "/media/series/episode.mkv",
-    {
-      "metadata": {
-        "duration": 1400.0,
-        "format": "matroska,webm",
-        "video_streams": [
-          {
-            "stream_index": 0,
-            "codec_name": "h264",
-            "language": null,
-            "title": null,
-            "is_default": true,
-            "is_forced": false
-          }
-        ],
-        "audio_streams": [],
-        "subtitle_streams": []
-      },
-      "configs": {
-        "position": 125.5,
-        "video_stream_index": 0,
-        "audio_stream_index": null,
-        "subtitle_stream_index": null
-      }
+  {
+    "file_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "path": "/media/series/episode.mkv",
+    "configs": {
+      "position": 125.5,
+      "video_stream_index": 0,
+      "audio_stream_index": null,
+      "subtitle_stream_index": null
     }
-  ]
+  }
 ]
 ```
 
-每个路径单独展示, 相同内容共享 configs.
-metadata 每次按路径实时探测, 任一文件探测失败返回错误,
-不伪造空元数据或静默省略该项.
+列表只查询数据库, 不对媒体文件运行 ffprobe. 每个路径单独返回,
+相同内容的路径使用相同 `file_id` 并共享 configs.
+
+展开或播放单个媒体时, 前端调用 `GET /api/media/{file_id}/metadata`.
+成功返回 `200`:
+
+```json
+{
+  "metadata": {
+    "duration": 1400.0,
+    "format": "matroska,webm",
+    "video_streams": [
+      {
+        "stream_index": 0,
+        "codec_name": "h264",
+        "language": null,
+        "title": null,
+        "is_default": true,
+        "is_forced": false
+      }
+    ],
+    "audio_streams": [],
+    "subtitle_streams": []
+  },
+  "configs": {
+    "position": 125.5,
+    "video_stream_index": 0,
+    "audio_stream_index": null,
+    "subtitle_stream_index": null
+  }
+}
+```
+
+后端按路径顺序探测该内容 ID 的第一个可访问副本. ID 不存在或所有副本都不可用时返回 `404`;
+媒体不可读取或探测失败时返回 `422`.
 流索引是 ffprobe 的容器全局索引, 不是数组下标.
 视频封面和字体附件不作为可选流返回, 不提供外挂字幕.
 
@@ -84,10 +100,25 @@ total 是扫描完成后数据库中的路径数量, 多副本分别计数.
 `POST /api/media/rescan`:
 
 ```json
-{ "path": "/media/series/episode.mkv" }
+"/media/series/episode.mkv"
 ```
 
-成功返回 `200` 和最新的 `[path, MediaInfo]`.
+请求体是 JSON 路径字符串, 不使用 `{ "path": "..." }` 对象.
+成功返回 `200` 和最新的轻量媒体条目:
+
+```json
+{
+  "file_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "path": "/media/series/episode.mkv",
+  "configs": {
+    "position": 125.5,
+    "video_stream_index": 0,
+    "audio_stream_index": null,
+    "subtitle_stream_index": null
+  }
+}
+```
+
 文件已经消失时删除其路径关联并返回 JSON `null`.
 路径必须位于媒体根目录, 不允许父目录跳转或指向目录外的符号链接.
 重扫不停止缓存生成. 内容改变后, 旧缓存可能失去源路径, 不能再播放或重试.
@@ -106,6 +137,7 @@ total 是扫描完成后数据库中的路径数量, 多副本分别计数.
 }
 ```
 
+请求体是 `{ "path": "...", "configs": { ... } }`.
 成功返回 `204`, 未登记路径返回 `404`.
 这是完整替换而不是 PATCH, 未提供的可选配置字段成为 null.
 position 必须为 null 或有限非负秒数, 流索引必须为 null 或非负整数.
@@ -168,20 +200,18 @@ curl --fail http://localhost:56080/api/cache \
     "resources": { "encoder_slots": 0, "process_slots": 0, "ffmpeg_threads": 0 },
     "source_path": "/media/series/episode.mkv"
   },
-  "media": {
-    "metadata": {
-      "duration": 1400.0,
-      "format": "matroska,webm",
-      "video_streams": [],
-      "audio_streams": [],
-      "subtitle_streams": []
-    },
-    "configs": {
-      "position": 125.5,
-      "video_stream_index": 0,
-      "audio_stream_index": 1,
-      "subtitle_stream_index": null
-    }
+  "media_meta": {
+    "duration": 1400.0,
+    "format": "matroska,webm",
+    "video_streams": [],
+    "audio_streams": [],
+    "subtitle_streams": []
+  },
+  "media_configs": {
+    "position": 125.5,
+    "video_stream_index": 0,
+    "audio_stream_index": 1,
+    "subtitle_stream_index": null
   }
 }
 ```
@@ -193,7 +223,7 @@ curl --fail http://localhost:56080/api/cache \
 
 PlaybackQuery 不包含 position. 前端从 media.configs.position 或本地用户操作确定目标,
 接近片尾的历史进度在前端从头播放. start_time, duration 和 selection
-不再独立返回, duration 位于 media.metadata 中.
+不再独立返回, duration 位于 media_meta 中.
 
 ## 缓存列表与状态
 

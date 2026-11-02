@@ -31,12 +31,14 @@ CacheManager 的查询和资源接口只接收 handle_id, 不接收客户端提�
 
 ## 共享模型
 
-前端媒体列表为 `[path, MediaInfo][]`. path 是容器内绝对路径,
-同内容副本各自作为列表项. 另有 `Map<handle_id, CacheEntry>` 保存全部缓存的内存快照,
+前端媒体列表只包含数据库内容 ID, 容器内绝对路径和共享配置.
+同内容副本各自作为列表项, metadata 由 `/api/media/{file_id}/metadata` 按需探测,
+前端按 `file_id` 在内存缓存探测结果. 另有 `Map<handle_id, CacheEntry>` 保存全部缓存的内存快照,
 页面刷新后由服务端重建, 不持久化到浏览器存储.
 
 | 模型           | 字段                                                                    |
 | -------------- | ----------------------------------------------------------------------- |
+| MediaFile      | file_id, path, configs                                                  |
 | MediaInfo      | metadata, configs                                                       |
 | MediaMetadata  | duration, format, video_streams, audio_streams, subtitle_streams        |
 | StreamInfo     | stream_index, codec_name, language, title, is_default, is_forced        |
@@ -44,7 +46,7 @@ CacheManager 的查询和资源接口只接收 handle_id, 不接收客户端提�
 | PlaybackQuery  | path, video_stream_index, audio_stream_index, subtitle_stream_index     |
 | CacheStatus    | phase, buffered_until, error                                            |
 | CacheSnapshot  | handle_id, spec, status, resources, source_path                        |
-| CacheBuild     | cache, media; 实际流选择位于 cache.spec                                  |
+| CacheBuild     | cache, media_meta, media_configs; 实际流选择位于 cache.spec              |
 | CacheList      | entries                                                               |
 | WorkerResources | encoder_slots, process_slots, ffmpeg_threads                           |
 
@@ -64,7 +66,9 @@ MediaMetadata 内部额外保留容器起点, 字体附件和视频色彩信息,
 
 单路径扫描用于手动重扫和播放前重新计算身份. 文件消失时删除该路径,
 当前数据库保留没有路径的 file 配置, 不因删除缓存而删除观看配置.
-媒体列表由 API 逐路径实时调用 ProcessManager 探测, 不使用 metadata Map.
+媒体列表只查询数据库并返回 file_id, path 和共享配置, 不运行 ffprobe.
+前端仅在展开单个条目时按 file_id 请求 metadata, 相同内容的展开副本共享请求与结果.
+重扫会使受影响内容的 metadata 缓存失效, 展开状态保留并重新探测.
 缓存列表按 media_id 查询排序后的路径, 跳过已经消失的副本,
 不在每次轮询中运行 ffprobe. 重试必须重扫源路径并比对原 media_id,
 内容已被替换则明确拒绝, 不把旧句柄续接到新媒体.

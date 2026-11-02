@@ -1,4 +1,5 @@
 
+
 // frontend/src/playback/playback-controller.test.js
 // 在无浏览器环境验证构建与播放分离, 本地等待和缓存生命周期.
 import assert from "node:assert/strict";
@@ -76,6 +77,9 @@ const info = {
   configs: { position: 12.375, video_stream_index: null, audio_stream_index: null, subtitle_stream_index: null },
 };
 const file = ["/media/video.mkv", info];
+const mediaFile = {
+  file_id: "a".repeat(32), path: file[0], configs: info.configs,
+};
 
 /** 模拟缓存 HTTP 契约, 同选择复用稳定句柄且播放不创建映射. */
 function server(context, generated = 120) {
@@ -86,7 +90,11 @@ function server(context, generated = 120) {
     const method = options.method ?? "GET";
     calls.push({ url, method, body });
     let result;
-    if (url.endsWith("/rescan")) result = file;
+    if (url.endsWith("/rescan")) {
+      assert.equal(body, file[0]);
+      result = mediaFile;
+    }
+    else if (url === `/api/media/${mediaFile.file_id}/metadata`) result = info;
     else if (method === "DELETE") {
       caches.delete(url.split("/").at(-1));
       return new Response(null, { status: 204 });
@@ -105,7 +113,7 @@ function server(context, generated = 120) {
         resources: { encoder_slots: 1, process_slots: 1, ffmpeg_threads: 2 },
       };
       caches.set(handleId, cache);
-      result = { cache, media: info };
+      result = { cache, media_meta: info.metadata, media_configs: info.configs };
     } else if (url === "/api/cache" && method === "GET") {
       result = { entries: [...caches.values()] };
     } else if (method === "GET" && url.startsWith("/api/cache/")) result = caches.get(url.split("/").at(-1));

@@ -1,17 +1,18 @@
 
+
 // frontend/src/playback/playback-controller.ts
 // 协调稳定缓存句柄, 本地播放位置和浏览器媒体引擎.
 
-import { isAbort, playbackUrl, rescanMedia, saveConfigs, wait } from "../api/anime-server.ts";
+import { getMediaMetadata, isAbort, playbackUrl, rescanMedia, saveConfigs, wait } from "../api/anime-server.ts";
 import { CacheStore } from "../state/cache-store.ts";
-import type { CacheEntry, CacheStatus, MediaEntry, MediaInfo, PlaybackQuery, StreamSelection } from "../state/player-state.ts";
+import type { CacheEntry, CacheStatus, MediaInfo, PlaybackMedia, PlaybackQuery, StreamSelection } from "../state/player-state.ts";
 import { MediaAdapter } from "./hls-adapter.ts";
 import { absoluteTime, formatTime, rangeReady } from "./timeline.ts";
 
 /** 播放器只维护本地操作, 构建和缓存管理由共享 CacheStore 执行. */
 export class PlaybackController extends EventTarget {
   /** 当前选中的源路径和媒体信息. */
-  file: MediaEntry | null = null;
+  file: PlaybackMedia | null = null;
   /** 最近一次重新探测得到的媒体信息. */
   info: MediaInfo | null = null;
   /** 当前选中缓存的稳定标识, 本地停止不会删除它. */
@@ -108,7 +109,7 @@ export class PlaybackController extends EventTarget {
   }
 
   /** 文件列表点播先发送 PlaybackQuery 构建, 然后通过句柄加载资源. */
-  open(file: MediaEntry): void {
+  open(file: PlaybackMedia): void {
     this.enqueue(async (signal) => {
       await this.persist();
       this.unload();
@@ -135,12 +136,14 @@ export class PlaybackController extends EventTarget {
       const media = await rescanMedia(entry.source_path, signal);
       signal.throwIfAborted();
       if (!media) throw new Error("Cache source media was removed");
+      const info = await getMediaMetadata(media.file_id, signal);
+      signal.throwIfAborted();
       await this.caches.refresh();
       signal.throwIfAborted();
       const current = this.requireCache(handleId);
-      if (current.source_path !== media[0]) throw new Error("Cache source changed. Refresh the cache list.");
-      this.file = media;
-      this.info = media[1];
+      if (current.source_path !== media.path) throw new Error("Cache source changed. Refresh the cache list.");
+      this.file = [media.path, info];
+      this.info = info;
       this.useCache(current);
       const saved = this.info.configs.position ?? 0;
       this.savedPosition = saved < this.duration - 2 ? saved : 0;
@@ -157,8 +160,8 @@ export class PlaybackController extends EventTarget {
         const entry = await rescanMedia(this.file[0], signal);
         signal.throwIfAborted();
         if (!entry) throw new Error("Media file was removed");
-        this.file = entry;
-        this.info = entry[1];
+        this.file = [entry.path, await getMediaMetadata(entry.file_id, signal)];
+        this.info = this.file[1];
         this.selection = null;
       }
       await this.build(initialized ? this.savedPosition : undefined, true, signal);
@@ -332,10 +335,10 @@ export class PlaybackController extends EventTarget {
     }
     const response = await this.caches.build(query);
     signal.throwIfAborted();
-    this.info = response.media;
-    this.file = [path, response.media];
+    this.info = { metadata: response.media_meta, configs: response.media_configs };
+    this.file = [path, this.info];
     this.useCache(this.requireCache(response.cache.handle_id));
-    const saved = response.media.configs.position ?? 0;
+    const saved = this.info.configs.position ?? 0;
     const target = position ?? (saved < this.duration - 2 ? saved : 0);
     this.savedPosition = Math.max(0, Math.min(target, this.duration - 0.1));
     await this.waitForRange(this.savedPosition, autoplay, signal, true);

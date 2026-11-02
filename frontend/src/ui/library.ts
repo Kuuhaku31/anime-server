@@ -1,36 +1,51 @@
 
 // frontend/src/ui/library.ts
-// 展示可展开的媒体文件配置, 仅通过明确操作创建缓存.
+// 展示轻量媒体列表, 展开时按需探测元数据并创建缓存.
 
-import { listMedia, rescanMedia, scanMedia } from "../api/anime-server.ts";
-import type { MediaEntry, MediaInfo, PlaybackQuery, StreamInfo, StreamSelection } from "../state/player-state.ts";
+import { getMediaMetadata, listMedia, rescanMedia, scanMedia } from "../api/anime-server.ts";
+import type { MediaEntry, MediaInfo, PlaybackMedia, PlaybackQuery, StreamInfo, StreamSelection } from "../state/player-state.ts";
 import { formatTime } from "../playback/timeline.ts";
 import { element } from "./controls.ts";
 
 /** 用容器内路径区分同内容媒体的不同副本. */
-export function fileAddress(file: MediaEntry): string {
+export function fileAddress(file: PlaybackMedia): string {
   return file[0];
 }
 
 /** 从容器路径取得显示名称, 不在 API 中维护冗余文件名. */
 export function fileName(file: MediaEntry): string {
-  return file[0].split("/").at(-1) ?? file[0];
+  return file.path.split("/").at(-1) ?? file.path;
 }
 
-/** 按当前模型中的字段排序, 相同值按完整路径稳定排序. */
-export function sortFiles(files: MediaEntry[], order: SortOrder): MediaEntry[] {
+/** 按列表字段排序, 未加载 metadata 的条目保持路径稳定顺序. */
+export function sortFiles(
+  files: MediaEntry[], order: SortOrder, metadata: ReadonlyMap<string, MediaInfo> = new Map(),
+): MediaEntry[] {
   const compareText = (left: string, right: string): number => left.localeCompare(right, undefined, { numeric: true });
   return [...files].sort((left, right) => {
     let result = 0;
     if (order === "name-asc") result = compareText(fileName(left), fileName(right));
     else if (order === "name-desc") result = compareText(fileName(right), fileName(left));
-    else if (order === "duration-asc") result = left[1].metadata.duration - right[1].metadata.duration;
-    else if (order === "duration-desc") result = right[1].metadata.duration - left[1].metadata.duration;
-    else if (order === "progress-desc") {
-      result = (right[1].configs.position ?? 0) / right[1].metadata.duration
-        - (left[1].configs.position ?? 0) / left[1].metadata.duration;
+    else if (order === "duration-asc" || order === "duration-desc") {
+      const leftInfo = metadata.get(left.file_id);
+      const rightInfo = metadata.get(right.file_id);
+      if (leftInfo && rightInfo) {
+        result = order === "duration-asc"
+          ? leftInfo.metadata.duration - rightInfo.metadata.duration
+          : rightInfo.metadata.duration - leftInfo.metadata.duration;
+      }
+    } else if (order === "progress-desc") {
+      const leftInfo = metadata.get(left.file_id);
+      const rightInfo = metadata.get(right.file_id);
+      const leftPosition = left.configs.position ?? 0;
+      const rightPosition = right.configs.position ?? 0;
+      const leftProgress = leftInfo && leftInfo.metadata.duration > 0
+        ? leftPosition / leftInfo.metadata.duration : leftPosition;
+      const rightProgress = rightInfo && rightInfo.metadata.duration > 0
+        ? rightPosition / rightInfo.metadata.duration : rightPosition;
+      result = rightProgress - leftProgress;
     }
-    return result || compareText(left[0], right[0]);
+    return result || compareText(left.path, right.path);
   });
 }
 
@@ -53,7 +68,7 @@ export function initialSelection(info: MediaInfo): StreamSelection | null {
   };
 }
 
-/** 管理媒体列表加载, 多行展开, 流选择和按路径缓存创建. */
+/** 管理媒体列表, 展开状态, 延迟 metadata 和缓存构建. */
 export class Library extends EventTarget {
   /** 绑定列表事件, 排序偏好和缓存构建回调. */
   constructor(build: (query: PlaybackQuery) => Promise<unknown>, fail: (error: unknown) => void) {
@@ -87,35 +102,46 @@ export class Library extends EventTarget {
     };
   }
 
-  /** 获取最新路径列表, 保留仍然存在路径的展开和选择状态. */
+  /** 获取轻量路径列表, 保留现存路径的展开和已加载 metadata. */
   async load(): Promise<void> {
     this.files = await listMedia();
-    const paths = new Set(this.files.map(([path]) => path));
+    const paths = new Set(this.files.map((file) => file.path));
+    const fileIds = new Set(this.files.map((file) => file.file_id));
     this.expanded = new Set([...this.expanded].filter((path) => paths.has(path)));
     this.selections = new Map([...this.selections].filter(([path]) => paths.has(path)));
     this.errors = new Map([...this.errors].filter(([path]) => paths.has(path)));
-    for (const [path, info] of this.files) {
-      const current = this.selections.get(path);
-      if (!this.selections.has(path) || !validSelection(info, current)) {
-        this.selections.set(path, initialSelection(info));
-      }
-    }
+    this.metadata = new Map([...this.metadata].filter(([fileId]) => fileIds.has(fileId)));
+    this.metadataErrors = new Map([...this.metadataErrors].filter(([fileId]) => fileIds.has(fileId)));
+    this.loading = new Set([...this.loading].filter((fileId) => fileIds.has(fileId)));
     this.render();
     this.dispatchEvent(new Event("change"));
+    await Promise.all(this.files
+      .filter((file) => this.expanded.has(file.path) && !this.metadata.has(file.file_id))
+      .map((file) => this.loadMetadata(file)));
   }
 
-  /** 为缓存列表提供已加载的源媒体时长, 不在轮询中重复探测. */
+  /** 为缓存列表提供已加载源路径的媒体信息. */
   info(path: string | null): MediaInfo | null {
-    return this.files.find((file) => file[0] === path)?.[1] ?? null;
+    if (!path) return null;
+    const file = this.files.find((entry) => entry.path === path);
+    return file ? this.metadata.get(file.file_id) ?? null : null;
   }
 
   /** 当前媒体列表的 DOM 容器. */
   private container = element<HTMLDivElement>("#files");
-  /** 当前路径和媒体信息列表. */
+  /** 当前数据库登记的媒体路径列表. */
   private files: MediaEntry[] = [];
+  /** 按数据库文件 ID 缓存的单文件 metadata. */
+  private metadata = new Map<string, MediaInfo>();
+  /** 正在按需获取 metadata 的内容 ID. */
+  private loading = new Set<string>();
+  /** 使重扫前仍在途的 metadata 响应失效. */
+  private metadataVersions = new Map<string, number>();
+  /** 按内容 ID 缓存的 metadata 请求错误. */
+  private metadataErrors = new Map<string, string>();
   /** 显示缓存构建请求的回调. */
   private build: (query: PlaybackQuery) => Promise<unknown>;
-  /** 展示失败操作的回调. */
+  /** 展示全局操作失败的回调. */
   private fail: (error: unknown) => void;
   /** 当前高亮的播放源路径. */
   private active: string | null = null;
@@ -127,7 +153,7 @@ export class Library extends EventTarget {
   private scanning = new Set<string>();
   /** 正在创建缓存的路径. */
   private building = new Set<string>();
-  /** 各路径最新一次操作的明确诊断. */
+  /** 各路径重扫和缓存操作的诊断. */
   private errors = new Map<string, string>();
   /** 当前使用的本地排序选项. */
   private sort: SortOrder = "path";
@@ -141,8 +167,12 @@ export class Library extends EventTarget {
       event.preventDefault();
       const path = summary.dataset.path;
       if (!path) return;
+      const file = this.files.find((item) => item.path === path);
       if (this.expanded.has(path)) this.expanded.delete(path);
-      else this.expanded.add(path);
+      else {
+        this.expanded.add(path);
+        if (file) void this.loadMetadata(file);
+      }
       this.render();
       return;
     }
@@ -150,10 +180,47 @@ export class Library extends EventTarget {
     if (!button || !this.container.contains(button)) return;
     const path = button.dataset.path;
     if (!path || button.disabled) return;
-    const file = this.files.find(([address]) => address === path);
+    const file = this.files.find((item) => item.path === path);
     if (!file) return;
     if (button.dataset.action === "build") void this.createCache(file);
     else if (button.dataset.action === "scan") void this.rescan(path);
+    else if (button.dataset.action === "metadata") void this.loadMetadata(file, true);
+  }
+
+  /** 加载单个 metadata 并在同内容列表项间共享结果. */
+  private async loadMetadata(file: MediaEntry, retry = false): Promise<void> {
+    if (this.metadata.has(file.file_id) || this.loading.has(file.file_id)) return;
+    if (this.metadataErrors.has(file.file_id) && !retry) return;
+    const version = this.metadataVersions.get(file.file_id) ?? 0;
+    this.metadataVersions.set(file.file_id, version);
+    this.loading.add(file.file_id);
+    this.metadataErrors.delete(file.file_id);
+    this.render();
+    try {
+      const info = await getMediaMetadata(file.file_id);
+      if (this.metadataVersions.get(file.file_id) !== version
+        || !this.files.some((item) => item.file_id === file.file_id)) return;
+      this.metadata.set(file.file_id, info);
+      for (const item of this.files) {
+        if (item.file_id !== file.file_id) continue;
+        item.configs = info.configs;
+        const selection = this.selections.get(item.path);
+        if (!this.selections.has(item.path) || !validSelection(info, selection)) {
+          this.selections.set(item.path, initialSelection(info));
+        }
+      }
+    } catch (error) {
+      if (this.metadataVersions.get(file.file_id) === version
+        && this.files.some((item) => item.file_id === file.file_id)) {
+        this.metadataErrors.set(file.file_id, error instanceof Error ? error.message : String(error));
+      }
+    } finally {
+      if (this.metadataVersions.get(file.file_id) === version) {
+        this.loading.delete(file.file_id);
+        this.render();
+        this.dispatchEvent(new Event("change"));
+      }
+    }
   }
 
   /** 保存展开详情中的临时流选择, 不写入观看配置. */
@@ -180,36 +247,42 @@ export class Library extends EventTarget {
 
   /** 显式构建当前行所选轨道的缓存, 不切换播放器或保存观看配置. */
   private async createCache(file: MediaEntry): Promise<void> {
-    const [path] = file;
-    const selection = this.selections.get(path);
-    if (!selection || this.building.has(path)) return;
-    this.building.add(path);
-    this.errors.delete(path);
+    const selection = this.selections.get(file.path);
+    if (!this.metadata.has(file.file_id) || !selection || this.building.has(file.path)) return;
+    this.building.add(file.path);
+    this.errors.delete(file.path);
     this.render();
     try {
-      await this.build({ path, ...selection });
+      await this.build({ path: file.path, ...selection });
     } catch (error) {
-      this.errors.set(path, error instanceof Error ? error.message : String(error));
-      this.fail(error);
+      this.errors.set(file.path, error instanceof Error ? error.message : String(error));
     } finally {
-      this.building.delete(path);
+      this.building.delete(file.path);
       this.render();
     }
   }
 
-  /** 重新扫描单路径, 更新媒体元数据并恢复本行操作状态. */
+  /** 重扫单路径并更新列表, 展开项随后重新按需获取 metadata. */
   private async rescan(path: string): Promise<void> {
     if (this.scanning.has(path)) return;
     this.scanning.add(path);
     this.errors.delete(path);
     this.render();
     try {
-      await rescanMedia(path);
+      const updated = await rescanMedia(path);
       this.selections.delete(path);
+      const previous = this.files.find((file) => file.path === path);
+      if (previous) {
+        this.metadataVersions.set(previous.file_id, (this.metadataVersions.get(previous.file_id) ?? 0) + 1);
+        this.loading.delete(previous.file_id);
+        this.metadata.delete(previous.file_id);
+        this.metadataErrors.delete(previous.file_id);
+      }
       await this.load();
+      const current = this.files.find((file) => file.path === path);
+      if (updated && current && this.expanded.has(path)) await this.loadMetadata(current);
     } catch (error) {
       this.errors.set(path, error instanceof Error ? error.message : String(error));
-      this.fail(error);
     } finally {
       this.scanning.delete(path);
       this.render();
@@ -226,15 +299,16 @@ export class Library extends EventTarget {
   /** 按展开集合和排序结果渲染紧凑行, 所有文本通过 textContent 设置. */
   private render(): void {
     element("#files-count").textContent = String(this.files.length);
-    const rows = sortFiles(this.files, this.sort).map((file) => this.row(file));
+    const rows = sortFiles(this.files, this.sort, this.metadata).map((file) => this.row(file));
     this.container.replaceChildren(...rows);
     if (!rows.length) this.container.textContent = "No media files found. Check the media mount and scan again.";
   }
 
   /** 创建一个可独立展开的路径条目及可选详情. */
   private row(file: MediaEntry): HTMLDetailsElement {
-    const [path, info] = file;
+    const { path, file_id: fileId, configs } = file;
     const expanded = this.expanded.has(path);
+    const info = this.metadata.get(fileId) ?? null;
     const selection = this.selections.get(path) ?? null;
     const row = document.createElement("details");
     row.className = `file-row${path === this.active ? " active" : ""}`;
@@ -249,62 +323,85 @@ export class Library extends EventTarget {
     name.title = path;
     const detail = document.createElement("span");
     detail.className = "file-summary-meta";
-    const position = info.configs.position === null ? "Not watched" : `Watched ${formatTime(info.configs.position)}`;
-    detail.textContent = `${formatTime(info.metadata.duration)} / ${info.metadata.format} / ${position}`;
+    const position = configs.position === null ? "Not watched" : `Watched ${formatTime(configs.position)}`;
+    detail.textContent = info
+      ? `${formatTime(info.metadata.duration)} / ${info.metadata.format} / ${position}` : position;
     summary.append(name, detail);
     row.append(summary);
 
-    if (expanded) row.append(this.details(path, info, selection));
+    if (expanded) row.append(this.details(file, info, selection));
     return row;
   }
 
-  /** 展示完整媒体状态, 轨道选择及缓存创建操作. */
-  private details(path: string, info: MediaInfo, selection: StreamSelection | null): HTMLDivElement {
+  /** 展示完整状态, metadata 请求结果或局部错误以及可用操作. */
+  private details(file: MediaEntry, info: MediaInfo | null, selection: StreamSelection | null): HTMLDivElement {
+    const { path, file_id: fileId, configs } = file;
     const details = document.createElement("div");
     details.className = "file-details";
     const source = document.createElement("code");
     source.className = "file-path";
     source.textContent = path;
-    const status = document.createElement("p");
-    status.className = "item-status";
-    status.textContent = `Ready / ${formatTime(info.metadata.duration)} / ${info.metadata.format} / ${info.metadata.video_streams.length} video, ${info.metadata.audio_streams.length} audio, ${info.metadata.subtitle_streams.length} subtitle streams`;
     const saved = document.createElement("p");
     saved.className = "item-status";
-    saved.textContent = `Saved position: ${info.configs.position === null ? "none" : formatTime(info.configs.position)}`;
-    details.append(source, status, saved);
+    saved.textContent = `Saved position: ${configs.position === null ? "none" : formatTime(configs.position)}`;
+    details.append(source, saved);
 
-    const tracks = document.createElement("div");
-    tracks.className = "media-track-selectors";
-    tracks.append(
-      this.streamSelect(path, "video", "Video", info.metadata.video_streams, selection?.video_stream_index ?? null, false),
-      this.streamSelect(path, "audio", "Audio", info.metadata.audio_streams, selection?.audio_stream_index ?? null, true),
-      this.streamSelect(path, "subtitle", "Subtitles", info.metadata.subtitle_streams, selection?.subtitle_stream_index ?? null, true),
-    );
-    details.append(tracks);
+    if (info) {
+      const status = document.createElement("p");
+      status.className = "item-status";
+      status.textContent = `Ready / ${formatTime(info.metadata.duration)} / ${info.metadata.format} / ${info.metadata.video_streams.length} video, ${info.metadata.audio_streams.length} audio, ${info.metadata.subtitle_streams.length} subtitle streams`;
+      details.append(status);
+      const tracks = document.createElement("div");
+      tracks.className = "media-track-selectors";
+      tracks.append(
+        this.streamSelect(path, "video", "Video", info.metadata.video_streams, selection?.video_stream_index ?? null, false),
+        this.streamSelect(path, "audio", "Audio", info.metadata.audio_streams, selection?.audio_stream_index ?? null, true),
+        this.streamSelect(path, "subtitle", "Subtitles", info.metadata.subtitle_streams, selection?.subtitle_stream_index ?? null, true),
+      );
+      details.append(tracks);
+    } else {
+      const loading = document.createElement("p");
+      loading.className = "item-status";
+      loading.textContent = this.loading.has(fileId) ? "Loading metadata..." : "Metadata not loaded";
+      details.append(loading);
+    }
 
-    const error = this.errors.get(path);
+    const metadataError = this.metadataErrors.get(fileId);
+    const error = this.errors.get(path) ?? metadataError;
     if (error) {
       const diagnostic = document.createElement("p");
       diagnostic.className = "item-error";
       diagnostic.textContent = error;
       details.append(diagnostic);
     }
+
     const actions = document.createElement("div");
     actions.className = "item-actions";
-    const build = document.createElement("button");
-    build.type = "button";
-    build.dataset.action = "build";
-    build.dataset.path = path;
-    build.className = "primary-button";
-    build.textContent = this.building.has(path) ? "Creating cache..." : "Create cache folder";
-    build.disabled = selection === null || this.building.has(path);
+    if (info) {
+      const build = document.createElement("button");
+      build.type = "button";
+      build.dataset.action = "build";
+      build.dataset.path = path;
+      build.className = "primary-button";
+      build.textContent = this.building.has(path) ? "Creating cache..." : "Create cache folder";
+      build.disabled = selection === null || this.building.has(path);
+      actions.append(build);
+    } else if (metadataError) {
+      const retry = document.createElement("button");
+      retry.type = "button";
+      retry.dataset.action = "metadata";
+      retry.dataset.path = path;
+      retry.textContent = "Retry metadata";
+      retry.disabled = this.loading.has(fileId);
+      actions.append(retry);
+    }
     const scan = document.createElement("button");
     scan.type = "button";
     scan.dataset.action = "scan";
     scan.dataset.path = path;
     scan.textContent = this.scanning.has(path) ? "Scanning..." : "Rescan";
     scan.disabled = this.scanning.has(path) || this.building.has(path);
-    actions.append(build, scan);
+    actions.append(scan);
     details.append(actions);
     return details;
   }

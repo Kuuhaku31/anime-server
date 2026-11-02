@@ -1,6 +1,8 @@
 
 // backend/src/tests/models.rs
-//! 验证稳定缓存身份和公开媒体契约.
+
+// backend/src/tests/models.rs
+// 验证稳定缓存身份和媒体请求契约.
 
 use super::*;
 
@@ -23,16 +25,4 @@ fn cache_descriptor_round_trips_and_keeps_ordered_identity() {
     changed = spec.clone();
     changed.version.push_str("-next");
     assert_ne!(changed.handle_id().unwrap(), spec.handle_id().unwrap());
-}
-
-/// 前端只能接收 metadata 和 configs, 内部时间轴和附件不泄露.
-#[test]
-fn media_response_keeps_internal_probe_details_private() {
-    let media = (crate::testing::metadata(), MediaConfigs::default());
-    let json = serde_json::to_value(media).unwrap();
-    assert_eq!(json.as_array().unwrap().len(), 2);
-    assert!(json[0].get("video_streams").is_some());
-    assert!(json[0].get("start_time").is_none());
-    assert!(json[0].get("attachments").is_none());
-    assert!(json[0]["video_streams"][0].get("color_transfer").is_none());
 }

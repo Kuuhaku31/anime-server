@@ -14,9 +14,10 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
 type SqlxErr = sqlx::Error; // 为 sqlx::Error 定义别名, 便于统一管理错误类型.
 
-type PathAndConfigsList = Vec<(PathBuf, MediaConfigs)>;
+type MediaPathList = Vec<(String, PathBuf, MediaConfigs)>;
 type PathAndIdentityList = Vec<(PathBuf, String)>;
 type OptionIdAndConfigs = Option<(String, MediaConfigs)>;
+type PathConfigsList = Vec<(PathBuf, MediaConfigs)>;
 
 #[cfg(test)]
 #[path = "tests/db.rs"]
@@ -46,11 +47,12 @@ impl DatabaseManager {
     pub(crate) async fn shutdown(&self) { self.pool.close().await; }
 
     /// 返回所有路径及其对应的配置
-    pub(crate) async fn list_paths_with_configs(&self) 
-    -> Result<PathAndConfigsList, SqlxErr>
+    pub(crate) async fn list_paths_with_configs(&self)
+    -> Result<MediaPathList, SqlxErr>
     {
         let sql = "
-            SELECT fp.path,
+            SELECT fp.media_id,
+                   fp.path,
                    f.position,
                    f.video_stream_index,
                    f.audio_stream_index,
@@ -58,17 +60,37 @@ impl DatabaseManager {
             FROM file_path AS fp
             JOIN file AS f ON f.media_id = fp.media_id ORDER BY fp.path
         ";
-        type Row = (String, Option<f64>, Option<i32>, Option<i32>, Option<i32>);
+        type Row = (String, String, Option<f64>, Option<i32>, Option<i32>, Option<i32>);
 
         let rows = sqlx::query_as::<_, Row>(sql).fetch_all(&self.pool).await?;
-        Ok(rows.into_iter().map(|(ph, po, v_s, a_s, s_s)|(
-            PathBuf::from(ph),
+        Ok(rows.into_iter().map(|(media_id, path, po, v_s, a_s, s_s)|(
+            media_id,
+            PathBuf::from(path),
             MediaConfigs {
                 position: po,
                 video_stream_index: v_s,
                 audio_stream_index: a_s,
                 subtitle_stream_index: s_s
             }
+        )).collect())
+    }
+
+    /// 根据内容 ID 返回排序后的路径副本和共享配置.
+    pub(crate) async fn paths_with_configs_by_id(&self, media_id: &str) -> Result<PathConfigsList, SqlxErr> {
+        type Row = (String, Option<f64>, Option<i32>, Option<i32>, Option<i32>);
+        let rows = sqlx::query_as::<_, Row>(
+            "SELECT fp.path, f.position, f.video_stream_index, f.audio_stream_index, f.subtitle_stream_index \
+             FROM file_path AS fp JOIN file AS f ON f.media_id = fp.media_id \
+             WHERE fp.media_id = ? ORDER BY fp.path",
+        ).bind(media_id).fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(|(path, position, video, audio, subtitle)| (
+            PathBuf::from(path),
+            MediaConfigs {
+                position,
+                video_stream_index: video,
+                audio_stream_index: audio,
+                subtitle_stream_index: subtitle,
+            },
         )).collect())
     }
 

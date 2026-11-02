@@ -1,6 +1,7 @@
 
+
 // backend/src/models.rs
-//! 定义媒体索引, 播放请求响应和稳定缓存身份.
+// 定义媒体索引, 播放请求和稳定缓存身份.
 
 use std::path::{Path, PathBuf};
 
@@ -8,7 +9,7 @@ use anyhow::{ensure, Result};
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 
-use crate::{cache::CacheSnapshot, constants::HASH_LIMIT, utils};
+use crate::{constants::HASH_LIMIT, utils};
 
 mod media;
 
@@ -17,16 +18,6 @@ mod media;
 mod tests;
 
 pub(crate) use media::{Attachment, MediaConfigs, MediaMetadata, StreamInfo};
-
-// /// 保存内容标识对应的共享播放配置.
-// #[derive(Debug, sqlx::FromRow)]
-// pub(crate) struct FileRecord {
-//     /// 媒体内容主键.
-//     pub(crate) media_id: String,
-//     /// 同内容的所有路径共享的播放配置.
-//     #[sqlx(flatten)]
-//     pub(crate) configs: MediaConfigs,
-// }
 
 
 /// 保存一次文件扫描得到的内容身份.
@@ -77,16 +68,6 @@ pub(crate) struct PlaybackQuery {
     /// 请求的字幕索引, 缺省继承偏好, 显式 null 关闭字幕.
     #[serde(default, deserialize_with = "track_choice")]
     pub(crate) subtitle_stream_index: Option<Option<i32>>,
-}
-
-/// 返回构建结果及最新媒体信息, 实际流选择位于 cache.spec.
-#[derive(Debug, Serialize)]
-pub(crate) struct CacheBuild {
-    /// 新建或复用的缓存条目.
-    pub(crate) cache: CacheSnapshot,
-    /// 当前路径重新探测的元数据和共享配置.
-    pub(crate) media_meta: MediaMetadata,
-    pub(crate) media_configs: MediaConfigs,
 }
 
 /// 以固定字段顺序定义缓存身份和 instance.json 的唯一格式.

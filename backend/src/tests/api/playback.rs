@@ -1,8 +1,50 @@
 
 // backend/src/tests/api/playback.rs
-//! 验证播放请求字段和缓存源路径查询.
+
+// backend/src/tests/api/playback.rs
+// 验证 API 请求和响应契约以及缓存源路径查询.
 
 use super::*;
+
+/// HTTP JSON 提取器按当前契约接收重扫路径字符串和配置对象.
+#[tokio::test]
+async fn media_mutation_requests_match_frontend_json() {
+    use axum::extract::FromRequest;
+
+    let request = Request::builder().header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#""/media/episode.mkv""#)).unwrap();
+    let Json(path) = Json::<PathBuf>::from_request(request, &()).await.unwrap();
+    assert_eq!(path, PathBuf::from("/media/episode.mkv"));
+
+    let request = Request::builder().header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::json!({
+            "path": "/media/episode.mkv",
+            "configs": {
+                "position": 12.5,
+                "video_stream_index": 0,
+                "audio_stream_index": null,
+                "subtitle_stream_index": null
+            }
+        }).to_string())).unwrap();
+    let Json(input) = Json::<SaveMediaConfigsRequest>::from_request(request, &()).await.unwrap();
+    assert_eq!(input.path, path);
+    assert_eq!(input.configs.position, Some(12.5));
+}
+
+/// metadata 实际响应保持对象字段并隐藏内部探测信息.
+#[test]
+fn media_response_keeps_internal_probe_details_private() {
+    let response = MediaMetadataResponseBody {
+        metadata: crate::testing::metadata(),
+        configs: MediaConfigs::default(),
+    };
+    let json = serde_json::to_value(response).unwrap();
+    assert!(json["configs"].is_object());
+    assert!(json["metadata"]["video_streams"].is_array());
+    assert!(json["metadata"].get("start_time").is_none());
+    assert!(json["metadata"].get("attachments").is_none());
+    assert!(json["metadata"]["video_streams"][0].get("color_transfer").is_none());
+}
 
 /// 请求字段缺省和显式 null 保持不同, 以区分继承偏好与关闭轨道.
 #[test]
@@ -38,6 +80,13 @@ fn removed_playback_fields_are_rejected() {
             "path": "/media/episode.mkv", field: 1,
         })).is_err());
     }
+}
+
+/// API 列表响应维持前端需要的 entries 对象封装.
+#[test]
+fn cache_list_response_wraps_entries() {
+    let response = CacheListResponseBody { entries: Vec::new() };
+    assert_eq!(serde_json::to_value(response).unwrap(), serde_json::json!({ "entries": [] }));
 }
 
 /// 源查询使用稳定排序的现存副本, 文件缺失后回退到其他副本.

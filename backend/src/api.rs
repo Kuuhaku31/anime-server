@@ -1,6 +1,7 @@
 
+
 // backend/src/api.rs
-//! 聚合全局 Manager 并公开按媒体路径操作的 HTTP 契约.
+// 聚合全局 Manager 并公开 HTTP API 契约.
 
 use std::path::{Path as FilePath, PathBuf};
 
@@ -9,19 +10,92 @@ use axum::{
     http::{header, HeaderValue, StatusCode}, response::{IntoResponse, Response},
     routing::{get, post, put}, Json, Router,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tower_http::services::ServeFile;
 
 use crate::{
     cache::CacheSnapshot, constants::CACHE_VERSION, db::DatabaseManager,
     models::{
-        CacheBuild, CacheSpec, MediaConfigs, MediaMetadata,
-        PlaybackQuery, ScanChanges,
+        CacheSpec,
+        MediaConfigs,
+        MediaMetadata,
+        PlaybackQuery,
+        ScanChanges,
     },
     process::{self, ProcessManager}, scanner::ScannerManager, services,
 };
 
-type MediaInfo = (MediaMetadata, MediaConfigs);
+
+/// 按路径完整替换媒体播放配置的请求.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SaveMediaConfigsRequest {
+    /// 容器内媒体路径.
+    pub(crate) path: PathBuf,
+    /// 要完整保存的播放位置和流选择.
+    pub(crate) configs: MediaConfigs,
+}
+
+// 各项 JSON 响应类型
+type GetConfigResponse = Json<ConfigResponseBody>;
+type ListMediaResponse = Json<Vec<ListMediaResponseItem>>;
+type MediaMetadataResponse = Json<MediaMetadataResponseBody>;
+type ScanMediaResponse = Json<ScanChanges>;
+type RescanMediaResponse = Json<Option<ListMediaResponseItem>>;
+type SaveMediaConfigsResponse = StatusCode;
+type BuildCacheResponse = Json<BuildCacheResponseBody>;
+type ListCacheResponse = Json<CacheListResponseBody>;
+type CacheDetailResponse = Json<CacheSnapshot>;
+type StopCacheResponse = CacheDetailResponse;
+type DeleteCacheResponse = StatusCode;
+type PlaybackAssetResponse = Response;
+
+/// 描述前端初始化所需的公开配置.
+#[derive(Debug, Serialize)]
+struct ConfigResponseBody {
+    /// 网页是否默认启用深色模式.
+    default_dark_mode: bool,
+}
+
+/// 描述媒体列表中数据库登记的单个路径及共享配置.
+#[derive(Debug, Serialize)]
+struct ListMediaResponseItem {
+    /// 内容记录 ID, 对应数据库 media_id.
+    file_id: String,
+    /// 容器内媒体路径.
+    path: PathBuf,
+    /// 同内容路径共享的播放配置.
+    configs: MediaConfigs,
+}
+
+/// 描述单个媒体实时探测得到的 metadata 和共享配置.
+#[derive(Debug, Serialize)]
+struct MediaMetadataResponseBody {
+    /// 本次探测得到的媒体元数据.
+    metadata: MediaMetadata,
+    /// 探测时读取的共享播放配置.
+    configs: MediaConfigs,
+}
+
+/// 描述缓存构建结果及媒体探测信息.
+#[derive(Debug, Serialize)]
+struct BuildCacheResponseBody {
+    /// 新建或复用的缓存条目.
+    cache: CacheSnapshot,
+    /// 当前路径重新探测得到的媒体元数据.
+    media_meta: MediaMetadata,
+    /// 后端读取的共享播放配置.
+    media_configs: MediaConfigs,
+}
+
+/// 描述全部缓存条目的列表响应.
+#[derive(Debug, Serialize)]
+struct CacheListResponseBody {
+    /// 按 handle_id 排序的缓存条目.
+    entries: Vec<CacheSnapshot>,
+}
+
 
 /// 组装业务路由, 不向 Axum 注入业务 AppState.
 pub(crate) fn router() -> Router {
@@ -29,6 +103,7 @@ pub(crate) fn router() -> Router {
     .route("/api/config", get(get_config))
 
     .route("/api/media", get(list_media))
+    .route("/api/media/{file_id}/metadata", get(media_metadata))
     .route("/api/media/scan", post(scan_media))
     .route("/api/media/rescan", post(rescan_media))
     .route("/api/media/configs", put(save_media_configs))
@@ -42,52 +117,61 @@ pub(crate) fn router() -> Router {
 }
 
 /// 提供前端初始化所需的公开配置
-async fn get_config() -> Json<serde_json::Value> {
-    Json(json!({"default_dark_mode": services::config().default_dark_mode}))
+async fn get_config() -> GetConfigResponse {
+    Json(ConfigResponseBody { default_dark_mode: services::config().default_dark_mode })
 }
 
-/// 逐路径探测元数据并聚合数据库配置, 任一失败都显式返回错误.
+/// 读取数据库中的路径和配置
 async fn list_media()
--> Result<Json<Vec<(PathBuf, MediaMetadata, MediaConfigs)>>, ApiError>
+-> Result<ListMediaResponse, ApiError>
 {
     let records = services::database().list_paths_with_configs().await.map_err(ApiError::internal)?;
-    let mut media = Vec::with_capacity(records.len());
-    for record in records {
-        let path = record.0;
-        let configs = record.1;
-        let source_path = path.clone();
-        let metadata = services::process().probe(&source_path).await.map_err(ApiError::media)?;
-        media.push((path, metadata, configs));
+    Ok(records.into_iter().map(|(file_id, path, configs)| ListMediaResponseItem { file_id, path, configs }).collect::<Vec<_>>().into())
+}
+
+/// 按数据库内容 ID 探测一个仍存在的媒体副本.
+async fn media_metadata(Path(file_id): Path<String>) -> Result<MediaMetadataResponse, ApiError> {
+    let paths = services::database().paths_with_configs_by_id(&file_id).await.map_err(ApiError::internal)?;
+    if paths.is_empty() { return Err(ApiError::missing("media file not found")); }
+
+    for (path, configs) in paths {
+        match services::scanner().resolve(&path).await {
+            Ok(resolved) => {
+                let metadata = services::process().probe(&resolved).await.map_err(ApiError::media)?;
+                return Ok(Json(MediaMetadataResponseBody { metadata, configs }));
+            }
+            Err(error) if error.downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) => {}
+            Err(error) => return Err(ApiError::media(format!("{error:#}"))),
+        }
     }
-    Ok(Json(media))
+    Err(ApiError::missing("media file is unavailable"))
 }
 
 /// 请求扫描器同步全部媒体路径.
-async fn scan_media() -> Result<Json<ScanChanges>, ApiError> {
+async fn scan_media() -> Result<ScanMediaResponse, ApiError> {
     services::scanner().scan_all(services::database()).await.map(Json).map_err(ApiError::internal)
 }
 
 
-/// 重扫单路径并返回最新媒体条目, 文件已删除时返回 null.
+/// 重扫单路径并返回更新后的数据库条目, 文件已删除时返回 null.
 async fn rescan_media(input: Result<Json<PathBuf>, JsonRejection>)
--> Result<Json<Option<(PathBuf, MediaInfo)>>, ApiError>
+-> Result<RescanMediaResponse, ApiError>
 {
     let Json(input) = input.map_err(ApiError::bad)?;
     let Some(file) = services::scanner().scan_one(services::database(), &input).await.map_err(ApiError::media)?
         else { return Ok(Json(None)); };
-    let metadata = services::process().probe(&file.path).await.map_err(ApiError::media)?;
-    let record = services::database().get_file_by_path(&file.path).await.map_err(ApiError::internal)?
+    let (file_id, configs) = services::database().get_file_by_path(&file.path).await.map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::missing("media path was removed during rescan"))?;
-    Ok(Json(Some((file.path, (metadata, record.1)))))
+    Ok(Json(Some(ListMediaResponseItem { file_id, path: file.path, configs })))
 }
 
 
 /// 校验配置后保存
-async fn save_media_configs(input: Result<Json<(PathBuf, MediaConfigs)>, JsonRejection>)
--> Result<StatusCode, ApiError>
+async fn save_media_configs(input: Result<Json<SaveMediaConfigsRequest>, JsonRejection>)
+-> Result<SaveMediaConfigsResponse, ApiError>
 {
-    let Json(input) = input.map_err(ApiError::bad)?;
-    let (path, configs) = input;
+    let Json(SaveMediaConfigsRequest { path, configs }) = input.map_err(ApiError::bad)?;
     if configs.position.is_some_and(|position| !position.is_finite() || position < 0.0) {
         return Err(ApiError::bad("position must be finite and non-negative"));
     }
@@ -105,7 +189,7 @@ async fn save_media_configs(input: Result<Json<(PathBuf, MediaConfigs)>, JsonRej
 
 /// 接受 PlaybackQuery 并启动或复用转码, 不创建播放映射或等待编码完成.
 async fn build_cache(input: Result<Json<PlaybackQuery>, JsonRejection>)
--> Result<Json<CacheBuild>, ApiError>
+-> Result<BuildCacheResponse, ApiError>
 {
     let Json(query) = input.map_err(ApiError::bad)?;
     let (media_id, media, media_configs) = prepare_media(&query.path, services::database(),
@@ -130,12 +214,12 @@ async fn build_cache(input: Result<Json<PlaybackQuery>, JsonRejection>)
     let mut snapshot = services::cache().build(spec, query.path, media.clone(),
         services::config(), services::process()).await.map_err(ApiError::cache)?;
     snapshot.source_path = source_path(&snapshot.spec.media_id, services::database(), services::scanner()).await?;
-    Ok(Json(CacheBuild { cache: snapshot, media_meta: media, media_configs: media_configs }))
+    Ok(Json(BuildCacheResponseBody { cache: snapshot, media_meta: media, media_configs }))
 }
 
 /// 获取全部缓存及转码 worker 占用合计, 不探测媒体或启动任务.
 async fn list_cache()
--> Result<Json<Vec<CacheSnapshot>>, ApiError>
+-> Result<ListCacheResponse, ApiError>
 {
     let snapshots = services::cache().list().await.map_err(ApiError::cache)?;
     let mut entries = Vec::with_capacity(snapshots.len());
@@ -150,12 +234,12 @@ async fn list_cache()
         };
         entries.push(snapshot);
     }
-    Ok(Json(entries))
+    Ok(Json(CacheListResponseBody { entries }))
 }
 
 /// 查询单个句柄状态
 async fn cache_detail(Path(handle_id): Path<String>)
--> Result<Json<CacheSnapshot>, ApiError>
+-> Result<CacheDetailResponse, ApiError>
 {
     let snapshot = services::cache().status(&handle_id).await.map_err(ApiError::cache)?;
     Ok(Json(snapshot))
@@ -163,7 +247,7 @@ async fn cache_detail(Path(handle_id): Path<String>)
 
 /// 重新校验源文件身份和全部实际流
 async fn retry_cache(Path(handle_id): Path<String>)
--> Result<Json<CacheBuild>, ApiError>
+-> Result<BuildCacheResponse, ApiError>
 {
     // 获取缓存实例的规格信息
     let spec = services::cache().spec(&handle_id).await.map_err(ApiError::cache)?;
@@ -180,12 +264,12 @@ async fn retry_cache(Path(handle_id): Path<String>)
     services::config(), services::process()).await.map_err(ApiError::cache)?;
     snapshot.source_path = source_path(&snapshot.spec.media_id, services::database(), services::scanner()).await?;
 
-    Ok(Json(CacheBuild { cache: snapshot, media_meta: media, media_configs: media_configs }))
+    Ok(Json(BuildCacheResponseBody { cache: snapshot, media_meta: media, media_configs }))
 }
 
 /// 停止缓存实例生成
 async fn stop_cache(Path(handle_id): Path<String>)
--> Result<Json<CacheSnapshot>, ApiError>
+-> Result<StopCacheResponse, ApiError>
 {
     let mut snapshot = 
     tokio::spawn(async move { services::cache().stop(&handle_id).await })
@@ -195,7 +279,7 @@ async fn stop_cache(Path(handle_id): Path<String>)
 }
 
 /// 删除缓存实例
-async fn delete_cache(Path(handle_id): Path<String>) -> Result<StatusCode, ApiError> {
+async fn delete_cache(Path(handle_id): Path<String>) -> Result<DeleteCacheResponse, ApiError> {
     tokio::spawn(async move { services::cache().remove(&handle_id).await })
     .await.map_err(ApiError::internal)?.map_err(ApiError::cache)?;
     Ok(StatusCode::NO_CONTENT)
@@ -204,7 +288,7 @@ async fn delete_cache(Path(handle_id): Path<String>) -> Result<StatusCode, ApiEr
 /// 获取播放资源
 async fn
 playback_asset(Path((handle_id, asset_name)): Path<(String, String)>, request: Request)
--> Result<Response, ApiError>
+-> Result<PlaybackAssetResponse, ApiError>
 {
     if !process::media_filename(&asset_name) { return Err(ApiError::missing("playback asset not found")); }
     let spec = services::cache().spec(&handle_id).await.map_err(ApiError::cache)?;

@@ -1,4 +1,5 @@
 
+
 // frontend/src/state/player-state.ts
 // 定义按路径访问媒体和查询缓存状态的前后端契约.
 
@@ -52,8 +53,18 @@ export interface MediaInfo {
   configs: MediaConfigs;
 }
 
-/** 列表条目仅包含容器路径和媒体信息, 不包含内容或缓存标识. */
-export type MediaEntry = [path: string, info: MediaInfo];
+/** 描述媒体列表中数据库登记的路径和共享播放配置. */
+export interface MediaEntry {
+  /** 数据库内容记录 ID. */
+  file_id: string;
+  /** 容器内媒体路径. */
+  path: string;
+  /** 同内容路径共享的播放配置. */
+  configs: MediaConfigs;
+}
+
+/** 描述播放器已获取元数据的媒体路径. */
+export type PlaybackMedia = [path: string, info: MediaInfo];
 
 /** 保存服务端确认的三类实际流索引. */
 export interface StreamSelection {
@@ -129,8 +140,10 @@ export interface CacheList {
 export interface CacheBuild {
   /** 新建或复用的缓存条目. */
   cache: CacheEntry;
-  /** 重新探测的媒体信息和当前配置. */
-  media: MediaInfo;
+  /** 重新探测的媒体元数据. */
+  media_meta: MediaMetadata;
+  /** 后端当前读取的播放配置. */
+  media_configs: MediaConfigs;
 }
 
 /** 描述全量扫描对路径索引的变更. */
