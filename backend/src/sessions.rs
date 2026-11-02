@@ -1,5 +1,5 @@
 
-// backend/src/api/sessions.rs
+// backend/src/sessions.rs
 //! 为 API 保存不透明 session 到缓存文件夹的唯一映射.
 
 use std::{collections::{hash_map::Entry, HashMap}, path::PathBuf};
@@ -8,7 +8,7 @@ use anyhow::{bail, Context, Result};
 use tokio::sync::Mutex;
 
 #[cfg(test)]
-#[path = "../tests/api/sessions.rs"]
+#[path = "tests/api/sessions.rs"]
 mod tests;
 
 /// 只管理会话映射, 不持有缓存管理器或播放状态.

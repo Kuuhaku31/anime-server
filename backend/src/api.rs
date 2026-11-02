@@ -14,9 +14,8 @@ use serde_json::json;
 use crate::{models::{MediaConfigs, MediaInfo, ScanChanges}, services};
 
 mod playback;
-mod sessions;
 
-pub(crate) use sessions::SessionManager;
+pub(crate) use crate::sessions::SessionManager;
 
 /// 组装业务路由, 不向 Axum 注入业务 AppState.
 pub(crate) fn router() -> Router {

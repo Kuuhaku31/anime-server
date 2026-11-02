@@ -20,6 +20,7 @@ mod process;
 mod scanner;
 mod services;
 mod utils;
+mod sessions;
 
 #[cfg(test)]
 #[path = "tests/fixtures/runtime.rs"]
