@@ -25,7 +25,7 @@ async fn concurrent_opens_share_one_handle_and_completed_cache_survives_restart(
     let first = first?;
     assert_eq!(first.folder, second?.folder);
     assert_eq!(manager.handles.lock().await.len(), 1);
-    wait_phase(&manager, &first.folder, CachePhase::Completed).await?;
+    wait_phase(&manager, &first.folder, "completed").await?;
     let descriptor = tokio::fs::read(first.folder.join("instance.json")).await?;
     assert_eq!(CacheSpec::from_descriptor(&descriptor)?, spec);
     let published = tokio::fs::read(first.folder.join("segment_000000.m4s")).await?;
@@ -34,7 +34,7 @@ async fn concurrent_opens_share_one_handle_and_completed_cache_survives_restart(
     drop(manager);
     tokio::fs::remove_file(&source).await?;
     let restored = CacheManager::new(root, &processes).await?;
-    wait_phase(&restored, &first.folder, CachePhase::Completed).await?;
+    wait_phase(&restored, &first.folder, "completed").await?;
     assert_eq!(restored.handles.lock().await.len(), 1);
     assert_eq!(tokio::fs::read(first.folder.join("segment_000000.m4s")).await?, published);
     assert!(restored.status(&first.folder).await?.buffered_until > 8.9);
@@ -57,12 +57,12 @@ async fn failed_generation_reloads_the_same_handle_on_retry() -> Result<()> {
     let manager = CacheManager::new(directory.path.join("cache"), &processes).await?;
     let config = AppConfigManager { ffmpeg_threads: 1, ..AppConfigManager::default() };
     let first = manager.open(spec.clone(), source.clone(), metadata.clone(), &config, &processes).await?;
-    wait_phase(&manager, &first.folder, CachePhase::Failed).await?;
+    wait_phase(&manager, &first.folder, "failed").await?;
     let handle = manager.handle_by_path(&first.folder).await?;
     tokio::fs::rename(&backup, &source).await?;
     let second = manager.open(spec, source, metadata, &config, &processes).await?;
     assert!(Arc::ptr_eq(&handle, &manager.handle_by_path(&second.folder).await?));
-    wait_phase(&manager, &second.folder, CachePhase::Completed).await?;
+    wait_phase(&manager, &second.folder, "completed").await?;
     manager.shutdown().await?;
     Ok(())
 }
@@ -80,7 +80,7 @@ async fn remove_cancels_queued_generation_and_prevents_late_writers() -> Result<
         let mut spec = spec();
         spec.media_id = format!("{iteration:032x}");
         let snapshot = manager.open(spec, directory.path.join("missing.mkv"), metadata(), &config, &processes).await?;
-        if iteration == 0 { wait_phase(&manager, &snapshot.folder, CachePhase::Running).await?; }
+        if iteration == 0 { wait_phase(&manager, &snapshot.folder, "running").await?; }
         manager.remove(&snapshot.folder).await?;
         tokio::time::sleep(std::time::Duration::from_millis(40)).await;
         assert!(!snapshot.folder.exists());
@@ -122,7 +122,7 @@ async fn recovered_partial_cache_appends_without_overwriting_the_prefix() -> Res
     let root = directory.path.join("cache");
     let manager = CacheManager::new(root.clone(), &processes).await?;
     let snapshot = manager.open(spec.clone(), source.clone(), metadata.clone(), &config, &processes).await?;
-    wait_phase(&manager, &snapshot.folder, CachePhase::Completed).await?;
+    wait_phase(&manager, &snapshot.folder, "completed").await?;
     let first = tokio::fs::read(snapshot.folder.join("segment_000000.m4s")).await?;
     let second = tokio::fs::read(snapshot.folder.join("segment_000001.m4s")).await?;
     let frames = frame_count(&processes, &snapshot.folder).await?;
@@ -130,10 +130,10 @@ async fn recovered_partial_cache_appends_without_overwriting_the_prefix() -> Res
     drop(manager);
     tokio::fs::write(snapshot.folder.join("segment_000002.m4s"), b"broken tail").await?;
     let manager = CacheManager::new(root, &processes).await?;
-    wait_phase(&manager, &snapshot.folder, CachePhase::Ready).await?;
+    wait_phase(&manager, &snapshot.folder, "ready").await?;
     assert_eq!(manager.status(&snapshot.folder).await?.buffered_until, 8.0);
     manager.open(spec, source, metadata, &config, &processes).await?;
-    wait_phase(&manager, &snapshot.folder, CachePhase::Completed).await?;
+    wait_phase(&manager, &snapshot.folder, "completed").await?;
     assert_eq!(tokio::fs::read(snapshot.folder.join("segment_000000.m4s")).await?, first);
     assert_eq!(tokio::fs::read(snapshot.folder.join("segment_000001.m4s")).await?, second);
     assert_eq!(frame_count(&processes, &snapshot.folder).await?, frames);

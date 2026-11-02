@@ -7,17 +7,17 @@ use super::*;
 /// 每条转换都必须符合架构矩阵, End 不能成为额外可查询状态.
 #[test]
 fn transition_matrix_has_only_the_six_documented_phases() {
-    let kinds = [CachePhase::Loading, CachePhase::Completed, CachePhase::Ready,
-        CachePhase::Failed, CachePhase::Stopping, CachePhase::Running];
+    let kinds = ["loading", "completed", "ready", "failed", "stopping", "running"];
     for from in kinds {
         for to in kinds.into_iter().map(Some).chain([None]) {
             let expected = match from {
-                CachePhase::Loading => to.is_none() || matches!(to, Some(CachePhase::Completed | CachePhase::Ready | CachePhase::Failed)),
-                CachePhase::Completed => to.is_none(),
-                CachePhase::Ready => to.is_none() || to == Some(CachePhase::Running),
-                CachePhase::Failed => to.is_none() || to == Some(CachePhase::Loading),
-                CachePhase::Stopping => to.is_none() || to == Some(CachePhase::Failed),
-                CachePhase::Running => matches!(to, Some(CachePhase::Completed | CachePhase::Ready | CachePhase::Failed | CachePhase::Stopping)),
+                "loading" => to.is_none() || matches!(to, Some("completed" | "ready" | "failed")),
+                "completed" => to.is_none(),
+                "ready" => to.is_none() || to == Some("running"),
+                "failed" => to.is_none() || to == Some("loading"),
+                "stopping" => to.is_none() || to == Some("failed"),
+                "running" => matches!(to, Some("completed" | "ready" | "failed" | "stopping")),
+                _ => unreachable!("unknown test phase: {from}"),
             };
             let mut current = Some(phase(from));
             assert_eq!(transition(&mut current, to.map(phase)).is_ok(), expected, "{from:?} -> {to:?}");
@@ -39,11 +39,11 @@ async fn ready_run_reserves_its_worker_before_stop() -> Result<()> {
     let directory = crate::testing::TestDirectory::new();
     let spec = crate::testing::spec();
     let handle = Arc::new(CacheInstanceHandle::new(spec.clone(), spec.handle_id()?, directory.path.clone()));
-    transition(&mut *handle.phase.lock().await, Some(phase(CachePhase::Ready)))?;
+    transition(&mut *handle.phase.lock().await, Some(phase("ready")))?;
     handle.run(directory.path.join("missing.mkv"), crate::testing::metadata(),
         &AppConfigManager::default(), &ProcessManager::new(2, 2)).await?;
     assert!(handle.stop().await?, "run returned before registering its worker");
-    assert_eq!(handle.snapshot().await?.phase, CachePhase::Stopping);
+    assert_eq!(handle.snapshot().await?.phase, "stopping");
     Ok(())
 }
 
@@ -61,19 +61,20 @@ async fn stop_cancels_a_deferred_run_after_recovery_becomes_ready() -> Result<()
         &AppConfigManager::default(), &ProcessManager::new(2, 2)).await?;
     transition(&mut *handle.phase.lock().await, Some(Phase::Ready { cancel }))?;
     assert!(!handle.stop().await?);
-    assert_eq!(handle.snapshot().await?.phase, CachePhase::Ready);
+    assert_eq!(handle.snapshot().await?.phase, "ready");
     assert!(std::fs::read_dir(&directory.path)?.next().is_none());
     Ok(())
 }
 
 /// 构造没有实际 worker 的状态机样本.
-fn phase(kind: CachePhase) -> Phase {
+fn phase(kind: &str) -> Phase {
     match kind {
-        CachePhase::Loading => Phase::loading(),
-        CachePhase::Completed => Phase::Completed,
-        CachePhase::Ready => Phase::Ready { cancel: watch::channel(false).0 },
-        CachePhase::Failed => Phase::Failed { error: "test failure".to_string() },
-        CachePhase::Stopping => Phase::Stopping { cancel: watch::channel(false).0 },
-        CachePhase::Running => Phase::Running { cancel: watch::channel(false).0 },
+        "loading" => Phase::loading(),
+        "completed" => Phase::Completed,
+        "ready" => Phase::Ready { cancel: watch::channel(false).0 },
+        "failed" => Phase::Failed { error: "test failure".to_string() },
+        "stopping" => Phase::Stopping { cancel: watch::channel(false).0 },
+        "running" => Phase::Running { cancel: watch::channel(false).0 },
+        _ => unreachable!("unknown test phase: {kind}"),
     }
 }

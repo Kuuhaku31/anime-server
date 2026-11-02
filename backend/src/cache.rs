@@ -19,24 +19,6 @@ mod tests;
 
 use handle::CacheInstanceHandle;
 
-/// 对外可查询的六个缓存生命周期阶段.
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum CachePhase {
-    /// 正在从磁盘恢复连续前缀.
-    Loading,
-    /// 媒体已经全部生成并验证.
-    Completed,
-    /// 已恢复且可以启动或续接编码.
-    Ready,
-    /// 恢复或编码失败, 下次打开时允许重试.
-    Failed,
-    /// 已请求停止, 正在回收当前写入任务.
-    Stopping,
-    /// 正在排队或执行编码与分片发布.
-    Running,
-}
-
 /// 返回缓存状态, 但不向前端暴露内部目录.
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct HandleSnapshot {
@@ -44,7 +26,7 @@ pub(crate) struct HandleSnapshot {
     #[serde(skip)]
     pub(crate) folder: PathBuf,
     /// 当前缓存阶段.
-    pub(crate) phase: CachePhase,
+    pub(crate) phase: String,
     /// 已验证并发布的连续前缀终点秒数.
     pub(crate) buffered_until: f64,
 }

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use tokio::process::Command;
 
-use crate::{cache::{CacheManager, CachePhase}, constants::CACHE_VERSION, models::{CacheSpec, MediaMetadata, StreamInfo}};
+use crate::{cache::CacheManager, constants::CACHE_VERSION, models::{CacheSpec, MediaMetadata, StreamInfo}};
 
 /// 保存一次测试专属的临时目录.
 pub(crate) struct TestDirectory {
@@ -60,12 +60,12 @@ pub(crate) async fn create_media(path: &Path) -> Result<()> {
 }
 
 /// 等待指定缓存阶段, 在出现意外失败或超时时终止测试.
-pub(crate) async fn wait_phase(manager: &CacheManager, folder: &Path, expected: CachePhase) -> Result<()> {
+pub(crate) async fn wait_phase(manager: &CacheManager, folder: &Path, expected: &str) -> Result<()> {
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
         loop {
             let status = manager.status(folder).await?;
             if status.phase == expected { return Ok(()); }
-            anyhow::ensure!(status.phase != CachePhase::Failed, "cache failed while waiting for {expected:?}");
+            anyhow::ensure!(status.phase != "failed", "cache failed while waiting for {expected:?}");
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     }).await?

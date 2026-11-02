@@ -14,7 +14,7 @@ use crate::{
     utils,
 };
 
-use super::{CachePhase, HandleSnapshot};
+use super::HandleSnapshot;
 
 #[cfg(test)]
 #[path = "../tests/cache/handle.rs"]
@@ -73,13 +73,13 @@ impl CacheInstanceHandle {
 
     /// 查询阶段和已发布清单, 不读取尚未恢复的损坏尾部.
     pub(super) async fn snapshot(&self) -> Result<HandleSnapshot> {
-        let phase = self.phase.lock().await.as_ref().context("cache instance has ended")?.kind();
-        let buffered_until = if phase == CachePhase::Loading {
-            0.0
-        } else {
+        let lock = self.phase.lock().await;
+        let phase = lock.as_ref().context("cache instance has ended")?;
+        let buffered_until = if matches!(phase, Phase::Loading { .. }) { 0.0 }
+        else {
             process::read_playlist(&self.path).await?.map_or(0.0, |playlist| playlist.duration)
         };
-        Ok(HandleSnapshot { folder: self.path.clone(), phase, buffered_until })
+        Ok(HandleSnapshot { folder: self.path.clone(), phase: phase.kind(), buffered_until })
     }
 
     /// 原子处理首次加载或 Failed 重试, 恢复工作不持有阶段锁.
@@ -202,9 +202,12 @@ impl CacheInstanceHandle {
     /// 只开放清单中的已提交资源, 不暴露 descriptor 或私有工作文件.
     pub(super) async fn media_path(&self, asset_name: &str) -> Result<PathBuf> {
         ensure!(process::media_filename(asset_name), "playback asset not found");
-        let phase = self.phase.lock().await.as_ref().context("cache instance has ended")?.kind();
-        ensure!(!matches!(phase, CachePhase::Loading | CachePhase::Stopping),
-            "playback cache is not available");
+        {
+            let phase = self.phase.lock().await;
+            let phase = phase.as_ref().context("cache instance has ended")?;
+            ensure!(!matches!(phase, Phase::Loading { .. } | Phase::Stopping { .. }),
+                "playback cache is not available");
+        }
         let playlist = process::read_playlist(&self.path).await?.context("playback output is not ready")?;
         ensure!(!playlist.segments.is_empty(), "playback output is not ready");
         if asset_name.starts_with("segment_") {
@@ -426,40 +429,52 @@ impl Phase {
     }
 
     /// 将内部阶段映射为对外六状态之一.
-    fn kind(&self) -> CachePhase {
+    fn kind(&self) -> String {
         match self {
-            Self::Loading { .. } => CachePhase::Loading,
-            Self::Completed => CachePhase::Completed,
-            Self::Ready { .. } => CachePhase::Ready,
-            Self::Failed { .. } => CachePhase::Failed,
-            Self::Stopping { .. } => CachePhase::Stopping,
-            Self::Running { .. } => CachePhase::Running,
+            Self::Loading { .. } => "loading".to_string(),
+            Self::Completed => "completed".to_string(),
+            Self::Ready { .. } => "ready".to_string(),
+            Self::Failed { .. } => "failed".to_string(),
+            Self::Stopping { .. } => "stopping".to_string(),
+            Self::Running { .. } => "running".to_string(),
         }
     }
 }
 
-/// 集中校验状态转换, None 是 End 动作的封闭标记而不是第七种阶段.
+/// 集中校验状态转换
 fn transition(current: &mut Option<Phase>, next: Option<Phase>) -> Result<()> {
-    let from = current.as_ref().map(Phase::kind);
-    let to = next.as_ref().map(Phase::kind);
+
+    let from = &current;
+    let to   = &next;
+
+    // 校验状态转换是否合法
     let allowed = match (from, to) {
-        (None, Some(CachePhase::Loading)) => true,
-        (Some(CachePhase::Loading), None | Some(CachePhase::Completed | CachePhase::Ready | CachePhase::Failed)) => true,
-        (Some(CachePhase::Completed), None) => true,
-        (Some(CachePhase::Ready), None | Some(CachePhase::Running)) => true,
-        (Some(CachePhase::Failed), None | Some(CachePhase::Loading)) => true,
-        (Some(CachePhase::Running), Some(CachePhase::Completed | CachePhase::Ready | CachePhase::Failed | CachePhase::Stopping)) => true,
-        (Some(CachePhase::Stopping), None | Some(CachePhase::Failed)) => true,
+        (None, Some(Phase::Loading{..})) => true,
+        (Some(Phase::Loading{..}), None | Some(Phase::Completed | Phase::Ready{..} | Phase::Failed{..})) => true,
+        (Some(Phase::Completed), None) => true,
+        (Some(Phase::Ready{..}), None | Some(Phase::Running{..})) => true,
+        (Some(Phase::Failed{..}), None | Some(Phase::Loading{..})) => true,
+        (Some(Phase::Running{..}), Some(Phase::Completed | Phase::Ready{..} | Phase::Failed{..} | Phase::Stopping{..})) => true,
+        (Some(Phase::Stopping{..}), None | Some(Phase::Failed{..})) => true,
         _ => false,
     };
-    ensure!(allowed, "illegal cache transition: {from:?} -> {to:?}");
+
+    ensure!(allowed, "illegal cache transition: {} -> {}",
+        from.as_ref().map_or("None".to_string(), |p| p.kind()),
+        to.as_ref().map_or("None".to_string(), |p| p.kind())
+    );
+
+    // 如果下一个阶段为 None, 确保当前阶段没有活跃的工作者
     if to.is_none() {
-        match current.as_ref() {
-            Some(Phase::Loading { started: true, cancel } | Phase::Stopping { cancel }) =>
-                ensure!(cancel.receiver_count() == 0, "cannot end a cache instance with a live worker"),
+        match from.as_ref() {
+            Some(Phase::Loading { started: true, cancel } | Phase::Stopping { cancel }) => {
+                ensure!(cancel.receiver_count() == 0, "cannot end a cache instance with a live worker")
+            }
             _ => {},
         }
     }
+
+    // 更新当前阶段为下一个阶段
     *current = next;
     Ok(())
 }
