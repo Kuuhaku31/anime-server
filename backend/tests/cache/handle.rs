@@ -1,5 +1,5 @@
 
-// backend/src/tests/cache/handle.rs
+// backend/tests/cache/handle.rs
 //! 验证六状态转换矩阵和 End 的写入者约束.
 
 use super::*;

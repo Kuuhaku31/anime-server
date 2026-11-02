@@ -19,7 +19,7 @@ use super::{
 };
 
 #[cfg(test)]
-#[path = "../tests/process/ffmpeg.rs"]
+#[path = "../../tests/process/ffmpeg.rs"]
 mod tests;
 
 

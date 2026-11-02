@@ -22,7 +22,7 @@ mod services;
 mod utils;
 
 #[cfg(test)]
-#[path = "tests/fixtures/runtime.rs"]
+#[path = "../tests/fixtures/runtime.rs"]
 mod testing;
 
 /// 初始化唯一实例并在 HTTP 停止后依次回收后台任务和持久资源.

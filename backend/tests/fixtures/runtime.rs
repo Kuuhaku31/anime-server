@@ -1,5 +1,5 @@
 
-// backend/src/tests/fixtures/runtime.rs
+// backend/tests/fixtures/runtime.rs
 //! 为独立管理器测试提供隔离目录和合成媒体夹具.
 
 use std::path::{Path, PathBuf};

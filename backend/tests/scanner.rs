@@ -1,5 +1,5 @@
 
-// backend/src/tests/scanner.rs
+// backend/tests/scanner.rs
 //! 验证前缀重新哈希, 失效路径清理和媒体目录边界.
 
 use super::*;

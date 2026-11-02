@@ -14,7 +14,7 @@ use crate::{constants::HASH_LIMIT, utils};
 mod media;
 
 #[cfg(test)]
-#[path = "tests/models.rs"]
+#[path = "../tests/models.rs"]
 mod tests;
 
 pub(crate) use media::{Attachment, MediaConfigs, MediaMetadata, StreamInfo};

@@ -1,7 +1,5 @@
 
-// backend/src/tests/models.rs
-
-// backend/src/tests/models.rs
+// backend/tests/models.rs
 // 验证稳定缓存身份和媒体请求契约.
 
 use super::*;

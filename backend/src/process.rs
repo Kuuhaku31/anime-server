@@ -27,7 +27,7 @@ pub(crate) use fragment::{normalize, Init, Tail};
 pub(crate) use worker::{EncodingWorker, WorkerResources, WorkerUsage};
 
 #[cfg(test)]
-#[path = "tests/process.rs"]
+#[path = "../tests/process.rs"]
 mod tests;
 
 /// 区分正常取消和磁盘, 解码或进程回收失败.

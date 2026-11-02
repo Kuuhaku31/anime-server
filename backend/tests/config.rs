@@ -1,5 +1,5 @@
 
-// backend/src/tests/config.rs
+// backend/tests/config.rs
 //! 验证扁平配置以及进程和线程预算约束.
 
 use super::*;

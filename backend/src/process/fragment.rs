@@ -7,7 +7,7 @@ use std::ops::Range;
 use anyhow::{ensure, Context, Result};
 
 #[cfg(test)]
-#[path = "../tests/process/fragment.rs"]
+#[path = "../../tests/process/fragment.rs"]
 mod tests;
 
 

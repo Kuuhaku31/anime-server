@@ -1,5 +1,5 @@
 
-// backend/src/tests/process.rs
+// backend/tests/process.rs
 //! 验证共享进程许可, 排队取消和长任务回收.
 
 use super::*;

@@ -20,7 +20,7 @@ type OptionIdAndConfigs = Option<(String, MediaConfigs)>;
 type PathConfigsList = Vec<(PathBuf, MediaConfigs)>;
 
 #[cfg(test)]
-#[path = "tests/db.rs"]
+#[path = "../tests/db.rs"]
 mod tests;
 
 /// 保存数据库连接池, 不持有其他业务管理器.

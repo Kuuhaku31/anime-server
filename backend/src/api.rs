@@ -394,5 +394,5 @@ impl IntoResponse for ApiError {
 
 
 #[cfg(test)]
-#[path = "tests/api/playback.rs"]
+#[path = "../tests/api/playback.rs"]
 mod tests;

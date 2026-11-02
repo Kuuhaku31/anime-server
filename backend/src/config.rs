@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
 
 #[cfg(test)]
-#[path = "tests/config.rs"]
+#[path = "../tests/config.rs"]
 mod tests;
 
 /// 直接持有应用运行所需的全部配置.

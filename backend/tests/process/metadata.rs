@@ -1,5 +1,5 @@
 
-// backend/src/tests/process/metadata.rs
+// backend/tests/process/metadata.rs
 //! 验证探测元数据归一化和不完整媒体错误.
 
 use super::*;

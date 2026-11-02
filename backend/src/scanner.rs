@@ -11,7 +11,7 @@ use walkdir::WalkDir;
 use crate::{constants::EXTENSIONS, db::DatabaseManager, models::{ScanChanges, ScannedFile}};
 
 #[cfg(test)]
-#[path = "tests/scanner.rs"]
+#[path = "../tests/scanner.rs"]
 mod tests;
 
 /// 保存媒体根目录和扫描锁, 不持有数据库管理器.

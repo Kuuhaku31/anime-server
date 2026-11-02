@@ -1,5 +1,5 @@
 
-// backend/src/tests/process/ffmpeg.rs
+// backend/tests/process/ffmpeg.rs
 //! 验证 CacheSpec 命令构造, 精确续接和清单边界.
 
 use super::*;

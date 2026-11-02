@@ -13,7 +13,7 @@ use crate::models::{Attachment, MediaMetadata, StreamInfo};
 use super::ProcessManager;
 
 #[cfg(test)]
-#[path = "../tests/process/metadata.rs"]
+#[path = "../../tests/process/metadata.rs"]
 mod tests;
 
 impl ProcessManager {

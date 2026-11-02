@@ -13,7 +13,7 @@ use crate::{config::AppConfigManager, constants::CACHE_VERSION, models::{CacheSp
 mod handle;
 
 #[cfg(test)]
-#[path = "tests/cache.rs"]
+#[path = "../tests/cache.rs"]
 mod tests;
 
 use handle::CacheInstanceHandle;

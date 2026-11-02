@@ -1,7 +1,5 @@
 
-// backend/src/tests/api/playback.rs
-
-// backend/src/tests/api/playback.rs
+// backend/tests/api/playback.rs
 // 验证 API 请求和响应契约以及缓存源路径查询.
 
 use super::*;

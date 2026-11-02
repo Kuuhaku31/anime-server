@@ -126,7 +126,8 @@ Vite 默认地址为 `http://localhost:5173`, `/api`, `/playback`, `/health`
 
 ## 测试组织
 
-所有 Rust 测试集中在 backend/src/tests, 与业务模块路径对应.
+所有 Rust 测试集中在 backend/tests, 与业务模块路径对应.
+通过业务模块的 `#[path]` 引入以保留私有实现访问权限, Cargo 的独立集成测试自动发现已关闭.
 二进制 crate 通过被测模块的 cfg(test) 子模块访问私有实现,
 业务文件只保留测试模块声明. 例如 cache/handle.rs 使用:
 

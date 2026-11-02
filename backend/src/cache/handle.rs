@@ -17,7 +17,7 @@ use crate::{
 use super::{CacheError, CacheSnapshot, CacheStatus};
 
 #[cfg(test)]
-#[path = "../tests/cache/handle.rs"]
+#[path = "../../tests/cache/handle.rs"]
 mod tests;
 
 /// 保存稳定身份, 唯一目录, 阶段锁和资源计数, 媒体进度以磁盘清单为准.

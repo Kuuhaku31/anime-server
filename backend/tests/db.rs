@@ -1,5 +1,5 @@
 
-// backend/src/tests/db.rs
+// backend/tests/db.rs
 //! 验证按路径共享配置和内容身份替换的事务行为.
 
 use super::*;

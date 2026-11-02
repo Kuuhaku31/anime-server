@@ -1,5 +1,5 @@
 
-// backend/src/tests/cache.rs
+// backend/tests/cache.rs
 //! 验证全量句柄映射, 并发生成, 停止和持久缓存恢复.
 
 use super::*;
