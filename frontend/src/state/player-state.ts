@@ -65,9 +65,9 @@ export interface StreamSelection {
   subtitle_stream_index: number | null;
 }
 
-/** 提交按路径播放的请求, 目标位置只由控制器本地维护. */
+/** 提交按路径构建缓存的请求, 目标位置只由控制器本地维护. */
 export interface PlaybackQuery {
-  /** 要播放的容器内媒体路径. */
+  /** 要构建缓存的容器内媒体路径. */
   path: string;
   /** 请求的视频流, 缺省继承配置或默认选择. */
   video_stream_index?: number;
@@ -83,20 +83,54 @@ export interface CacheStatus {
   phase: "loading" | "completed" | "ready" | "failed" | "stopping" | "running";
   /** 服务端已验证的连续前缀终点, 不是浏览器缓冲. */
   buffered_until: number;
+  /** 已启动转码 worker 的实际预算占用. */
+  resources: WorkerResources;
+  /** 恢复或生成失败的诊断, 正常状态为 null. */
+  error: string | null;
 }
 
-/** 保存客户端需要的最小会话引用. */
-export interface PlaybackSession {
-  /** 不透明会话标识, 不能用于推导缓存身份. */
-  session_id: string;
-  /** 会话对应的同源 HLS 清单 URL. */
-  url: string;
+/** 描述转码 worker 的许可占用, 不代表 CPU 使用率或浏览器解码开销. */
+export interface WorkerResources {
+  /** 活动转码 worker 占用的编码名额. */
+  encoder_slots: number;
+  /** 活动转码 worker 占用的媒体进程名额. */
+  process_slots: number;
+  /** 当前占用的 FFmpeg 编码线程预算. */
+  ffmpeg_threads: number;
 }
 
-/** 描述创建播放后的初始状态和实际媒体选择. */
-export interface PlaybackStart extends PlaybackSession, StreamSelection {
-  /** 初始缓存状态. */
-  cache: CacheStatus;
+/** 描述服务端计算稳定缓存标识使用的实际流选择和编码契约. */
+export interface CacheSpec extends StreamSelection {
+  /** 源媒体内容标识, 不由前端计算. */
+  media_id: string;
+  /** 编码和续接契约版本. */
+  version: string;
+}
+
+/** 前端缓存 Map 中的一条记录, 只使用 handle_id 作为主键. */
+export interface CacheEntry {
+  /** 稳定缓存标识, 不作为授权凭证. */
+  handle_id: string;
+  /** 服务端确认的实际流选择和媒体身份. */
+  spec: CacheSpec;
+  /** 当前生成进度和 worker 占用. */
+  status: CacheStatus;
+  /** 稳定选择的现存源路径, null 时不能播放或重试. */
+  source_path: string | null;
+}
+
+/** 描述全部缓存以及同一轮快照的 worker 占用总数. */
+export interface CacheList {
+  /** 按 handle_id 排序的缓存条目. */
+  entries: CacheEntry[];
+  /** 全部转码 worker 的资源合计. */
+  resources: WorkerResources;
+}
+
+/** 构建响应不创建会话, 播放器直接使用返回的 handle_id. */
+export interface CacheBuild {
+  /** 新建或复用的缓存条目. */
+  cache: CacheEntry;
   /** 重新探测的媒体信息和当前配置. */
   media: MediaInfo;
 }

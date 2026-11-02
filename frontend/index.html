@@ -1,6 +1,6 @@
 
 <!-- frontend/index.html -->
-<!-- 定义常驻播放器和右侧路径型媒体列表. -->
+<!-- 定义常驻播放器和右侧文件及缓存任务列表. -->
 <!doctype html>
 <html lang="en">
 
@@ -77,6 +77,7 @@
       </div>
       <div id="meta">Select a video from the library</div>
     </section>
+    <aside class="library-sidebar" aria-label="Media and caches">
     <section class="panel files-panel">
       <div class="section-heading files-heading">
         <div>
@@ -99,7 +100,30 @@
       </label>
       <div id="files" class="files-list"></div>
     </section>
+    <section class="panel cache-panel" aria-label="Cache tasks">
+      <div class="section-heading">
+        <div>
+          <span class="eyebrow">Transcoding</span>
+          <h2>Caches <span id="cache-count" class="count-badge">0</span></h2>
+        </div>
+        <button id="cache-refresh" type="button">Refresh</button>
+      </div>
+      <p id="cache-resources" class="cache-summary"></p>
+      <p class="cache-hint">Worker permits only, not CPU usage or browser decoding.</p>
+      <div id="cache-error" role="alert"></div>
+      <div id="caches" class="cache-list"></div>
+    </section>
+    </aside>
   </main>
+  <dialog id="cache-delete-dialog">
+    <h2>Delete cache?</h2>
+    <p id="cache-delete-name"></p>
+    <p>This stops transcoding and removes cached files immediately. Playback using this cache will be interrupted.</p>
+    <div class="actions">
+      <button id="cache-delete-cancel" type="button">Cancel</button>
+      <button id="cache-delete-confirm" type="button">Delete cache</button>
+    </div>
+  </dialog>
   <script type="module" src="/src/main.ts"></script>
 </body>
 

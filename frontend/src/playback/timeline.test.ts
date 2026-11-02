@@ -1,6 +1,6 @@
 
 // frontend/src/playback/timeline.test.ts
-// 验证缓存快照和原时间轴边界, 不再依赖服务端会话位置.
+// 验证缓存快照和本地原时间轴边界.
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { absoluteTime, cacheProgress, rangeReady, formatTime } from "./timeline.ts";
@@ -8,7 +8,8 @@ import type { CacheStatus } from "../state/player-state.ts";
 
 test("cache generation shows verified time independently of playback and completion rounding", () => {
   // 播放目标和浏览器缓冲不参与百分比, 完成标记将舍入不足的末端显示为 100%.
-  const cache: CacheStatus = { buffered_until: 30, phase: "running" };
+  const cache: CacheStatus = { buffered_until: 30, phase: "running", error: null,
+    resources: { encoder_slots: 1, process_slots: 1, ffmpeg_threads: 2 } };
   assert.deepEqual(cacheProgress(cache, 120), { percent: 25, text: "Generating: 25.0% / 0:30 of 2:00" });
   assert.match(cacheProgress({ ...cache, phase: "loading" }, 120).text, /^Preparing \/ queued/);
   assert.match(cacheProgress({ ...cache, phase: "ready" }, 120).text, /^Ready/);
@@ -18,6 +19,10 @@ test("cache generation shows verified time independently of playback and complet
   assert.equal(complete.percent, 100);
   assert.match(complete.text, /^Complete: 100.0%/);
   assert.equal(cacheProgress({ ...cache, buffered_until: 120.1 }, 120).percent, 100);
+  assert.match(cacheProgress({ ...cache, resources: { encoder_slots: 0, process_slots: 0, ffmpeg_threads: 0 } }, 120).text,
+    /^Queued \/ preparing/);
+  assert.match(cacheProgress(cache, 0).text, /duration unavailable/);
+  assert.equal(cacheProgress(cache, 0).percent, 0);
 });
 
 test("fractional HLS source offsets preserve the original timeline", () => {

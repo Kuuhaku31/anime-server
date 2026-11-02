@@ -2,14 +2,13 @@
 // backend/src/cache.rs
 //! 管理缓存根目录与全部缓存实例句柄的一一对应关系.
 
-use std::{collections::HashMap, path::{Path, PathBuf}, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{ensure, Context, Result};
 use serde::Serialize;
 use tokio::sync::Mutex;
-use tracing::warn;
 
-use crate::{config::AppConfigManager, constants::CACHE_VERSION, models::{CacheSpec, MediaMetadata}, process::{self, ProcessManager}, utils};
+use crate::{config::AppConfigManager, constants::CACHE_VERSION, models::{CacheSpec, MediaMetadata}, process::{self, ProcessManager, WorkerResources}, utils};
 
 mod handle;
 
@@ -19,17 +18,50 @@ mod tests;
 
 use handle::CacheInstanceHandle;
 
-/// 返回缓存状态, 但不向前端暴露内部目录.
+/// 返回稳定缓存身份和公开状态, 不暴露内部目录.
 #[derive(Clone, Debug, Serialize)]
-pub(crate) struct HandleSnapshot {
-    /// SessionManager 内部保存的缓存文件夹地址.
-    #[serde(skip)]
-    pub(crate) folder: PathBuf,
+pub(crate) struct CacheSnapshot {
+    /// 客户端用来查询和播放的稳定句柄标识.
+    pub(crate) handle_id: String,
+    /// 已确认的媒体内容和流选择.
+    pub(crate) spec: CacheSpec,
+    /// 当前生成进度和资源占用.
+    pub(crate) status: CacheStatus,
+}
+
+/// 描述缓存状态和已发布范围, 不保存播放位置.
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct CacheStatus {
     /// 当前缓存阶段.
     pub(crate) phase: String,
     /// 已验证并发布的连续前缀终点秒数.
     pub(crate) buffered_until: f64,
+    /// 仅统计已启动的转码 worker.
+    pub(crate) resources: WorkerResources,
+    /// 最近一次恢复或转码失败的诊断, 正常状态为 None.
+    pub(crate) error: Option<String>,
 }
+
+/// 区分句柄不存在和正在停止, 供 API 显式映射 HTTP 状态.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CacheError {
+    /// 句柄不存在或已经封闭.
+    NotFound,
+    /// 句柄正在停止, 不能接受新的构建请求.
+    Stopping,
+}
+
+impl std::fmt::Display for CacheError {
+    /// 提供稳定可读的缓存操作诊断.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::NotFound => "cache handle not found",
+            Self::Stopping => "cache generation is stopping",
+        })
+    }
+}
+
+impl std::error::Error for CacheError {}
 
 /// 只持有根目录和全量句柄表, 不拥有数据库, 进程或 worker 集合.
 pub(crate) struct CacheManager {
@@ -55,10 +87,10 @@ impl CacheManager {
     }
 
     /// 查找或创建稳定身份的句柄, 恢复和生成均由句柄自行调度.
-    pub(crate) async fn open(
+    pub(crate) async fn build(
         &self, spec: CacheSpec, source_path: PathBuf, metadata: MediaMetadata,
         config: &AppConfigManager, processes: &ProcessManager,
-    ) -> Result<HandleSnapshot> {
+    ) -> Result<CacheSnapshot> {
         let handle_id = spec.handle_id()?;
         let handle = {
             let mut handles = self.handles.lock().await;
@@ -76,39 +108,72 @@ impl CacheManager {
         handle.snapshot().await
     }
 
-    /// 按会话保存的文件夹路径查询缓存状态.
-    pub(crate) async fn status(&self, folder: &Path) -> Result<HandleSnapshot> {
-        self.handle_by_path(folder).await?.snapshot().await
+    /// 复制句柄后释放全局锁, 按稳定标识顺序读取快照.
+    pub(crate) async fn list(&self) -> Result<Vec<CacheSnapshot>> {
+        let mut handles: Vec<_> = self.handles.lock().await.values().cloned().collect();
+        handles.sort_by(|left, right| left.handle_id.cmp(&right.handle_id));
+        let mut snapshots = Vec::with_capacity(handles.len());
+        for handle in handles {
+            match handle.snapshot().await {
+                Ok(snapshot) => snapshots.push(snapshot),
+                // 已复制的句柄可能被并发删除, 不把正常删除视为整个列表故障.
+                Err(error) if error.downcast_ref::<CacheError>() == Some(&CacheError::NotFound) => {},
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(snapshots)
+    }
+
+    /// 按稳定标识查询缓存状态, 不启动恢复或生成.
+    pub(crate) async fn status(&self, handle_id: &str) -> Result<CacheSnapshot> {
+        self.handle(handle_id).await?.snapshot().await
+    }
+
+    /// 返回实际流选择, 供重试和源文件查询使用.
+    pub(crate) async fn spec(&self, handle_id: &str) -> Result<CacheSpec> {
+        Ok(self.handle(handle_id).await?.spec.clone())
     }
 
     /// 只返回正式清单中已经发布的媒体资源路径.
-    pub(crate) async fn media_path(&self, folder: &Path, asset_name: &str) -> Result<PathBuf> {
-        self.handle_by_path(folder).await?.media_path(asset_name).await
+    pub(crate) async fn media_path(&self, handle_id: &str, asset_name: &str) -> Result<PathBuf> {
+        self.handle(handle_id).await?.media_path(asset_name).await
+    }
+
+    /// 只重试现有句柄, 不在并发删除后隐式新建缓存目录.
+    pub(crate) async fn retry(
+        &self, handle_id: &str, source_path: PathBuf, metadata: MediaMetadata,
+        config: &AppConfigManager, processes: &ProcessManager,
+    ) -> Result<CacheSnapshot> {
+        let handle = self.handle(handle_id).await?;
+        handle.load(processes).await?;
+        handle.run(source_path, metadata, config, processes).await?;
+        handle.snapshot().await
+    }
+
+    /// 停止当前生成并保留前缀, 随后可以显式重试续接.
+    pub(crate) async fn stop(&self, handle_id: &str) -> Result<CacheSnapshot> {
+        let handle = self.handle(handle_id).await?;
+        handle.pause().await?;
+        handle.snapshot().await
     }
 
     /// 停止实例, 删除实际目录后才从句柄表移除.
-    pub(crate) async fn remove(&self, folder: &Path) -> Result<()> {
-        let handle_id = self.path_handle_id(folder)?;
+    pub(crate) async fn remove(&self, handle_id: &str) -> Result<()> {
+        check_handle_id(handle_id)?;
         let mut handles = self.handles.lock().await;
-        let handle = handles.get(handle_id).context("cache instance not found")?;
+        let handle = handles.get(handle_id).ok_or(CacheError::NotFound)?;
         handle.end().await?;
         handles.remove(handle_id);
         Ok(())
     }
 
-    /// 停止所有写入任务, 保留稳定缓存, 删除经历 Stopping 的未完成实例.
+    /// 停止并回收所有写入任务, 保留全部缓存实例和已发布前缀.
     pub(crate) async fn shutdown(&self) -> Result<()> {
         let handles: Vec<_> = self.handles.lock().await.values().cloned().collect();
         let mut errors = Vec::new();
         for handle in handles {
-            match handle.stop().await {
-                Ok(true) => {
-                    if let Err(error) = self.remove(&handle.path).await {
-                        errors.push(format!("{}: {error:#}", handle.handle_id));
-                    }
-                },
-                Ok(false) => {},
-                Err(error) => errors.push(format!("{}: {error:#}", handle.handle_id)),
+            if let Err(error) = handle.stop().await {
+                errors.push(format!("{}: {error:#}", handle.handle_id));
             }
         }
         ensure!(errors.is_empty(), "cache shutdown failed: {}", errors.join("; "));
@@ -135,20 +200,9 @@ impl CacheManager {
                     "cache descriptor does not match directory or encoding contract");
                 Ok::<_, anyhow::Error>(spec)
             }.await;
-            match descriptor {
-                Ok(spec) => {
-                    handles.insert(name.clone(), Arc::new(CacheInstanceHandle::new(spec, name, path)));
-                },
-                Err(error) => {
-                    // 权限或设备错误不能被当作损坏身份, 防止误删可恢复数据.
-                    if error.downcast_ref::<std::io::Error>()
-                        .is_some_and(|error| error.kind() != std::io::ErrorKind::NotFound) {
-                        return Err(error).context("cannot read cache descriptor");
-                    }
-                    warn!(path = %path.display(), "removing invalid cache instance: {error:#}");
-                    tokio::fs::remove_dir_all(&path).await.context("cannot remove invalid cache instance")?;
-                },
-            }
+            let spec = descriptor.with_context(|| format!(
+                "cannot load cache instance {}; files preserved, repair or remove it manually", path.display()))?;
+            handles.insert(name.clone(), Arc::new(CacheInstanceHandle::new(spec, name, path)));
         }
         Ok(())
     }
@@ -175,19 +229,16 @@ impl CacheManager {
         Ok(Arc::new(CacheInstanceHandle::new(spec, handle_id, path)))
     }
 
-    /// 校验文件夹地址后返回唯一句柄, 不依赖源媒体是否仍然存在.
-    async fn handle_by_path(&self, folder: &Path) -> Result<Arc<CacheInstanceHandle>> {
-        let handle_id = self.path_handle_id(folder)?;
-        self.handles.lock().await.get(handle_id).cloned().context("cache instance not found")
+    /// 校验稳定标识后从登记表读取句柄, 不拼接客户端路径.
+    async fn handle(&self, handle_id: &str) -> Result<Arc<CacheInstanceHandle>> {
+        check_handle_id(handle_id)?;
+        self.handles.lock().await.get(handle_id).cloned().ok_or_else(|| CacheError::NotFound.into())
     }
+}
 
-    /// 拒绝缓存根目录之外或非实例名称的路径.
-    fn path_handle_id<'a>(&self, folder: &'a Path) -> Result<&'a str> {
-        if folder.parent() != Some(self.root.join("playback").as_path()) {
-            bail!("cache folder is outside playback root");
-        }
-        let handle_id = folder.file_name().and_then(|name| name.to_str()).context("invalid cache folder")?;
-        ensure!(utils::check_md5_ok(handle_id), "invalid cache handle ID");
-        Ok(handle_id)
-    }
+/// 只接受规范的小写内容哈希, 拒绝路径片段和大小写别名.
+pub(crate) fn check_handle_id(handle_id: &str) -> Result<()> {
+    ensure!(utils::check_md5_ok(handle_id) && handle_id == handle_id.to_ascii_lowercase(),
+        "handle_id must be 32 lowercase hexadecimal characters");
+    Ok(())
 }

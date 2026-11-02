@@ -15,8 +15,6 @@ use crate::{models::{MediaConfigs, MediaInfo, ScanChanges}, services};
 
 mod playback;
 
-pub(crate) use crate::sessions::SessionManager;
-
 /// 组装业务路由, 不向 Axum 注入业务 AppState.
 pub(crate) fn router() -> Router {
     Router::new()
@@ -127,9 +125,18 @@ impl ApiError {
         Self { status: StatusCode::INTERNAL_SERVER_ERROR, message: error.to_string() }
     }
 
-    /// 表示媒体, 会话或资源不存在.
+    /// 表示媒体, 缓存句柄或资源不存在.
     fn missing(error: impl std::fmt::Display) -> Self {
         Self { status: StatusCode::NOT_FOUND, message: error.to_string() }
+    }
+
+    /// 缓存操作保留缺失和停止冲突语义, 其他错误明确报告为内部失败.
+    fn cache(error: anyhow::Error) -> Self {
+        match error.downcast_ref::<crate::cache::CacheError>() {
+            Some(crate::cache::CacheError::NotFound) => Self::missing(error),
+            Some(crate::cache::CacheError::Stopping) => Self { status: StatusCode::CONFLICT, message: error.to_string() },
+            None => Self::internal(format!("{error:#}")),
+        }
     }
 }
 

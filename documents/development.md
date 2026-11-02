@@ -48,7 +48,7 @@ curl --fail http://localhost:56080/health
 本次架构不兼容旧配置, 数据库和 API.
 先停止并备份旧实例, 再用示例配置和空数据库重新扫描,
 不要直接让测试实例操作生产数据.
-已知哈希命名但缺少有效 instance.json 的旧缓存会在启动时清理.
+缺少有效 instance.json 的旧缓存保留原文件并明确阻止启动, 由用户修复或手动移除.
 
 ## 运行配置
 
@@ -146,7 +146,9 @@ tests/fixtures/runtime.rs 提供隔离临时目录和合成媒体.
 扫描边界, 状态矩阵, 并发打开, 排队取消, Failed 重试,
 完成缓存重启恢复, 损坏尾部修复和不覆盖前缀的真实续接.
 前端测试覆盖路径契约, 暂停状态换轨, 小数 seek, 半开区间等待,
-停止和解码失败释放, 本地目标不发送到服务端, 完成后无需心跳.
+构建和资源读取分离, 本地 Stop 不停止转码, 删除当前句柄后卸载播放器,
+无源缓存禁止播放, 过期响应不能复活已删除的 Map 条目.
+后端额外覆盖按 handle_id 查询, 稳定源路径选择, 停止保留前缀和 worker 占用归零.
 
 ## Docker 验证
 
@@ -167,23 +169,29 @@ curl --fail -X POST http://127.0.0.1:56081/api/media/scan
 curl --fail http://127.0.0.1:56081/api/media
 ```
 
-创建播放只传 path 和可选流索引, 再查询返回的 session_id:
+构建只传 path 和可选流索引, 再使用返回的 cache.handle_id 查询和播放:
 
 ```bash
-curl --fail http://127.0.0.1:56081/api/playback \
+curl --fail http://127.0.0.1:56081/api/cache \
   -H 'Content-Type: application/json' \
   -d '{"path":"/media/sample.mkv","subtitle_stream_index":null}'
-curl --fail http://127.0.0.1:56081/api/playback/SESSION_ID
+curl --fail http://127.0.0.1:56081/api/cache
+curl --fail http://127.0.0.1:56081/api/cache/HANDLE_ID
+curl --fail http://127.0.0.1:56081/playback/HANDLE_ID/index.m3u8
+curl --fail -X POST http://127.0.0.1:56081/api/cache/HANDLE_ID/stop
+curl --fail -X POST http://127.0.0.1:56081/api/cache/HANDLE_ID/retry
 ```
 
 验证缓存进入 completed, 清单含 ENDLIST, 每个分片可以配合 init 真实解码.
-同内容不同路径应共享一份 instance.json 和输出, 但返回不同 session_id.
-删除其中一个 session 后另一个仍可读取资源, 缓存继续生成.
+同内容不同路径应返回同一 handle_id, 共享一份 instance.json 和输出.
+确认转码中显示 worker 占用, 排队和完成后归零.
+Stop 保留已发布文件, Retry 续接且不覆盖前缀, Delete 后资源请求返回 404.
 
 保存配置后重启测试容器, 确认数据库配置和 completed 缓存保留,
-旧 session 消失且新会话复用缓存.
+缓存列表仍使用原 handle_id, 读取已有资源不会新建转码任务.
 在测试实例上验证失败重试和部分尾部恢复, 不破坏生产缓存.
-浏览器验证播放时间前进, 视频/音频/字幕切换, 暂停意图和目标范围等待.
+浏览器验证双列表, 独立 Build, 缓存 Play 不发送构建请求,
+播放时间前进, 换轨暂停意图, 目标范围等待和删除当前缓存后的中断.
 Safari 原生 HLS 的最终兼容性仍需真实设备验证.
 
 ```bash
@@ -208,9 +216,11 @@ docker rm anime-server-verify
 成功, 失败或取消后清理该目录, 异常退出的遗留目录在恢复时清理.
 进程 stderr 只保留末尾诊断, 不无限累积转码日志.
 
-缓存与会话生命周期解耦. session 释放不会停止编码,
+缓存与浏览器生命周期解耦, 播放器 Stop 和关闭页面不会停止编码,
 没有自动过期, LRU 或缓存容量设置.
-Ready 和 Completed 等待复用, 仅显式删除, 无效实例清理或关闭流程执行 End.
+所有缓存实例持久保留, 仅用户显式删除执行 End.
+关闭流程只回收任务, 未完成前缀重启后恢复为 Ready, 等待显式构建或续接.
+临时工作文件仍按任务生命周期清理, 恢复时仍修复损坏尾部, 不自动删除整个缓存实例.
 服务关闭先停止 HTTP, 再停止后台任务和缓存写入, 最后关闭数据库.
 
 ## 故障排查
@@ -223,7 +233,8 @@ Ready 和 Completed 等待复用, 仅显式删除, 无效实例清理或关闭�
 | 等待目标较慢        | 新缓存从零连续生成, 可拖回已生成范围                 |
 | failed 且目标未覆盖 | 查看 FFmpeg 诊断, 修复媒体或环境后手动 Retry         |
 | 字幕没有字形        | 检查内嵌字体和镜像的 Noto CJK 回退字体               |
-| 会话不存在          | 服务重启或已释放, 手动重新创建播放                   |
+| handle 不存在       | 缓存已被删除, 从源文件列表显式重新构建               |
+| 缓存没有源路径      | 恢复对应媒体并扫描, 否则只能管理或删除该缓存          |
 | 缓存目录无法初始化  | 检查写权限, 未知条目和是否有其他实例共享目录         |
-| 磁盘空间不足        | 没有自动淘汰, 停服后仅清理明确需要移除的缓存实例     |
+| 磁盘空间不足        | 没有自动淘汰, 在缓存列表确认后删除明确需要移除的实例   |
 | 构建目录权限错误    | 使用独立输出目录或按宿主机策略修复指定目录所有权     |

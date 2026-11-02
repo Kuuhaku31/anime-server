@@ -88,7 +88,7 @@ impl ScannerManager {
     }
 
     /// 验证现存文件实际位于媒体目录内, 保留列表展示的路径身份.
-    async fn resolve(&self, path: &Path) -> Result<PathBuf> {
+    pub(crate) async fn resolve(&self, path: &Path) -> Result<PathBuf> {
         self.check_path(path)?;
         let resolved = tokio::fs::canonicalize(path).await?;
         ensure!(resolved.starts_with(&self.root) && tokio::fs::metadata(&resolved).await?.is_file(),

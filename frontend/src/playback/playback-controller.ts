@@ -1,35 +1,39 @@
 
 // frontend/src/playback/playback-controller.ts
-// 协调最小播放会话, 本地等待位置和浏览器媒体引擎.
-import { createPlayback, getPlayback, isAbort, releasePlayback, rescanMedia, saveConfigs, wait } from "../api/anime-server.ts";
-import type { CacheStatus, MediaEntry, MediaInfo, PlaybackQuery, PlaybackSession, StreamSelection } from "../state/player-state.ts";
+// 协调稳定缓存句柄, 本地播放位置和浏览器媒体引擎.
+
+import { isAbort, playbackUrl, rescanMedia, saveConfigs, wait } from "../api/anime-server.ts";
+import { CacheStore } from "../state/cache-store.ts";
+import type { CacheEntry, CacheStatus, MediaEntry, MediaInfo, PlaybackQuery, StreamSelection } from "../state/player-state.ts";
 import { MediaAdapter } from "./hls-adapter.ts";
 import { absoluteTime, formatTime, rangeReady } from "./timeline.ts";
 
-/** 管理换片, 选轨, seek 和轮询, 不向服务端发送等待目标. */
+/** 播放器只维护本地操作, 构建和缓存管理由共享 CacheStore 执行. */
 export class PlaybackController extends EventTarget {
-  /** 当前选中的路径和媒体信息. */
+  /** 当前选中的源路径和媒体信息. */
   file: MediaEntry | null = null;
-  /** 播放创建时重新探测的媒体信息. */
+  /** 最近一次重新探测得到的媒体信息. */
   info: MediaInfo | null = null;
-  /** 当前不透明会话和清单地址. */
-  session: PlaybackSession | null = null;
-  /** 当前服务端缓存快照. */
-  cache: CacheStatus | null = null;
-  /** 服务端确认的实际三类流索引. */
+  /** 当前选中缓存的稳定标识, 本地停止不会删除它. */
+  handleId: string | null = null;
+  /** 所有缓存及其服务端状态的唯一前端数据源. */
+  readonly caches: CacheStore;
+  /** 服务端确认的实际流选择. */
   selection: StreamSelection | null = null;
-  /** 是否正在等待用户操作完成. */
+  /** 是否正在等待当前用户操作. */
   pending = false;
-  /** 当前需要显示的错误. */
+  /** 当前需要展示的播放错误. */
   error = "";
   /** 当前播放状态说明. */
   message = "Select a video from the library";
 
-  /** 绑定浏览器媒体事件和必要的进度轮询. */
-  constructor(video: HTMLVideoElement) {
+  /** 绑定浏览器事件, 并订阅共享缓存状态而不额外启动状态轮询. */
+  constructor(video: HTMLVideoElement, caches = new CacheStore()) {
     super();
     this.video = video;
+    this.caches = caches;
     this.adapter = new MediaAdapter(video);
+    caches.addEventListener("change", () => this.cacheChanged());
     video.addEventListener("timeupdate", () => {
       if (this.loaded && !this.pending) this.savedPosition = this.position;
       this.changed();
@@ -58,68 +62,93 @@ export class PlaybackController extends EventTarget {
       this.playRequested = false;
       this.enqueue(async () => {
         await this.persist();
-        await this.detach();
+        this.unload();
         this.message = "Ended";
       });
     });
     window.setInterval(() => {
       if (!this.pending && this.loaded && !video.paused) this.persist().catch((error) => this.fail(error));
     }, 5000);
-    // 未完成阶段每秒刷新, Completed 不需要心跳, 等待阶段自行轮询.
-    window.setInterval(() => {
-      if (this.session && this.cache?.phase !== "completed") void this.report();
-    }, 1000);
     document.addEventListener("visibilitychange", () => {
       if (document.hidden) this.persist(true).catch((error) => console.error("Progress save failed", error));
-      else if (!this.pending) void this.report();
+      else void this.report();
     });
     window.addEventListener("pagehide", () => {
       this.savedPosition = this.position;
       this.persist(true).catch((error) => console.error("Progress save failed", error));
       this.operation.abort();
-      this.detach(true).catch((error) => console.error("Session release failed", error));
+      this.unload();
     });
     window.addEventListener("pageshow", (event) => {
       if (event.persisted && this.file) {
         this.pending = false;
-        this.message = "Session closed. Press Play to resume.";
+        this.message = "Press Play to resume.";
+        void this.report();
         this.changed();
       }
     });
   }
 
-  /** 返回原媒体的完整时长. */
+  /** 从共享 Map 获取当前状态, 不保存第二份会过期的缓存快照. */
+  get cache(): CacheStatus | null {
+    return this.handleId ? this.caches.entries.get(this.handleId)?.status ?? null : null;
+  }
+  /** 原媒体的完整时长. */
   get duration(): number { return this.info?.metadata.duration ?? 0; }
-  /** 返回实际播放位置或当前本地等待位置. */
+  /** 实际播放位置或当前尚未覆盖的本地目标. */
   get position(): number {
-    return !this.pending && this.loaded && this.session
+    return !this.pending && this.loaded && this.handleId
       ? absoluteTime(this.video.currentTime, 0, this.duration) : this.savedPosition;
   }
-  /** 返回浏览器下载缓冲末端, 不等同于服务端生成进度. */
+  /** 浏览器下载缓冲末端, 不等同于服务端生成进度. */
   get buffered(): number {
-    if (!this.session || !this.loaded) return 0;
+    if (!this.handleId || !this.loaded) return 0;
     const ranges = this.video.buffered;
     return ranges.length ? Math.min(this.duration, ranges.end(ranges.length - 1)) : 0;
   }
 
-  /** 按列表路径打开媒体, 默认位置取自创建响应的最新配置. */
+  /** 文件列表点播先发送 PlaybackQuery 构建, 然后通过句柄加载资源. */
   open(file: MediaEntry): void {
     this.enqueue(async (signal) => {
       await this.persist();
-      await this.detach();
+      this.unload();
+      this.handleId = null;
       signal.throwIfAborted();
       this.file = file;
       this.info = file[1];
       this.selection = null;
       this.savedPosition = 0;
-      this.message = "Reading media tracks...";
-      this.changed();
-      // 缺省选择交由服务端解析, 本地不计算 media_id 或 handle_id.
-      await this.start(undefined, true, signal);
+      await this.build(undefined, true, signal);
     });
   }
 
-  /** 手动重试播放, 可先重新扫描列表路径. */
+  /** 缓存列表播放只解析源媒体和读取已有资源, 不提交任何构建请求. */
+  openCached(handleId: string): void {
+    this.enqueue(async (signal) => {
+      await this.persist();
+      this.unload();
+      this.handleId = null;
+      await this.caches.refresh();
+      signal.throwIfAborted();
+      const entry = this.requireCache(handleId);
+      if (!entry.source_path) throw new Error("Cache source media is unavailable");
+      const media = await rescanMedia(entry.source_path, signal);
+      signal.throwIfAborted();
+      if (!media) throw new Error("Cache source media was removed");
+      await this.caches.refresh();
+      signal.throwIfAborted();
+      const current = this.requireCache(handleId);
+      if (current.source_path !== media[0]) throw new Error("Cache source changed. Refresh the cache list.");
+      this.file = media;
+      this.info = media[1];
+      this.useCache(current);
+      const saved = this.info.configs.position ?? 0;
+      this.savedPosition = saved < this.duration - 2 ? saved : 0;
+      await this.waitForRange(this.savedPosition, true, signal);
+    });
+  }
+
+  /** 手动重试构建, 可先重新扫描源文件, 不自动循环重建失败任务. */
   retry(probe = false): void {
     this.enqueue(async (signal) => {
       if (!this.file) return;
@@ -132,83 +161,76 @@ export class PlaybackController extends EventTarget {
         this.info = entry[1];
         this.selection = null;
       }
-      await this.start(initialized ? this.savedPosition : undefined, true, signal);
+      await this.build(initialized ? this.savedPosition : undefined, true, signal);
     });
   }
 
-  /** 切换任一实际流并保留用户原来的播放或暂停意图. */
+  /** 换轨构建对应缓存, 保留小数位置和原来的播放意图. */
   select(selection: StreamSelection): void {
     if (!this.info || !this.file) return;
-    // 在入队触发临时暂停前保存意图, 换轨后继续保持原来的播放或暂停状态.
     const playing = this.playRequested;
     this.enqueue(async (signal) => {
       this.selection = selection;
       await this.persist();
-      await this.start(this.savedPosition, playing, signal);
+      await this.build(this.savedPosition, playing, signal);
     });
   }
 
-  /** 在前端更新目标位置, 已覆盖范围直接 seek, 其余范围轮询等待. */
+  /** seek 只修改本地目标, 不因未覆盖范围而重新构建. */
   seek(position: number): void {
     if (!this.info) return;
-    if (!Number.isFinite(position)) {
-      this.fail(new Error("Playback position must be finite"));
-      return;
-    }
+    if (!Number.isFinite(position)) { this.fail(new Error("Playback position must be finite")); return; }
     const target = Math.max(0, Math.min(position, this.duration - 0.1));
-    // 已生成范围直接 seek, 网络缓冲由 HLS 负责, 不必重新创建会话.
-    if (this.session && this.cache && this.loaded && !this.pending
-      && rangeReady(target, this.cache.buffered_until)) {
-      const sessionId = this.session.session_id;
+    if (this.handleId && this.cache && this.loaded && !this.pending && rangeReady(target, this.cache.buffered_until)) {
+      const handleId = this.handleId;
       this.video.currentTime = target;
       this.savedPosition = target;
-      this.persist().catch((error) => {
-        if (this.session?.session_id === sessionId) this.fatal(error);
-      });
+      this.persist().catch((error) => { if (this.handleId === handleId) this.fatal(error); });
       this.changed();
     } else {
       const playing = this.playRequested;
       this.enqueue(async (signal) => {
         this.savedPosition = target;
         await this.persist();
-        if (this.session) {
-          // 未覆盖目标只卸载当前媒体并等待同一会话, 不重启顺序生成任务.
-          this.loaded = false;
-          this.adapter.destroy();
-          await this.waitForRange(target, playing, signal);
-        } else { await this.start(target, playing, signal); }
+        this.unload();
+        if (this.handleId) await this.waitForRange(target, playing, signal);
+        else await this.build(target, playing, signal);
       });
     }
   }
 
-  /** 切换用户播放意图, 没有活动会话时重新创建播放. */
+  /** 本地停止后复用现有句柄, 不把 Play 隐式转换成转码重试. */
   toggle(): void {
     if (this.pending || !this.file) return;
-    if (!this.loaded || !this.session) {
+    if (!this.loaded) {
       this.enqueue(async (signal) => {
-        await this.start(this.savedPosition >= this.duration ? 0 : this.savedPosition, true, signal);
+        const target = this.savedPosition >= this.duration ? 0 : this.savedPosition;
+        if (this.handleId) {
+          await this.caches.refresh();
+          signal.throwIfAborted();
+          await this.waitForRange(target, true, signal);
+        } else await this.build(target, true, signal);
       });
     } else if (this.video.paused) {
       this.playRequested = true;
       this.video.play().catch((error) => this.fatal(error));
     } else {
-      // 暂停意图同步更新, 避免 pause 事件尚未派发时立即换轨又恢复播放.
       this.playRequested = false;
       this.video.pause();
     }
   }
 
-  /** 保存当前位置并释放当前会话, 不停止共享缓存生成. */
+  /** Stop 只保存位置和卸载播放器, 不停止或删除共享转码任务. */
   stop(): void {
     this.enqueue(async () => {
       this.playRequested = false;
       await this.persist();
-      await this.detach();
+      this.unload();
       this.message = "Stopped";
     });
   }
 
-  /** 向界面报告可处理的失败, 不把取消操作显示为错误. */
+  /** 展示失败, 被新操作替代的取消不显示为业务错误. */
   fail(error: unknown): void {
     if (isAbort(error)) return;
     console.error(error);
@@ -217,53 +239,56 @@ export class PlaybackController extends EventTarget {
     this.changed();
   }
 
-  /** 浏览器实际使用的视频元素. */
+  /** 当前浏览器媒体元素. */
   private video: HTMLVideoElement;
-  /** 当前 HLS 播放引擎. */
+  /** 当前 HLS 媒体引擎. */
   private adapter: MediaAdapter;
-  /** 取消被后续用户操作替代的等待. */
+  /** 取消被后续操作替代的等待和媒体加载. */
   private operation = new AbortController();
-  /** 保证会话清理和用户操作按顺序执行. */
+  /** 串行执行播放器操作, 不限制独立缓存构建. */
   private queue: Promise<void> = Promise.resolve();
-  /** 重置媒体元素或等待转码期间保留的本地绝对位置. */
+  /** 卸载或等待期间保留的绝对播放位置. */
   private savedPosition = 0;
-  /** 浏览器媒体是否已完成挂载. */
+  /** 是否已经挂载浏览器媒体. */
   private loaded = false;
   /** 独立于临时暂停的用户播放意图. */
   private playRequested = false;
-  /** 防止普通状态轮询重叠. */
-  private reporting = false;
   /** 串行保存完整播放配置的队列. */
   private saving: Promise<void> = Promise.resolve();
 
-  /** 终止加载并释放会话, 保留错误等待手动重试. */
+  /** 删除当前句柄或源路径失效时立即停止本地播放, 不静默重建. */
+  private cacheChanged(): void {
+    if (this.handleId) {
+      const entry = this.caches.entries.get(this.handleId);
+      if (!entry) { this.fatal(new Error("The current cache was deleted")); return; }
+      if (!entry.source_path) { this.fatal(new Error("Cache source media is unavailable")); return; }
+      if (!this.pending && this.loaded && entry.status.phase === "failed") {
+        if (!rangeReady(this.position, entry.status.buffered_until)) {
+          this.fatal(new Error(entry.status.error || "Cache generation failed")); return;
+        }
+        this.message = "Playing cached range. Cache generation stopped.";
+      }
+    }
+    this.changed();
+  }
+
+  /** 解码或资源故障只卸载播放器, 不删除仍可由其他客户端使用的缓存. */
   private fatal(error: unknown): void {
     if (isAbort(error)) return;
     this.savedPosition = this.position;
-    this.loaded = false;
     this.playRequested = false;
     this.operation.abort();
-    this.adapter.destroy();
+    this.unload();
+    this.handleId = null;
     this.pending = false;
     this.fail(error);
-    const session = this.session;
-    this.session = null;
-    this.cache = null;
-    this.queue = this.queue.then(async () => {
-      try {
-        await Promise.all([this.persist(), session ? releasePlayback(session.session_id) : Promise.resolve()]);
-      } catch (cleanupError) {
-        console.error("Playback cleanup failed", cleanupError);
-        this.error += `\nSession cleanup failed: ${String(cleanupError)}`;
-        this.changed();
-      }
-    });
+    this.persist().catch((saveError) => this.fail(saveError));
   }
 
-  /** 通知控件同步当前状态. */
+  /** 通知控件读取当前本地状态. */
   private changed(): void { this.dispatchEvent(new Event("change")); }
 
-  /** 新操作取消旧等待, 但按顺序清理旧会话以防多个会话接管播放器. */
+  /** 新用户操作取消旧等待, 旧构建结果仍保留在共享缓存 Map 中. */
   private enqueue(action: (signal: AbortSignal) => Promise<void>): void {
     this.savedPosition = this.position;
     this.operation.abort();
@@ -279,9 +304,8 @@ export class PlaybackController extends EventTarget {
       catch (error) {
         if (!operation.signal.aborted) {
           this.playRequested = false;
-          try { await this.detach(); }
-          catch (cleanupError) { console.error("Session cleanup failed", cleanupError); }
-          if (!operation.signal.aborted) this.fail(error);
+          this.unload();
+          this.fail(error);
         }
       } finally {
         if (!operation.signal.aborted) { this.pending = false; this.changed(); }
@@ -289,69 +313,82 @@ export class PlaybackController extends EventTarget {
     });
   }
 
-  /** 创建会话并接收最新媒体配置, 等待位置不进入 PlaybackQuery. */
-  private async start(position: number | undefined, autoplay: boolean, signal: AbortSignal): Promise<void> {
+  /** 构建请求只含路径与流选择, 响应迟到不能接管新的播放器操作. */
+  private async build(position: number | undefined, autoplay: boolean, signal: AbortSignal): Promise<void> {
     if (!this.file) throw new Error("Select a video first");
-    await this.detach();
+    this.unload();
+    this.handleId = null;
     signal.throwIfAborted();
     this.savedPosition = position ?? 0;
     this.playRequested = autoplay;
-    this.message = "Preparing stream...";
+    this.message = "Building cache...";
     this.changed();
     const path = this.file[0];
     const query: PlaybackQuery = { path, ...this.selection };
-    // 已保存实际视频流说明用户曾完成选轨, 显式传递 null 才能保持关闭偏好.
     if (!this.selection && this.file[1].configs.video_stream_index !== null) {
       query.video_stream_index = this.file[1].configs.video_stream_index;
       query.audio_stream_index = this.file[1].configs.audio_stream_index;
       query.subtitle_stream_index = this.file[1].configs.subtitle_stream_index;
     }
-    const response = await createPlayback(query);
-    if (signal.aborted) { await releasePlayback(response.session_id); signal.throwIfAborted(); }
-    const { media, cache, session_id, url, video_stream_index, audio_stream_index, subtitle_stream_index } = response;
-    this.info = media;
-    this.file = [path, media];
-    this.selection = { video_stream_index, audio_stream_index, subtitle_stream_index };
-    const saved = media.configs.position ?? 0;
+    const response = await this.caches.build(query);
+    signal.throwIfAborted();
+    this.info = response.media;
+    this.file = [path, response.media];
+    this.useCache(this.requireCache(response.cache.handle_id));
+    const saved = response.media.configs.position ?? 0;
     const target = position ?? (saved < this.duration - 2 ? saved : 0);
     this.savedPosition = Math.max(0, Math.min(target, this.duration - 0.1));
-    this.session = { session_id, url };
-    this.cache = cache;
-    await this.waitForRange(this.savedPosition, autoplay, signal);
+    await this.waitForRange(this.savedPosition, autoplay, signal, true);
   }
 
-  /** 只在目标进入已发布的半开区间后挂载 HLS, 等待期间不创建新会话. */
-  private async waitForRange(position: number, autoplay: boolean, signal: AbortSignal): Promise<void> {
-    if (!this.session || !this.cache) throw new Error("Playback session is missing");
-    const sessionId = this.session.session_id;
+  /** 接受服务端确认的稳定标识与三类实际流选择. */
+  private useCache(entry: CacheEntry): void {
+    this.handleId = entry.handle_id;
+    const { video_stream_index, audio_stream_index, subtitle_stream_index } = entry.spec;
+    this.selection = { video_stream_index, audio_stream_index, subtitle_stream_index };
+  }
+
+  /** 查找失败明确报错, 不用假状态掩盖并发删除. */
+  private requireCache(handleId: string): CacheEntry {
+    const entry = this.caches.entries.get(handleId);
+    if (!entry) throw new Error("The requested cache was deleted");
+    return entry;
+  }
+
+  /** 只有目标进入已发布范围才挂载 HLS, 资源请求仅包含句柄和文件名. */
+  private async waitForRange(position: number, autoplay: boolean, signal: AbortSignal, building = false): Promise<void> {
+    const handleId = this.handleId;
+    if (!handleId) throw new Error("No cache selected");
+    this.savedPosition = position;
     let deadline = Date.now() + 180_000;
-    let generated = this.cache.buffered_until;
-    let activity = this.cache.phase;
+    let generated = -1;
+    let activity = "";
     while (true) {
       signal.throwIfAborted();
-      if (!this.session || !this.cache || this.session.session_id !== sessionId) throw new Error("Playback session changed");
-      if (this.cache.phase === "stopping") throw new Error("Cache generation is stopping. Retry playback later.");
-      if (rangeReady(position, this.cache.buffered_until)) break;
-      if (this.cache.phase === "failed") throw new Error("Cache generation failed. Retry playback.");
-      if (this.cache.phase === "completed") throw new Error("Cached video does not cover the requested position.");
-      // 超时只限制持续无进展, 生成前进或调度状态变化都会刷新等待期限.
-      if (this.cache.buffered_until > generated || this.cache.phase !== activity) {
-        generated = this.cache.buffered_until;
-        activity = this.cache.phase;
+      if (this.handleId !== handleId) throw new Error("Playback cache changed");
+      const entry = this.requireCache(handleId);
+      if (!entry.source_path) throw new Error("Cache source media is unavailable");
+      const cache = entry.status;
+      if (cache.phase === "running") building = false;
+      if (rangeReady(position, cache.buffered_until)) break;
+      if (cache.phase === "failed") throw new Error(cache.error || "Cache generation failed. Retry the cache.");
+      if (cache.phase === "completed") throw new Error("Cached video does not cover the requested position.");
+      if (cache.phase === "stopping" || cache.phase === "ready" && !building) {
+        throw new Error("Cache generation is stopped. Retry it from the cache list.");
+      }
+      if (cache.buffered_until > generated || cache.phase !== activity) {
+        generated = cache.buffered_until;
+        activity = cache.phase;
         deadline = Date.now() + 180_000;
       }
       if (Date.now() > deadline) throw new Error("Cache generation made no progress for 180 seconds. Retry later.");
-      const phaseLabel = this.cache.phase === "running" ? "Generating cache"
-        : "Preparing cache or waiting for a media process slot";
-      this.message = `${phaseLabel}: ${formatTime(this.cache.buffered_until)} / ${formatTime(this.duration)}. Waiting for ${formatTime(position)}...`;
+      this.message = `Generating cache: ${formatTime(cache.buffered_until)} / ${formatTime(this.duration)}. Waiting for ${formatTime(position)}...`;
       this.changed();
       await wait(500, signal);
-      const status = await getPlayback(sessionId, signal);
-      signal.throwIfAborted();
-      this.cache = status;
+      await this.caches.refresh();
     }
     signal.throwIfAborted();
-    await this.adapter.attach(this.session.url, position, signal, (error) => this.fatal(error));
+    await this.adapter.attach(playbackUrl(handleId), position, signal, (error) => this.fatal(error));
     this.loaded = true;
     this.error = "";
     this.playRequested = autoplay;
@@ -362,28 +399,23 @@ export class PlaybackController extends EventTarget {
         if (error instanceof DOMException && error.name === "NotAllowedError") {
           this.playRequested = false;
           this.message = "Press Play to start";
-        } else { throw error; }
+        } else throw error;
       }
     }
   }
 
-  /** 卸载媒体引擎并释放旧会话映射. */
-  private async detach(keepalive = false): Promise<void> {
-    const previous = this.session;
-    this.session = null;
-    this.cache = null;
+  /** 卸载本地引擎但保留所选句柄, 不发送服务端删除请求. */
+  private unload(): void {
     this.loaded = false;
     this.adapter.destroy();
-    if (previous) await releasePlayback(previous.session_id, keepalive);
   }
 
-  /** 捕获当前路径, 位置和流选择, 防止异步换片把旧配置写到新媒体. */
+  /** 捕获路径和配置, 防止换片期间把旧位置写到新媒体. */
   private persist(keepalive = false): Promise<void> {
     if (!this.file || !this.info || !this.selection) return Promise.resolve();
     const path = this.file[0];
     const configs = { position: this.position, ...this.selection };
     this.info.configs = configs;
-    // 普通保存串行发送, 卸载请求绕过队列以尽力在页面关闭前发出.
     if (keepalive) return saveConfigs(path, configs, true);
     const task = this.saving.catch((error) => console.error("Previous progress save failed", error))
       .then(() => saveConfigs(path, configs));
@@ -391,24 +423,9 @@ export class PlaybackController extends EventTarget {
     return task;
   }
 
-  /** 刷新当前会话缓存快照, 丢弃已经被换片或 seek 替代的响应. */
+  /** 恢复可见页面时通过共享仓库刷新, 避免播放器拥有第二条轮询链. */
   private async report(): Promise<void> {
-    if (this.reporting || this.pending || !this.session) return;
-    const sessionId = this.session.session_id;
-    this.reporting = true;
-    try {
-      const status = await getPlayback(sessionId);
-      // 响应返回前可能已换轨或进入拖动等待, 旧响应不能覆盖当前操作状态.
-      if (this.session?.session_id !== sessionId || this.pending) return;
-      this.cache = status;
-      if (status.phase === "failed") {
-        if (!rangeReady(this.position, status.buffered_until)) throw new Error("Cache generation failed. Retry playback.");
-        this.message = "Playing cached range. Cache generation stopped.";
-      }
-      if (status.phase === "stopping") throw new Error("Cache generation is stopping. Retry playback later.");
-      this.changed();
-    } catch (error) {
-      if (this.session?.session_id === sessionId && !this.pending) this.fatal(error);
-    } finally { this.reporting = false; }
+    try { await this.caches.refresh(); }
+    catch (error) { this.fail(error); }
   }
 }

@@ -20,7 +20,6 @@ mod process;
 mod scanner;
 mod services;
 mod utils;
-mod sessions;
 
 #[cfg(test)]
 #[path = "tests/fixtures/runtime.rs"]
@@ -46,7 +45,6 @@ async fn main() -> Result<()> {
     // 先等待 HTTP 完全停止, 避免清理缓存时仍有请求创建新的写入任务.
     stop.send_replace(true);
     scanning.await?;
-    services::sessions().shutdown().await;
     let caches = services::cache().shutdown().await;
     services::database().shutdown().await;
     server?;

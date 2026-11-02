@@ -13,19 +13,22 @@ interface CacheProgress {
 
 /** 使用服务端阶段与已验证前缀展示生成进度. */
 export function cacheProgress(cache: CacheStatus, duration: number): CacheProgress {
-  const seconds = Math.min(duration, cache.buffered_until);
-  const percent = cache.phase === "completed" ? 100 : Math.min(100, 100 * seconds / duration);
+  const knownDuration = Number.isFinite(duration) && duration > 0;
+  const seconds = knownDuration ? Math.min(duration, cache.buffered_until) : cache.buffered_until;
+  const percent = cache.phase === "completed" ? 100 : knownDuration ? Math.min(100, 100 * seconds / duration) : 0;
   const state = {
     loading: "Preparing / queued",
     ready: "Ready",
-    running: "Generating",
+    running: cache.resources.encoder_slots ? "Generating" : "Queued / preparing",
     stopping: "Stopping",
     completed: "Complete",
     failed: "Generation failed",
   }[cache.phase];
   return {
     percent,
-    text: `${state}: ${percent.toFixed(1)}% / ${formatTime(seconds)} of ${formatTime(duration)}`,
+    text: knownDuration
+      ? `${state}: ${percent.toFixed(1)}% / ${formatTime(seconds)} of ${formatTime(duration)}`
+      : `${state}: ${formatTime(seconds)} generated / source duration unavailable`,
   };
 }
 

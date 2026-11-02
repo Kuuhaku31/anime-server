@@ -7,7 +7,7 @@ use std::{path::Path, sync::OnceLock};
 use anyhow::{anyhow, Result};
 
 use crate::{
-    api::SessionManager, cache::CacheManager, config::AppConfigManager, constants,
+    cache::CacheManager, config::AppConfigManager, constants,
     db::DatabaseManager, process::ProcessManager, scanner::ScannerManager,
 };
 
@@ -21,8 +21,6 @@ static SCANNER: OnceLock<ScannerManager> = OnceLock::new();
 static CACHE: OnceLock<CacheManager> = OnceLock::new();
 /// 全局进程预算实例.
 static PROCESS: OnceLock<ProcessManager> = OnceLock::new();
-/// API 内部会话映射实例.
-static SESSIONS: OnceLock<SessionManager> = OnceLock::new();
 
 /// 初始化全部管理器, 管理器自身不读取全局 getter 或保存彼此.
 pub(crate) async fn initialize(config_path: &Path) -> Result<()> {
@@ -35,7 +33,6 @@ pub(crate) async fn initialize(config_path: &Path) -> Result<()> {
     let processes = register(&PROCESS, ProcessManager::new(config.max_processes, config.max_total_ffmpeg_threads), "process")?;
     register(&CACHE, CacheManager::new(constants::CACHE_DIR.into(), processes).await?, "cache")?;
     register(&SCANNER, ScannerManager::new(Path::new(constants::VIDEO_ROOT)).await?, "scanner")?;
-    register(&SESSIONS, SessionManager::new(), "sessions")?;
     Ok(())
 }
 
@@ -62,11 +59,6 @@ pub(crate) fn cache() -> &'static CacheManager {
 /// 返回唯一进程预算实例.
 pub(crate) fn process() -> &'static ProcessManager {
     PROCESS.get().expect("process manager is not initialized")
-}
-
-/// 返回 API 内部会话映射实例.
-pub(crate) fn sessions() -> &'static SessionManager {
-    SESSIONS.get().expect("session manager is not initialized")
 }
 
 /// 注册只读单例, 拒绝覆盖任何已经存在的实例.

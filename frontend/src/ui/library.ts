@@ -3,7 +3,7 @@
 // 展示路径和媒体信息列表, 并将点播动作交给播放控制器.
 
 import { listMedia, rescanMedia, scanMedia } from "../api/anime-server.ts";
-import type { MediaEntry } from "../state/player-state.ts";
+import type { MediaEntry, MediaInfo } from "../state/player-state.ts";
 import { formatTime } from "../playback/timeline.ts";
 import { element } from "./controls.ts";
 
@@ -35,10 +35,12 @@ export function sortFiles(files: MediaEntry[], order: SortOrder): MediaEntry[] {
 }
 
 /** 管理媒体列表加载, 排序和按路径选中状态. */
-export class Library {
+export class Library extends EventTarget {
   /** 绑定列表事件和持久化排序选项. */
-  constructor(open: (file: MediaEntry) => void, fail: (error: unknown) => void) {
+  constructor(open: (file: MediaEntry) => void, fail: (error: unknown) => void, build?: (file: MediaEntry) => Promise<void>) {
+    super();
     this.open = open;
+    this.build = build;
     const sort = element<HTMLSelectElement>("#files-sort");
     try {
       const saved = localStorage.getItem(SORT_KEY);
@@ -61,6 +63,13 @@ export class Library {
       const file = this.files.find((file) => file[0] === target.dataset.path);
       if (!file) return;
       if (target.dataset.action === "open") this.open(file);
+      else if (target.dataset.action === "build" && this.build) {
+        const path = file[0];
+        if (this.building.has(path)) return;
+        this.building.add(path);
+        this.render();
+        this.build(file).catch(fail).finally(() => { this.building.delete(path); this.render(); });
+      }
       else if (target.dataset.action === "scan") {
         const path = file[0];
         if (this.scanning.has(path)) return;
@@ -91,6 +100,12 @@ export class Library {
   async load(): Promise<void> {
     this.files = await listMedia();
     this.render();
+    this.dispatchEvent(new Event("change"));
+  }
+
+  /** 为缓存列表提供已加载的源媒体时长, 不在轮询中重复探测. */
+  info(path: string | null): MediaInfo | null {
+    return this.files.find((file) => file[0] === path)?.[1] ?? null;
   }
 
   /** 播放位置变化时仅更新高亮, 不重建整张列表. */
@@ -108,10 +123,14 @@ export class Library {
   private files: MediaEntry[] = [];
   /** 交由播放控制器执行的打开动作. */
   private open: (file: MediaEntry) => void;
+  /** 不切换播放器的独立缓存构建操作. */
+  private build?: (file: MediaEntry) => Promise<void>;
   /** 当前高亮的媒体路径. */
   private active: string | null = null;
   /** 正在单文件扫描的路径, 防止重复提交. */
   private scanning = new Set<string>();
+  /** 正在提交构建的路径, 防止重复点击. */
+  private building = new Set<string>();
   /** 当前使用的本地排序选项. */
   private sort: SortOrder = "path";
 
@@ -133,12 +152,19 @@ export class Library {
       info.append(name, detail);
       const actions = document.createElement("div");
       actions.className = "actions";
-      for (const [action, label] of [["open", "Play"], ["scan", "Rescan"]]) {
+      const buttons = [["open", "Play"], ...(this.build ? [["build", "Build"]] : []), ["scan", "Rescan"]];
+      for (const [action, label] of buttons) {
         const button = document.createElement("button");
         button.type = "button";
         button.dataset.path = path;
         button.dataset.action = action;
         button.textContent = label;
+        if (action === "open") button.title = "Build or reuse a cache, then play";
+        if (action === "build") {
+          button.title = "Build a cache without changing playback";
+          button.disabled = this.building.has(path);
+          if (button.disabled) button.textContent = "Building...";
+        }
         if (action === "scan") {
           button.title = "Rehash this file path and update the database";
           button.disabled = this.scanning.has(path);

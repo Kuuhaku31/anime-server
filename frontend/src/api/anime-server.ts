@@ -1,8 +1,8 @@
 
 // frontend/src/api/anime-server.ts
-// 封装同源媒体列表, 配置保存和最小播放会话接口.
+// 封装媒体配置, 缓存构建管理和稳定句柄资源地址.
 
-import type { CacheStatus, MediaConfigs, MediaEntry, PlaybackQuery, PlaybackStart, ScanChanges } from "../state/player-state.ts";
+import type { CacheBuild, CacheEntry, CacheList, MediaConfigs, MediaEntry, PlaybackQuery, ScanChanges } from "../state/player-state.ts";
 
 /** 保留服务端返回的 HTTP 状态和错误正文. */
 export class ApiError extends Error {
@@ -57,19 +57,39 @@ export function saveConfigs(path: string, configs: MediaConfigs, keepalive = fal
   });
 }
 
-/** 创建播放时保留响应以便释放被新操作替代的会话. */
-export function createPlayback(query: PlaybackQuery): Promise<PlaybackStart> {
-  return jsonRequest("/api/playback", query);
+/** 提交转码请求, 与读取已有 HLS 资源分离. */
+export function buildCache(query: PlaybackQuery): Promise<CacheBuild> {
+  return jsonRequest("/api/cache", query);
 }
 
-/** 查询缓存快照, 不发送位置或心跳. */
-export function getPlayback(sessionId: string, signal?: AbortSignal): Promise<CacheStatus> {
-  return request(`/api/playback/${sessionId}`, { signal });
+/** 获取全部缓存及其转码资源占用合计. */
+export function listCache(): Promise<CacheList> {
+  return request("/api/cache");
 }
 
-/** 只释放当前会话映射, 不停止服务端共享缓存生成. */
-export function releasePlayback(sessionId: string, keepalive = false): Promise<void> {
-  return request(`/api/playback/${sessionId}`, { method: "DELETE", keepalive });
+/** 查询已有缓存, 不隐式启动或恢复生成. */
+export function getCache(handleId: string, signal?: AbortSignal): Promise<CacheEntry> {
+  return request(`/api/cache/${encodeURIComponent(handleId)}`, { signal });
+}
+
+/** 由服务端解析同内容的源路径并重新构建已有缓存. */
+export function retryCache(handleId: string): Promise<CacheBuild> {
+  return request(`/api/cache/${encodeURIComponent(handleId)}/retry`, { method: "POST" });
+}
+
+/** 停止转码并保留已经发布的缓存前缀. */
+export function stopCache(handleId: string): Promise<CacheEntry> {
+  return request(`/api/cache/${encodeURIComponent(handleId)}/stop`, { method: "POST" });
+}
+
+/** 立即停止并删除共享缓存, 不保护其他播放器的引用. */
+export function deleteCache(handleId: string): Promise<void> {
+  return request(`/api/cache/${encodeURIComponent(handleId)}`, { method: "DELETE" });
+}
+
+/** 使用稳定句柄和单个资源名称构造同源播放请求. */
+export function playbackUrl(handleId: string, assetName = "index.m3u8"): string {
+  return `/playback/${encodeURIComponent(handleId)}/${encodeURIComponent(assetName)}`;
 }
 
 /** 判断错误是否来自被替代的用户操作. */

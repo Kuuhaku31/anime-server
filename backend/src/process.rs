@@ -24,7 +24,7 @@ pub(crate) use ffmpeg::{
     sync_directory, write_playlist, CachedMedia,
 };
 pub(crate) use fragment::{normalize, Init, Tail};
-pub(crate) use worker::EncodingWorker;
+pub(crate) use worker::{EncodingWorker, WorkerResources, WorkerUsage};
 
 #[cfg(test)]
 #[path = "tests/process.rs"]

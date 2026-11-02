@@ -15,7 +15,7 @@ fn transition_matrix_has_only_the_six_documented_phases() {
                 "completed" => to.is_none(),
                 "ready" => to.is_none() || to == Some("running"),
                 "failed" => to.is_none() || to == Some("loading"),
-                "stopping" => to.is_none() || to == Some("failed"),
+                "stopping" => to.is_none() || matches!(to, Some("completed" | "ready" | "failed")),
                 "running" => matches!(to, Some("completed" | "ready" | "failed" | "stopping")),
                 _ => unreachable!("unknown test phase: {from}"),
             };
@@ -43,7 +43,7 @@ async fn ready_run_reserves_its_worker_before_stop() -> Result<()> {
     handle.run(directory.path.join("missing.mkv"), crate::testing::metadata(),
         &AppConfigManager::default(), &ProcessManager::new(2, 2)).await?;
     assert!(handle.stop().await?, "run returned before registering its worker");
-    assert_eq!(handle.snapshot().await?.phase, "stopping");
+    assert_eq!(handle.snapshot().await?.status.phase, "stopping");
     Ok(())
 }
 
@@ -61,8 +61,54 @@ async fn stop_cancels_a_deferred_run_after_recovery_becomes_ready() -> Result<()
         &AppConfigManager::default(), &ProcessManager::new(2, 2)).await?;
     transition(&mut *handle.phase.lock().await, Some(Phase::Ready { cancel }))?;
     assert!(!handle.stop().await?);
-    assert_eq!(handle.snapshot().await?.phase, "ready");
+    assert_eq!(handle.snapshot().await?.status.phase, "ready");
     assert!(std::fs::read_dir(&directory.path)?.next().is_none());
+    Ok(())
+}
+
+/// 停止中的 worker 未退出前不能提前变为可续接状态.
+#[test]
+fn stopping_cannot_become_ready_with_a_live_worker() {
+    let (cancel, receiver) = watch::channel(false);
+    let mut current = Some(Phase::Stopping { cancel });
+    assert!(transition(&mut current, Some(phase("ready"))).is_err());
+    drop(receiver);
+    assert!(transition(&mut current, Some(phase("ready"))).is_ok());
+}
+
+/// 用户停止不能取消非 Running 阶段的恢复, 也不能等待其接收端退出.
+#[tokio::test]
+async fn pause_does_not_cancel_loading_recovery() -> Result<()> {
+    let directory = crate::testing::TestDirectory::new();
+    let spec = crate::testing::spec();
+    let handle = CacheInstanceHandle::new(spec.clone(), spec.handle_id()?, directory.path.clone());
+    let (cancel, receiver) = watch::channel(false);
+    *handle.phase.lock().await = Some(Phase::Loading { started: true, cancel });
+    tokio::time::timeout(Duration::from_millis(100), handle.pause()).await??;
+    assert!(!*receiver.borrow());
+    assert_eq!(handle.snapshot().await?.status.phase, "loading");
+    Ok(())
+}
+
+/// 正在停止转码时仍可读取已发布前缀, 但不能读取清单外的分片.
+#[tokio::test]
+async fn stopping_keeps_published_assets_available() -> Result<()> {
+    let directory = crate::testing::TestDirectory::new();
+    let spec = crate::testing::spec();
+    let handle = CacheInstanceHandle::new(spec.clone(), spec.handle_id()?, directory.path.clone());
+    tokio::fs::write(directory.path.join("index.m3u8"),
+        "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:4,\nsegment_000000.m4s\n").await?;
+    for name in ["init.mp4", "segment_000000.m4s", "segment_000001.m4s"] {
+        tokio::fs::write(directory.path.join(name), b"published asset").await?;
+    }
+    *handle.phase.lock().await = Some(phase("stopping"));
+    for name in ["index.m3u8", "init.mp4", "segment_000000.m4s"] {
+        assert_eq!(handle.media_path(name).await?, directory.path.join(name));
+    }
+    assert!(handle.media_path("segment_000001.m4s").await.is_err());
+    assert!(handle.media_path("instance.json").await.is_err());
+    handle.pause().await?;
+    assert_eq!(handle.snapshot().await?.status.phase, "ready");
     Ok(())
 }
 

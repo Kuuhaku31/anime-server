@@ -8,7 +8,7 @@ use anyhow::{ensure, Result};
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 
-use crate::{cache::HandleSnapshot, constants::HASH_LIMIT, utils};
+use crate::{cache::CacheSnapshot, constants::HASH_LIMIT, process::WorkerResources, utils};
 
 mod media;
 
@@ -63,11 +63,11 @@ pub(crate) struct ScanChanges {
     pub(crate) total: u64,
 }
 
-/// 按媒体路径请求播放, 不向后端传递等待位置或编码参数.
+/// 按媒体路径请求构建缓存, 不向后端传递等待位置或编码参数.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PlaybackQuery {
-    /// 要播放的容器内媒体路径.
+    /// 要转码的容器内媒体路径.
     pub(crate) path: PathBuf,
     /// 请求的视频全局流索引, 缺省时使用配置或首条视频流.
     pub(crate) video_stream_index: Option<i32>,
@@ -79,23 +79,32 @@ pub(crate) struct PlaybackQuery {
     pub(crate) subtitle_stream_index: Option<Option<i32>>,
 }
 
-/// 返回新播放映射, 初始缓存状态和实际媒体选择.
+/// 聚合缓存快照和按内容身份找到的现存源路径.
 #[derive(Debug, Serialize)]
-pub(crate) struct PlaybackStart {
-    /// 客户端持有的不透明播放会话标识.
-    pub(crate) session_id: String,
-    /// 该会话的同源 HLS 清单地址.
-    pub(crate) url: String,
-    /// 不包含内部缓存目录的初始状态快照.
-    pub(crate) cache: HandleSnapshot,
+pub(crate) struct CacheEntry {
+    /// 不包含磁盘目录的缓存身份和当前状态.
+    #[serde(flatten)]
+    pub(crate) snapshot: CacheSnapshot,
+    /// 稳定排序后的首个现存源路径, 无源缓存为 None.
+    pub(crate) source_path: Option<PathBuf>,
+}
+
+/// 返回全部缓存及其转码 worker 的占用合计.
+#[derive(Debug, Serialize)]
+pub(crate) struct CacheList {
+    /// 按 handle_id 排序的全部缓存条目.
+    pub(crate) entries: Vec<CacheEntry>,
+    /// 全部条目的转码 worker 占用, 不包含短时探测和校验进程.
+    pub(crate) resources: WorkerResources,
+}
+
+/// 返回构建结果及最新媒体信息, 实际流选择位于 cache.spec.
+#[derive(Debug, Serialize)]
+pub(crate) struct CacheBuild {
+    /// 新建或复用的缓存条目.
+    pub(crate) cache: CacheEntry,
     /// 当前路径重新探测的元数据和共享配置.
     pub(crate) media: MediaInfo,
-    /// 服务端确认的视频流索引.
-    pub(crate) video_stream_index: i32,
-    /// 服务端确认的可选音频流索引.
-    pub(crate) audio_stream_index: Option<i32>,
-    /// 服务端确认的可选字幕流索引.
-    pub(crate) subtitle_stream_index: Option<i32>,
 }
 
 /// 以固定字段顺序定义缓存身份和 instance.json 的唯一格式.
@@ -133,7 +142,7 @@ impl CacheSpec {
         Ok(format!("{:x}", Md5::digest(self.descriptor()?)))
     }
 
-    /// 序列化全部身份字段, 不包含路径, 会话, 位置或线程数.
+    /// 序列化全部身份字段, 不包含路径, 播放位置或线程数.
     pub(crate) fn descriptor(&self) -> Result<Vec<u8>, serde_json::Error> {
         serde_json::to_vec(self)
     }

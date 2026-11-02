@@ -80,6 +80,13 @@ impl DatabaseManager {
        Ok(rows.into_iter().map(|(path, media_id)| (PathBuf::from(path), media_id)).collect())
     }
 
+    /// 按稳定路径顺序查找同内容副本, 由调用方跳过已经消失的源文件.
+    pub(crate) async fn paths_by_media_id(&self, media_id: &str) -> Result<Vec<PathBuf>, SqlxErr> {
+        let paths: Vec<String> = sqlx::query_scalar("SELECT path FROM file_path WHERE media_id = ? ORDER BY path")
+            .bind(media_id).fetch_all(&self.pool).await?;
+        Ok(paths.into_iter().map(PathBuf::from).collect())
+    }
+
     /// 根据路径获取身份和配置
     pub(crate) async fn get_file_by_path(&self, path: &Path)
     -> Result<OptionIdAndConfigs, SqlxErr>

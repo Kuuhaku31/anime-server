@@ -86,7 +86,7 @@ export class MediaAdapter {
     });
   }
 
-  /** 先解除旧加载回调再重置 video, 避免旧事件污染新会话. */
+  /** 先解除旧加载回调再重置 video, 避免旧事件污染新播放操作. */
   destroy(): void {
     this.cleanup?.();
     this.cleanup = null;

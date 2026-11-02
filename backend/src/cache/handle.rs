@@ -10,17 +10,17 @@ use tracing::{info, warn};
 
 use crate::{
     config::AppConfigManager, models::{CacheSpec, MediaMetadata},
-    process::{self, check_cancel, CachedMedia, Cancelled, EncodingWorker, Init, ProcessManager, RenderAssets, Tail},
+    process::{self, check_cancel, CachedMedia, Cancelled, EncodingWorker, Init, ProcessManager, RenderAssets, Tail, WorkerUsage},
     utils,
 };
 
-use super::HandleSnapshot;
+use super::{CacheError, CacheSnapshot, CacheStatus};
 
 #[cfg(test)]
 #[path = "../tests/cache/handle.rs"]
 mod tests;
 
-/// 只保存稳定身份, 唯一目录和阶段锁, 媒体进度以磁盘清单为准.
+/// 保存稳定身份, 唯一目录, 阶段锁和资源计数, 媒体进度以磁盘清单为准.
 pub(super) struct CacheInstanceHandle {
     /// 与实例描述和目录哈希一致的稳定身份.
     pub(super) spec: CacheSpec,
@@ -30,6 +30,8 @@ pub(super) struct CacheInstanceHandle {
     pub(super) path: PathBuf,
     /// None 仅表示执行 End 时已封闭的句柄, 不作为可查询状态.
     phase: Mutex<Option<Phase>>,
+    /// 长时间转码 worker 的资源计数, 不持有 worker 或其他管理器.
+    resources: Arc<WorkerUsage>,
 }
 
 /// 六个内部阶段及其必要的启动和取消数据.
@@ -68,18 +70,23 @@ enum Phase {
 impl CacheInstanceHandle {
     /// 为一个已建立目录的稳定身份创建未启动的 Loading 句柄.
     pub(super) fn new(spec: CacheSpec, handle_id: String, path: PathBuf) -> Self {
-        Self { spec, handle_id, path, phase: Mutex::new(Some(Phase::loading())) }
+        Self { spec, handle_id, path, phase: Mutex::new(Some(Phase::loading())),
+            resources: Arc::new(WorkerUsage::default()) }
     }
 
     /// 查询阶段和已发布清单, 不读取尚未恢复的损坏尾部.
-    pub(super) async fn snapshot(&self) -> Result<HandleSnapshot> {
+    pub(super) async fn snapshot(&self) -> Result<CacheSnapshot> {
         let lock = self.phase.lock().await;
-        let phase = lock.as_ref().context("cache instance has ended")?;
+        let phase = lock.as_ref().ok_or(CacheError::NotFound)?;
         let buffered_until = if matches!(phase, Phase::Loading { .. }) { 0.0 }
         else {
             process::read_playlist(&self.path).await?.map_or(0.0, |playlist| playlist.duration)
         };
-        Ok(HandleSnapshot { folder: self.path.clone(), phase: phase.kind(), buffered_until })
+        let error = match phase { Phase::Failed { error } => Some(error.clone()), _ => None };
+        Ok(CacheSnapshot {
+            handle_id: self.handle_id.clone(), spec: self.spec.clone(),
+            status: CacheStatus { phase: phase.kind(), buffered_until, resources: self.resources.snapshot(), error },
+        })
     }
 
     /// 原子处理首次加载或 Failed 重试, 恢复工作不持有阶段锁.
@@ -89,7 +96,7 @@ impl CacheInstanceHandle {
             if matches!(phase.as_ref(), Some(Phase::Failed { .. })) {
                 transition(&mut phase, Some(Phase::loading()))?;
             }
-            match phase.as_mut().context("cache instance has ended")? {
+            match phase.as_mut().ok_or(CacheError::NotFound)? {
                 Phase::Loading { started, cancel } if !*started => {
                     *started = true;
                     (cancel.clone(), cancel.subscribe())
@@ -126,8 +133,9 @@ impl CacheInstanceHandle {
     ) -> Result<()> {
         let waiting = {
             let mut phase = self.phase.lock().await;
-            match phase.as_ref().context("cache instance has ended")? {
-                Phase::Running { .. } | Phase::Completed | Phase::Stopping { .. } => return Ok(()),
+            match phase.as_ref().ok_or(CacheError::NotFound)? {
+                Phase::Running { .. } | Phase::Completed => return Ok(()),
+                Phase::Stopping { .. } => return Err(CacheError::Stopping.into()),
                 Phase::Failed { error } => bail!("cache instance failed: {error}"),
                 Phase::Ready { .. } => {
                     return self.spawn_generation(&mut phase, source_path, metadata, config, processes);
@@ -181,6 +189,25 @@ impl CacheInstanceHandle {
         }
     }
 
+    /// 用户停止只保留已发布前缀, 等全部写入者退出后恢复为可续接阶段.
+    pub(super) async fn pause(&self) -> Result<()> {
+        {
+            let phase = self.phase.lock().await;
+            if !matches!(phase.as_ref(), Some(Phase::Running { .. } | Phase::Stopping { .. })) {
+                return Ok(());
+            }
+        }
+        self.stop().await?;
+        let mut phase = self.phase.lock().await;
+        if matches!(phase.as_ref(), Some(Phase::Stopping { .. })) {
+            let complete = process::read_playlist(&self.path).await?.is_some_and(|playlist| playlist.complete);
+            let next = if complete { Phase::Completed }
+                else { Phase::Ready { cancel: watch::channel(false).0 } };
+            transition(&mut phase, Some(next))?;
+        }
+        Ok(())
+    }
+
     /// 封闭句柄以阻止排队任务重新启动, 删除目录后允许管理器移除 Map 项.
     pub(super) async fn end(&self) -> Result<()> {
         loop {
@@ -204,8 +231,8 @@ impl CacheInstanceHandle {
         ensure!(process::media_filename(asset_name), "playback asset not found");
         {
             let phase = self.phase.lock().await;
-            let phase = phase.as_ref().context("cache instance has ended")?;
-            ensure!(!matches!(phase, Phase::Loading { .. } | Phase::Stopping { .. }),
+            let phase = phase.as_ref().ok_or(CacheError::NotFound)?;
+            ensure!(!matches!(phase, Phase::Loading { .. }),
                 "playback cache is not available");
         }
         let playlist = process::read_playlist(&self.path).await?.context("playback output is not ready")?;
@@ -315,7 +342,7 @@ impl CacheInstanceHandle {
         let mut command = processes.command(&self.spec, source_path, metadata, directory,
             assets.as_ref(), resume, config.ffmpeg_threads)?;
         let mut worker = processes.start_encoder(&mut command, config.ffmpeg_threads,
-            config.startup_timeout_seconds, cancel).await?;
+            config.startup_timeout_seconds, cancel, self.resources.clone()).await?;
         let result = self.monitor(processes, directory, media, resume, &mut worker, sender, cancel).await;
         worker.finish(result).await
     }
@@ -455,7 +482,7 @@ fn transition(current: &mut Option<Phase>, next: Option<Phase>) -> Result<()> {
         (Some(Phase::Ready{..}), None | Some(Phase::Running{..})) => true,
         (Some(Phase::Failed{..}), None | Some(Phase::Loading{..})) => true,
         (Some(Phase::Running{..}), Some(Phase::Completed | Phase::Ready{..} | Phase::Failed{..} | Phase::Stopping{..})) => true,
-        (Some(Phase::Stopping{..}), None | Some(Phase::Failed{..})) => true,
+        (Some(Phase::Stopping{..}), None | Some(Phase::Completed | Phase::Ready{..} | Phase::Failed{..})) => true,
         _ => false,
     };
 
@@ -464,8 +491,9 @@ fn transition(current: &mut Option<Phase>, next: Option<Phase>) -> Result<()> {
         to.as_ref().map_or("None".to_string(), |p| p.kind())
     );
 
-    // 如果下一个阶段为 None, 确保当前阶段没有活跃的工作者
-    if to.is_none() {
+    // 离开 Stopping 或执行 End 前必须回收全部写入者.
+    if to.is_none() || matches!((from.as_ref(), to.as_ref()),
+        (Some(Phase::Stopping { .. }), Some(Phase::Ready { .. } | Phase::Completed))) {
         match from.as_ref() {
             Some(Phase::Loading { started: true, cancel } | Phase::Stopping { cancel }) => {
                 ensure!(cancel.receiver_count() == 0, "cannot end a cache instance with a live worker")

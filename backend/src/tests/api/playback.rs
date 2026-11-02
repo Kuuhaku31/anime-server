@@ -31,9 +31,40 @@ fn invalid_indices_and_removed_playback_fields_are_rejected() {
         assert_eq!(select_streams("a".repeat(32), &query, &metadata, &MediaConfigs::default())
             .unwrap_err().status, StatusCode::BAD_REQUEST);
     }
+
     for field in ["position", "media_id", "handle_id", "version"] {
         assert!(serde_json::from_value::<PlaybackQuery>(serde_json::json!({
             "path": "/media/episode.mkv", field: 1,
         })).is_err());
     }
+}
+
+/// 重试选择稳定排序的现存副本, 缺失源和身份变化均明确拒绝.
+#[tokio::test]
+async fn cache_sources_are_sorted_and_retries_reject_changed_content() -> anyhow::Result<()> {
+    let directory = crate::testing::TestDirectory::new();
+    let root = directory.path.join("media");
+    tokio::fs::create_dir(&root).await?;
+    let first = root.join("a.mkv");
+    let second = root.join("b.mkv");
+    tokio::fs::write(&first, b"source content").await?;
+    tokio::fs::copy(&first, &second).await?;
+    let database = DatabaseManager::initialize(&directory.path.join("main.db")).await?;
+    let scanner = ScannerManager::new(&root).await?;
+    let original = scanner.scan_one(&database, &first).await?.unwrap();
+    scanner.scan_one(&database, &second).await?;
+    assert_eq!(source_path(&original.media_id, &database, &scanner).await.unwrap(), Some(first.clone()));
+    tokio::fs::remove_file(&first).await?;
+    assert_eq!(source_path(&original.media_id, &database, &scanner).await.unwrap(), Some(second.clone()));
+    tokio::fs::write(&second, b"different content").await?;
+    let error = prepare_media(&second, Some(&original.media_id), &database, &scanner,
+        &ProcessManager::new(2, 2)).await.err().unwrap();
+    assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(error.message.contains("content changed"));
+    assert_eq!(source_path(&original.media_id, &database, &scanner).await.unwrap(), None);
+    let error = prepare_media(&first, Some(&original.media_id), &database, &scanner,
+        &ProcessManager::new(2, 2)).await.err().unwrap();
+    assert_eq!(error.status, StatusCode::NOT_FOUND);
+    database.shutdown().await;
+    Ok(())
 }

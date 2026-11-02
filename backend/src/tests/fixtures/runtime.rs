@@ -60,10 +60,10 @@ pub(crate) async fn create_media(path: &Path) -> Result<()> {
 }
 
 /// 等待指定缓存阶段, 在出现意外失败或超时时终止测试.
-pub(crate) async fn wait_phase(manager: &CacheManager, folder: &Path, expected: &str) -> Result<()> {
+pub(crate) async fn wait_phase(manager: &CacheManager, handle_id: &str, expected: &str) -> Result<()> {
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
         loop {
-            let status = manager.status(folder).await?;
+            let status = manager.status(handle_id).await?.status;
             if status.phase == expected { return Ok(()); }
             anyhow::ensure!(status.phase != "failed", "cache failed while waiting for {expected:?}");
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;

@@ -2,7 +2,7 @@
 
 本地视频 Web 服务, 使用单个 Docker 容器部署. Rust/Axum 提供媒体接口,
 SQLite 保存播放配置, FFmpeg 生成可共享和恢复的 HLS 缓存,
-TypeScript/HLS.js 提供常驻播放器和右侧文件列表.
+TypeScript/HLS.js 提供常驻播放器和右侧文件及缓存任务列表.
 
 ## 挂载与端口
 
@@ -51,8 +51,8 @@ CACHE_DIR=/srv/anime-server/cache
 backend/src/
 |-- main.rs, services.rs      # 启动与 OnceLock 全局实例
 |-- config.rs                 # 扁平 AppConfigManager
-|-- api.rs, api/              # HTTP 枢纽与内部 SessionManager
-|-- db.rs, db/                # 唯一数据库连接池与事务仓储
+|-- api.rs, api/              # 媒体接口, 缓存构建管理与资源读取
+|-- db.rs                     # 唯一数据库连接池与事务仓储
 |-- scanner.rs                # 媒体目录和单路径扫描
 |-- cache.rs, cache/handle.rs # 全量句柄表与六状态生命周期
 |-- process.rs, process/      # 探测, 子进程, 资源预算与 HLS 处理
@@ -60,9 +60,9 @@ backend/src/
 `-- tests/                    # 集中 Rust 测试和夹具
 frontend/src/
 |-- api/                      # 同源 HTTP 客户端
-|-- state/                    # 共享数据契约
+|-- state/                    # 共享数据契约和 handle_id 缓存 Map
 |-- playback/                 # 本地等待目标与 HLS 引擎
-`-- ui/                       # 控件和按路径展示的媒体列表
+`-- ui/                       # 控件, 媒体列表和缓存任务列表
 ```
 
 - [核心架构](documents/architecture.md)
@@ -74,8 +74,19 @@ frontend/src/
 
 前端持有的核心数据
 
-- `session_id`: 和后端会话对应的唯一标识
+- `handle_id`: 服务端计算的稳定缓存标识, 不作为访问凭证
+- `Map<handle_id, CacheEntry>`: 内存中保存全部缓存的状态, 生成进度, 实际流选择和 worker 资源
 - 前端媒体列表: `List<(Path, MediaInfo)>`: 媒体文件在后端容器内的路径及其对应的信息
+
+页面刷新后从 `GET /api/cache` 重建 Map, 不把任务快照保存在 localStorage.
+文件列表的 Play 构建并播放, Build 只提交转码且不切换播放器.
+缓存列表的 Play 只读取已有缓存, Retry / resume 重新构建, Stop build 保留已发布前缀,
+Delete 经确认后立即停止并删除缓存, 包括其他浏览器正在使用的缓存.
+播放器的 Stop 只停止本地播放, 不发送服务端删除或停止转码请求.
+
+每条缓存显示 `encoder_slots`, `process_slots`, `ffmpeg_threads`, 并显示全部条目的合计.
+这些数字是已启动转码 worker 的预算占用, 不是 CPU 使用率, 操作系统实际线程数或浏览器解码开销.
+排队和准备阶段可为 running 且三项占用均为 0.
 
 MediaInfo 包含
 
@@ -97,10 +108,8 @@ MediaInfo 包含
 
 - AppConfigManager
 - API接口枢纽
-- 会话管理器
-  - `HashMap<SessionId, PathBuf>`
 - 缓存管理器
-  - 持有 缓存实例句柄列表: `List<CacheInstanceHandle>`
+  - 持有 `HashMap<handle_id, Arc<CacheInstanceHandle>>`
 - 进程管理器 直接操作ffmpeg进行编解码
 - 数据库管理器 提供数据库操作
 - 扫描管理器 周期性扫描媒体文件更新数据库
@@ -124,10 +133,10 @@ MediaInfo 包含
 - 后端 根据文件路径*调用工具访问文件获得对应 metadata*, 构建 `List<(Path, MediaInfo)>`
 - 后端 向前端发送 `List<(Path, MediaInfo)>`
 
-2. 前端 播放视频
+2. 前端 构建缓存
 
 - 前端 根据 前端媒体列表 选择要播放的媒体文件和需要的播放配置
-- 前端 构建并向后端发送 `PlaybackQuery`
+- 前端 向 `POST /api/cache` 发送 `PlaybackQuery`
 - 后端 API接口枢纽 收到 `PlaybackQuery` 后, 根据 `path` 访问媒体文件获得:
   - 新计算的 媒体标识
   - 获取其元数据信息 `metadata` (包括时长, 格式, 视频流, 音频流, 字幕流...)
@@ -136,12 +145,20 @@ MediaInfo 包含
   - 缓存管理器 根据这些参数计算出句柄标识后,
     查找 缓存实例句柄列表, 找到或创建对应的 缓存实例句柄.
     缓存实例句柄列表的每个句柄必须和实际缓存实例文件夹一一对应
-  - 缓存实例句柄的状态不是 Complete 时, 缓存管理器启动相应的转码任务
-- API接口枢纽 从 缓存管理器 获取缓存实例的路径, 构建播放流, 返回给前端
-- 前端 根据返回的播放流进行播放
-- 如果前端播放的位置还没有生成, 需要等待缓存实例完成转码后再开始播放
+  - running 或 completed 复用已有任务, ready 启动生成, failed 重新恢复后重试
+- API 返回 `CacheBuild { cache, media }`, 不返回内部目录或创建播放映射
+- `GET /api/cache` 和 `GET /api/cache/{handle_id}` 只查询状态, 不触发构建
 
-### 前端的播放请求 `PlaybackQuery`
+3. 前端 播放已有缓存
+
+- 前端按 `handle_id` 选择缓存, 确认其现存源路径可用
+- 浏览器通过 `GET /playback/{handle_id}/{asset_name}` 读取 HLS 清单和分片
+- 构建和播放是不同请求. 只有 `position < buffered_until` 时才加载对应位置
+- retry 按 `media_id` 选择稳定排序后的首个现存源路径, 重扫身份并重新验证流选择
+- 没有源路径的缓存仍显示且可以删除, 但不允许播放或重试
+- 不存在 SessionManager, session_id, 会话释放或心跳
+
+### 前端的构建请求 `PlaybackQuery`
 
 包含
 
@@ -163,6 +180,7 @@ MediaInfo 包含
 - 实际转码用到的字幕流索引: `subtitle_stream_index`
 - 版本标识: `version`
 - 容器内保存对应的缓存实例文件夹路径: `path`
+- 长时间转码 worker 的原子资源计数: `resources`
 
 缓存实例句柄有且只有以下6个状态
 
@@ -183,7 +201,12 @@ MediaInfo 包含
 | Ready     | 结束, Running                      |
 | Failed    | 结束, Loading                      |
 | Running   | Completed, Ready, Failed, Stopping |
-| Stopping  | 结束, Failed                       |
+| Stopping  | 结束, Failed, Ready, Completed     |
+
+显式 Stop build 等待写入者退出后转为 Ready, 若最后一个清单已完成则转为 Completed.
+缓存持久化, 只有用户显式删除才执行 End. 服务关闭仅停止任务并回收资源,
+未完成缓存和已发布前缀均保留, 重启后恢复并等待显式构建或续接.
+无效实例保留原文件并明确报错, 不自动删除. 临时工作文件清理和损坏尾部修复不属于整实例删除.
 
 #
 

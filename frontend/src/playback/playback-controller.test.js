@@ -1,14 +1,17 @@
 
 // frontend/src/playback/playback-controller.test.js
-// 在无浏览器环境验证路径契约, 本地等待位置和会话生命周期.
+// 在无浏览器环境验证构建与播放分离, 本地等待和缓存生命周期.
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { createHash } from "node:crypto";
+import { beforeEach, test } from "node:test";
 import { PlaybackController } from "./playback-controller.ts";
 import { preferNativeHls } from "./hls-adapter.ts";
 
-// 保留操作所需的事件和延迟, 禁用周期定时器以免测试遗留后台轮询.
-globalThis.window = Object.assign(new EventTarget(), { setTimeout, setInterval: () => 0 });
-globalThis.document = new EventTarget();
+// 每个用例独立持有浏览器事件, 避免旧控制器继续订阅新用例的页面事件.
+beforeEach(() => {
+  globalThis.window = Object.assign(new EventTarget(), { setTimeout, setInterval: () => 0 });
+  globalThis.document = new EventTarget();
+});
 
 test("Safari uses native HLS while MSE browsers do not trust a native maybe result", () => {
   assert.equal(preferNativeHls(true, true, "Apple Computer, Inc."), true);
@@ -74,10 +77,10 @@ const info = {
 };
 const file = ["/media/video.mkv", info];
 
-/** 模拟新 HTTP 契约, 会话表只保存独立的缓存快照. */
+/** 模拟缓存 HTTP 契约, 同选择复用稳定句柄且播放不创建映射. */
 function server(context, generated = 120) {
   const calls = [];
-  const sessions = new Map();
+  const caches = new Map();
   context.mock.method(globalThis, "fetch", async (url, options = {}) => {
     const body = options.body ? JSON.parse(options.body) : null;
     const method = options.method ?? "GET";
@@ -85,27 +88,32 @@ function server(context, generated = 120) {
     let result;
     if (url.endsWith("/rescan")) result = file;
     else if (method === "DELETE") {
-      sessions.delete(url.split("/").at(-1));
+      caches.delete(url.split("/").at(-1));
       return new Response(null, { status: 204 });
-    } else if (url.endsWith("/playback")) {
-      const sessionId = `session-${calls.filter((call) => call.url.endsWith("/playback")).length}`;
-      result = {
-        phase: "running", buffered_until: generated,
-      };
-      sessions.set(sessionId, result);
+    } else if (url === "/api/cache" && method === "POST") {
       // 模拟服务端默认选择, 明确区分字段缺省与显式 null.
-      result = {
-        session_id: sessionId, url: `/playback/${sessionId}/index.m3u8`, cache: result, media: info,
+      const spec = {
+        media_id: "a".repeat(32), version: "test",
         video_stream_index: body.video_stream_index ?? 0,
         audio_stream_index: "audio_stream_index" in body ? body.audio_stream_index : 1,
         subtitle_stream_index: "subtitle_stream_index" in body ? body.subtitle_stream_index : null,
       };
-    } else if (method === "GET" && url.startsWith("/api/playback/")) result = sessions.get(url.split("/").at(-1));
+      const handleId = createHash("md5").update(JSON.stringify(spec)).digest("hex");
+      const cache = {
+        handle_id: handleId, spec, source_path: body.path,
+        status: { phase: "running", buffered_until: generated, error: null,
+          resources: { encoder_slots: 1, process_slots: 1, ffmpeg_threads: 2 } },
+      };
+      caches.set(handleId, cache);
+      result = { cache, media: info };
+    } else if (url === "/api/cache" && method === "GET") {
+      result = { entries: [...caches.values()], resources: { encoder_slots: 0, process_slots: 0, ffmpeg_threads: 0 } };
+    } else if (method === "GET" && url.startsWith("/api/cache/")) result = caches.get(url.split("/").at(-1));
     else if (method === "PUT") return new Response(null, { status: 204 });
     else throw new Error(`Unexpected request: ${method} ${url}`);
     return Response.json(result);
   });
-  return { calls, sessions, creations: () => calls.filter((call) => call.url.endsWith("/playback")) };
+  return { calls, caches, creations: () => calls.filter((call) => call.url === "/api/cache" && call.method === "POST") };
 }
 
 /** 在有限时间内等待控制器满足预期条件. */
@@ -123,8 +131,8 @@ async function operation(controller, action) {
   await until(() => !controller.pending);
 }
 
-// 完成状态不再需要任何心跳, 停止后不再发出状态请求.
-test("active generation refreshes while paused and completion stops polling", async (context) => {
+// 共享列表统一轮询, 稳定缓存降低频率而不是为播放器维持心跳.
+test("the shared cache list refreshes paused playback and slows down after completion", async (context) => {
   // 捕获定时回调而不等待真实时间, 验证刷新频率和停止后的请求边界.
   const timers = new Map();
   context.mock.method(window, "setInterval", (callback, milliseconds) => {
@@ -135,19 +143,20 @@ test("active generation refreshes while paused and completion stops polling", as
   const video = new Video();
   const controller = new PlaybackController(video);
   await operation(controller, () => controller.open(file));
+  await controller.caches.start();
   video.pause();
   let changes = 0;
   controller.addEventListener("change", () => { changes += 1; });
-  const session = [...api.sessions.values()][0];
-  session.buffered_until = 60;
+  const cache = [...api.caches.values()][0].status;
+  cache.buffered_until = 60;
   timers.get(1000)();
   await until(() => controller.cache.buffered_until === 60);
   assert.ok(changes > 0);
   assert.equal(video.paused, true);
-  session.phase = "completed";
+  cache.phase = "completed";
   timers.get(1000)();
   await until(() => controller.cache.phase === "completed");
-  const polls = () => api.calls.filter((call) => call.method === "GET" && call.url.startsWith("/api/playback/")).length;
+  const polls = () => api.calls.filter((call) => call.method === "GET" && call.url === "/api/cache").length;
   const completedPolls = polls();
   timers.get(1000)();
   assert.equal(polls(), completedPolls);
@@ -175,22 +184,20 @@ test("track changes and subtitle off preserve fractional position and pause stat
   assert.equal(controller.error, "");
   assert.equal(video.paused, true);
   assert.equal(controller.position, 14);
-  assert.equal(api.sessions.size, 1);
+  assert.equal(api.caches.size, 2);
   assert.deepEqual(api.creations()[1].body, {
     path: file[0], video_stream_index: 4, audio_stream_index: 2, subtitle_stream_index: 3,
   });
-  const release = api.calls.findIndex((call) => call.method === "DELETE");
-  const replacement = api.calls.findIndex((call) => call === api.creations()[1]);
-  assert.ok(release < replacement);
+  assert.equal(api.calls.some((call) => call.method === "DELETE"), false);
   await operation(controller, () => controller.select({ video_stream_index: 4, audio_stream_index: 2, subtitle_stream_index: null }));
   assert.equal(api.creations()[2].body.subtitle_stream_index, null);
   assert.equal("position" in api.creations()[2].body, false);
   assert.equal(video.paused, true);
   await operation(controller, () => controller.stop());
-  assert.equal(api.sessions.size, 0);
+  assert.equal(api.caches.size, 3);
 });
 
-test("forward and backward seeks within cached ranges reuse the session", async (context) => {
+test("forward and backward seeks within cached ranges reuse the handle", async (context) => {
   const api = server(context);
   const video = new Video();
   const controller = new PlaybackController(video);
@@ -219,7 +226,7 @@ test("immediate track switching keeps a pause whose browser event has not arrive
   await operation(controller, () => controller.stop());
 });
 
-test("decoder failure releases the session without an automatic playback request", async (context) => {
+test("decoder failure unloads locally without deleting or rebuilding the cache", async (context) => {
   const api = server(context);
   context.mock.method(console, "error", () => {});
   const video = new Video();
@@ -227,9 +234,10 @@ test("decoder failure releases the session without an automatic playback request
   await operation(controller, () => controller.open(file));
   video.currentTime = 14.875;
   video.decodeError();
-  await until(() => api.sessions.size === 0);
+  await until(() => api.calls.some((call) => call.method === "PUT" && call.body.configs.position === 14.875));
   assert.match(controller.error, /Test decoder failure/);
-  assert.equal(controller.session, null);
+  assert.equal(api.caches.size, 1);
+  assert.equal(api.calls.some((call) => call.method === "DELETE"), false);
   assert.equal(video.paused, true);
   assert.equal(controller.position, 14.875);
   assert.equal(api.creations().length, 1);
@@ -255,7 +263,7 @@ test("initial decode errors are terminal and manual retry repeats the same reque
   const controller = new PlaybackController(video);
   await operation(controller, () => controller.open(file));
   assert.match(controller.error, /Test decoder failure/);
-  assert.equal(api.sessions.size, 0);
+  assert.equal(api.caches.size, 1);
   assert.equal(api.creations().length, 1);
   video.failOnLoad = false;
   await operation(controller, () => controller.retry());
@@ -266,14 +274,14 @@ test("initial decode errors are terminal and manual retry repeats the same reque
   await operation(controller, () => controller.stop());
 });
 
-test("seek waits for new segments without creating a new session and can be redirected", async (context) => {
+test("seek waits for new segments without another build and can be redirected", async (context) => {
   const api = server(context);
   const video = new Video();
   const controller = new PlaybackController(video);
   await operation(controller, () => controller.open(file));
-  const session = [...api.sessions.values()][0];
-  session.buffered_until = 20;
-  controller.cache = { ...session };
+  const cache = [...api.caches.values()][0].status;
+  cache.buffered_until = 20;
+  await controller.caches.refresh();
   controller.seek(65.375);
   await until(() => controller.message.includes("Waiting for 1:05"));
   assert.equal(controller.pending, true);
@@ -281,7 +289,7 @@ test("seek waits for new segments without creating a new session and can be redi
   assert.equal(controller.position, 65.375);
   assert.equal(api.creations().length, 1);
   assert.equal(api.calls.some((call) => call.url.endsWith("/target") || call.url.endsWith("/heartbeat")), false);
-  session.buffered_until = 80;
+  cache.buffered_until = 80;
   await until(() => !controller.pending);
   assert.equal(controller.position, 65.375);
   assert.equal(video.paused, false);
@@ -295,7 +303,7 @@ test("seek waits for new segments without creating a new session and can be redi
   assert.equal(video.paused, true);
   assert.equal(api.creations().length, 1);
   await operation(controller, () => controller.stop());
-  assert.equal(api.sessions.size, 0);
+  assert.equal(api.caches.size, 1);
 });
 
 test("resuming waits for the target range and stop cancels the wait", async (context) => {
@@ -306,8 +314,8 @@ test("resuming waits for the target range and stop cancels the wait", async (con
   await until(() => controller.message.includes("Waiting for 0:12"));
   assert.equal(video.src, "");
   assert.equal(controller.position, 12.375);
-  const session = [...api.sessions.values()][0];
-  session.buffered_until = 16;
+  const cache = [...api.caches.values()][0].status;
+  cache.buffered_until = 16;
   await until(() => !controller.pending);
   assert.equal(controller.position, 12.375);
   assert.equal(video.currentTime, 12.375);
@@ -317,7 +325,26 @@ test("resuming waits for the target range and stop cancels the wait", async (con
   assert.equal(controller.position, 95.125);
   assert.equal(controller.message, "Stopped");
   assert.equal(controller.error, "");
-  assert.equal(api.sessions.size, 0);
+  assert.equal(api.caches.size, 1);
+  assert.equal(api.creations().length, 1);
+});
+
+// 初次构建等待中被服务端停止后必须退出等待, 不能仍把 Ready 当作启动过渡.
+test("stopping generation ends an uncovered initial playback wait without rebuilding", async (context) => {
+  context.mock.method(console, "error", () => {});
+  const api = server(context, 4);
+  const video = new Video();
+  const controller = new PlaybackController(video);
+  context.after(() => operation(controller, () => controller.stop()));
+  controller.open(file);
+  await until(() => controller.message.includes("Waiting for 0:12"));
+  const cache = [...api.caches.values()][0];
+  cache.status.phase = "ready";
+  cache.status.resources = { encoder_slots: 0, process_slots: 0, ffmpeg_threads: 0 };
+  await until(() => !controller.pending);
+  assert.match(controller.error, /generation is stopped/);
+  assert.equal(controller.handleId, cache.handle_id);
+  assert.equal(video.src, "");
   assert.equal(api.creations().length, 1);
 });
 
@@ -330,8 +357,8 @@ test("the exact cache boundary waits but even a sub-half-second covered target s
   await until(() => controller.message.includes("Waiting for 0:12"));
   assert.equal(video.src, "");
   assert.equal(controller.position, 12.375);
-  const session = [...api.sessions.values()][0];
-  session.buffered_until = 12.376;
+  const cache = [...api.caches.values()][0].status;
+  cache.buffered_until = 12.376;
   await until(() => !controller.pending);
   assert.equal(controller.error, "");
   assert.equal(video.currentTime, 12.375);
@@ -350,16 +377,16 @@ test("a published prefix remains usable while an uncovered failed range reports 
   const video = new Video();
   const controller = new PlaybackController(video);
   await operation(controller, () => controller.open(file));
-  const session = [...api.sessions.values()][0];
-  session.phase = "failed";
-  session.buffered_until = 20;
+  const cache = [...api.caches.values()][0].status;
+  cache.phase = "failed";
+  cache.buffered_until = 20;
   await controller.report();
   assert.equal(controller.error, "");
   assert.equal(controller.message, "Playing cached range. Cache generation stopped.");
   assert.equal(video.paused, false);
   await operation(controller, () => controller.seek(30));
   assert.match(controller.error, /Cache generation failed/);
-  assert.equal(api.sessions.size, 0);
+  assert.equal(api.caches.size, 1);
   await operation(controller, () => controller.stop());
 });
 
@@ -375,4 +402,56 @@ test("saved disabled tracks are explicit in a path-based playback request", asyn
   });
   assert.equal(controller.selection.audio_stream_index, null);
   await operation(controller, () => controller.stop());
+});
+
+// 已有缓存播放不构建, 播放器停止和继续也不删除或重建共享缓存.
+test("playing a cache and resuming after local stop only read the existing handle", async (context) => {
+  const api = server(context);
+  const video = new Video();
+  const controller = new PlaybackController(video);
+  const built = await controller.caches.build({ path: file[0], video_stream_index: 4, audio_stream_index: null });
+  await operation(controller, () => controller.openCached(built.cache.handle_id));
+  assert.equal(controller.error, "");
+  assert.equal(api.creations().length, 1);
+  assert.equal(video.src, `/playback/${built.cache.handle_id}/index.m3u8`);
+  assert.equal(controller.selection.video_stream_index, 4);
+  await operation(controller, () => controller.stop());
+  assert.equal(video.src, "");
+  await operation(controller, () => controller.toggle());
+  assert.equal(video.paused, false);
+  assert.equal(api.creations().length, 1);
+  assert.equal(api.calls.some((call) => call.method === "DELETE"), false);
+  await operation(controller, () => controller.stop());
+});
+
+// 删除会立刻通知当前播放器, 不能在错误处理中重新生成已删缓存.
+test("deleting the current handle stops playback without an automatic rebuild", async (context) => {
+  const api = server(context);
+  context.mock.method(console, "error", () => {});
+  const video = new Video();
+  const controller = new PlaybackController(video);
+  await operation(controller, () => controller.open(file));
+  await controller.caches.remove(controller.handleId);
+  assert.match(controller.error, /cache was deleted/);
+  assert.equal(controller.handleId, null);
+  assert.equal(video.src, "");
+  assert.equal(video.paused, true);
+  assert.equal(api.creations().length, 1);
+  assert.equal(api.caches.size, 0);
+});
+
+// completed 缓存没有源路径也必须拒绝播放, 不能降级为匿名直放.
+test("cache playback requires an available source even after completion", async (context) => {
+  const api = server(context);
+  context.mock.method(console, "error", () => {});
+  const video = new Video();
+  const controller = new PlaybackController(video);
+  const built = await controller.caches.build({ path: file[0] });
+  const cache = api.caches.get(built.cache.handle_id);
+  cache.status.phase = "completed";
+  cache.source_path = null;
+  await operation(controller, () => controller.openCached(cache.handle_id));
+  assert.match(controller.error, /source media is unavailable/);
+  assert.equal(video.src, "");
+  assert.equal(api.creations().length, 1);
 });

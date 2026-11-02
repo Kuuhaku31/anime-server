@@ -120,7 +120,7 @@ export function attachControls(controller: PlaybackController, video: HTMLVideoE
       cacheBar.setAttribute("aria-valuetext", progress.text);
       cacheText.textContent = progress.text;
     } else {
-      // 换片或停止时清空旧配置的进度, 防止下一会话短暂显示旧数据.
+      // 未选择缓存时清空旧配置的进度, 防止换片短暂显示旧数据.
       cacheBar.value = 0;
       cacheText.textContent = "";
     }
