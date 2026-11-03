@@ -134,11 +134,11 @@ impl CacheManager {
         self.handle(handle_id).await?.media_path(asset_name).await
     }
 
-    /// 只重试现有句柄, 不在并发删除后隐式新建缓存目录.
-    pub(crate) async fn retry(
-        &self, handle_id: &str, source_path: PathBuf, metadata: MediaMetadata,
-        config: &AppConfigManager, processes: &ProcessManager,
-    ) -> Result<CacheSnapshot> {
+    /// 重试现有句柄
+    pub(crate) async fn
+    retry(&self, handle_id: &str, source_path: PathBuf, metadata: MediaMetadata, config: &AppConfigManager, processes: &ProcessManager)
+    -> Result<CacheSnapshot>
+    {
         let handle = self.handle(handle_id).await?;
         handle.load(processes).await?;
         handle.run(source_path, metadata, config, processes).await?;
@@ -154,7 +154,6 @@ impl CacheManager {
 
     /// 停止实例, 删除实际目录后才从句柄表移除.
     pub(crate) async fn remove(&self, handle_id: &str) -> Result<()> {
-        check_handle_id(handle_id)?;
         let mut handles = self.handles.lock().await;
         let handle = handles.get(handle_id).ok_or(CacheError::NotFound)?;
         handle.end().await?;
@@ -175,7 +174,7 @@ impl CacheManager {
         Ok(())
     }
 
-    /// 只处理缓存根目录中的直接子目录, 非本程序命名的内容明确阻止启动.
+    /// 处理缓存根目录中的直接子目录
     async fn discover_handles(&self) -> Result<()> {
         let mut entries = tokio::fs::read_dir(self.root.join("playback")).await?;
         let mut handles = self.handles.lock().await;
@@ -226,14 +225,6 @@ impl CacheManager {
 
     /// 校验稳定标识后从登记表读取句柄, 不拼接客户端路径.
     async fn handle(&self, handle_id: &str) -> Result<Arc<CacheInstanceHandle>> {
-        check_handle_id(handle_id)?;
         self.handles.lock().await.get(handle_id).cloned().ok_or_else(|| CacheError::NotFound.into())
     }
-}
-
-/// 只接受规范的小写内容哈希, 拒绝路径片段和大小写别名.
-pub(crate) fn check_handle_id(handle_id: &str) -> Result<()> {
-    ensure!(utils::check_md5_ok(handle_id) && handle_id == handle_id.to_ascii_lowercase(),
-        "handle_id must be 32 lowercase hexadecimal characters");
-    Ok(())
 }
