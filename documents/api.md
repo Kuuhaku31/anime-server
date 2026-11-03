@@ -192,11 +192,9 @@ curl --fail http://localhost:56080/api/cache \
       "subtitle_stream_index": null,
       "version": "h264-high-yuv420p-aac-fmp4-v2"
     },
-    "status": {
-      "phase": "loading",
-      "buffered_until": 0.0,
-      "error": null
-    },
+    "phase": "loading",
+    "buffered_until": 0.0,
+    "error": null,
     "resources": { "encoder_slots": 0, "process_slots": 0, "ffmpeg_threads": 0 },
     "source_path": "/media/series/episode.mkv"
   },
@@ -237,6 +235,7 @@ PlaybackQuery 不包含 position. 前端从 media.configs.position 或本地用�
 
 entries 按 handle_id 排序, 每条结构与构建响应的 cache 相同.
 `GET /api/cache/{handle_id}` 直接返回单个 CacheSnapshot.
+phase, buffered_until 和 error 均位于缓存对象顶层, 前后端需同步更新.
 handle_id 必须为 32 个小写十六进制字符, 不接受目录路径或大小写别名.
 
 source_path 由数据库按 media_id 查找, 选择路径排序后的第一个现存副本.
@@ -247,7 +246,7 @@ resources 只统计已经启动的转码 worker. 单个 worker 的 encoder_slots
 ffmpeg_threads 为其实际持有的编码线程预算. 排队, 准备或退出后为 0.
 这不是 CPU 使用率, 操作系统实际线程数量或浏览器解码开销,
 不包含 ffprobe, 字幕准备和分片校验等短进程.
-失败诊断保存在 status.error, 其他状态为 null.
+失败诊断保存在缓存对象的 error 字段, 其他状态为 null.
 
 | phase     | 含义                                      |
 | --------- | ----------------------------------------- |
@@ -310,7 +309,7 @@ HTTP 请求取消不会中断已经开始的 stop 或 delete 清理.
 ## 错误与健康检查
 
 业务错误记录日志并返回 `{"error":"具体原因"}`.
-异步生成失败通过 status.phase 和 status.error 表达, 服务日志保留详细诊断.
+异步生成失败通过缓存对象顶层的 phase 和 error 表达, 服务日志保留详细诊断.
 
 | 状态码 | 主要情况                                                    |
 | ------ | ----------------------------------------------------------- |

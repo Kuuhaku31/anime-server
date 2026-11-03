@@ -80,11 +80,29 @@ fn removed_playback_fields_are_rejected() {
     }
 }
 
-/// API 列表响应维持前端需要的 entries 对象封装.
+/// 各缓存响应共用扁平快照, 列表和构建仍保留各自的对象封装.
 #[test]
-fn cache_list_response_wraps_entries() {
+fn cache_responses_share_flat_snapshots() {
     let response = CacheListResponseBody { entries: Vec::new() };
     assert_eq!(serde_json::to_value(response).unwrap(), serde_json::json!({ "entries": [] }));
+    let spec = crate::testing::spec();
+    let snapshot = CacheSnapshot {
+        handle_id: spec.handle_id().unwrap(), spec,
+        phase: "failed".to_string(), buffered_until: 12.5, error: Some("encoding failed".to_string()),
+        resources: process::WorkerResources::default(),
+        source_path: Some(PathBuf::from("/media/episode.mkv")),
+    };
+    let json = serde_json::to_value(&snapshot).unwrap();
+    assert_eq!(json["phase"], "failed");
+    assert_eq!(json["buffered_until"], 12.5);
+    assert_eq!(json["error"], "encoding failed");
+    assert!(json.get("status").is_none());
+    let list = CacheListResponseBody { entries: vec![snapshot.clone()] };
+    assert_eq!(serde_json::to_value(list).unwrap()["entries"][0], json);
+    let build = BuildCacheResponseBody {
+        cache: snapshot, media_meta: crate::testing::metadata(), media_configs: MediaConfigs::default(),
+    };
+    assert_eq!(serde_json::to_value(build).unwrap()["cache"], json);
 }
 
 /// 源查询使用稳定排序的现存副本, 文件缺失后回退到其他副本.

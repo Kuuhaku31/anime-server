@@ -31,7 +31,7 @@ export class CacheStore extends EventTarget {
     this.timer = window.setInterval(() => {
       if (document.hidden) return;
       const active = [...this.entries.values()].some((entry) =>
-        ["loading", "running", "stopping"].includes(entry.status.phase));
+        ["loading", "running", "stopping"].includes(entry.phase));
       if (active || Date.now() - this.refreshedAt >= 5000) {
         void this.refresh().catch((error) => console.error("Cache polling failed", error));
       }

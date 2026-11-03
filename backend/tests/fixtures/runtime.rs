@@ -63,9 +63,9 @@ pub(crate) async fn create_media(path: &Path) -> Result<()> {
 pub(crate) async fn wait_phase(manager: &CacheManager, handle_id: &str, expected: &str) -> Result<()> {
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
         loop {
-            let status = manager.status(handle_id).await?.status;
-            if status.phase == expected { return Ok(()); }
-            anyhow::ensure!(status.phase != "failed", "cache failed while waiting for {expected:?}");
+            let snapshot = manager.status(handle_id).await?;
+            if snapshot.phase == expected { return Ok(()); }
+            anyhow::ensure!(snapshot.phase != "failed", "cache failed while waiting for {expected:?}");
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     }).await?

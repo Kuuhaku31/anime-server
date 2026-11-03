@@ -1,5 +1,4 @@
 
-
 // frontend/src/state/player-state.ts
 // 定义按路径访问媒体和查询缓存状态的前后端契约.
 
@@ -88,16 +87,6 @@ export interface PlaybackQuery {
   subtitle_stream_index?: number | null;
 }
 
-/** 描述缓存实例的公开状态, 不包含内部目录. */
-export interface CacheStatus {
-  /** 当前缓存生命周期阶段. */
-  phase: "loading" | "completed" | "ready" | "failed" | "stopping" | "running";
-  /** 服务端已验证的连续前缀终点, 不是浏览器缓冲. */
-  buffered_until: number;
-  /** 恢复或生成失败的诊断, 正常状态为 null. */
-  error: string | null;
-}
-
 /** 描述转码 worker 的许可占用, 不代表 CPU 使用率或浏览器解码开销. */
 export interface WorkerResources {
   /** 活动转码 worker 占用的编码名额. */
@@ -122,8 +111,12 @@ export interface CacheEntry {
   handle_id: string;
   /** 服务端确认的实际流选择和媒体身份. */
   spec: CacheSpec;
-  /** 当前生成进度. */
-  status: CacheStatus;
+  /** 当前缓存生命周期阶段. */
+  phase: "loading" | "completed" | "ready" | "failed" | "stopping" | "running";
+  /** 服务端已验证的连续前缀终点, 不是浏览器缓冲. */
+  buffered_until: number;
+  /** 恢复或生成失败的诊断, 正常状态为 null. */
+  error: string | null;
   /** 当前转码 worker 占用. */
   resources: WorkerResources;
   /** 稳定选择的现存源路径, null 时不能播放或重试. */

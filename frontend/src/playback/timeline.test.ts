@@ -4,11 +4,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { absoluteTime, cacheProgress, rangeReady, formatTime } from "./timeline.ts";
-import type { CacheStatus } from "../state/player-state.ts";
+import type { CacheEntry } from "../state/player-state.ts";
 
 test("cache generation shows verified time independently of playback and completion rounding", () => {
   // 播放目标和浏览器缓冲不参与百分比, 完成标记将舍入不足的末端显示为 100%.
-  const cache: CacheStatus = { buffered_until: 30, phase: "running", error: null };
+  const cache: Pick<CacheEntry, "phase" | "buffered_until"> = { buffered_until: 30, phase: "running" };
   const resources = { encoder_slots: 1, process_slots: 1, ffmpeg_threads: 2 };
   assert.deepEqual(cacheProgress(cache, 120, resources), {
     percent: 25, determinate: true, state: "Generating", timing: "0:30 of 2:00",

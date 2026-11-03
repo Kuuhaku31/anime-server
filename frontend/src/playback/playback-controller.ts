@@ -1,11 +1,10 @@
 
-
 // frontend/src/playback/playback-controller.ts
 // 协调稳定缓存句柄, 本地播放位置和浏览器媒体引擎.
 
 import { getMediaMetadata, isAbort, playbackUrl, rescanMedia, saveConfigs, wait } from "../api/anime-server.ts";
 import { CacheStore } from "../state/cache-store.ts";
-import type { CacheEntry, CacheStatus, MediaInfo, PlaybackMedia, PlaybackQuery, StreamSelection } from "../state/player-state.ts";
+import type { CacheEntry, MediaInfo, PlaybackMedia, PlaybackQuery, StreamSelection } from "../state/player-state.ts";
 import { MediaAdapter } from "./hls-adapter.ts";
 import { absoluteTime, formatTime, rangeReady } from "./timeline.ts";
 
@@ -91,8 +90,8 @@ export class PlaybackController extends EventTarget {
   }
 
   /** 从共享 Map 获取当前状态, 不保存第二份会过期的缓存快照. */
-  get cache(): CacheStatus | null {
-    return this.handleId ? this.caches.entries.get(this.handleId)?.status ?? null : null;
+  get cache(): CacheEntry | null {
+    return this.handleId ? this.caches.entries.get(this.handleId) ?? null : null;
   }
   /** 原媒体的完整时长. */
   get duration(): number { return this.info?.metadata.duration ?? 0; }
@@ -265,9 +264,9 @@ export class PlaybackController extends EventTarget {
       const entry = this.caches.entries.get(this.handleId);
       if (!entry) { this.fatal(new Error("The current cache was deleted")); return; }
       if (!entry.source_path) { this.fatal(new Error("Cache source media is unavailable")); return; }
-      if (!this.pending && this.loaded && entry.status.phase === "failed") {
-        if (!rangeReady(this.position, entry.status.buffered_until)) {
-          this.fatal(new Error(entry.status.error || "Cache generation failed")); return;
+      if (!this.pending && this.loaded && entry.phase === "failed") {
+        if (!rangeReady(this.position, entry.buffered_until)) {
+          this.fatal(new Error(entry.error || "Cache generation failed")); return;
         }
         this.message = "Playing cached range. Cache generation stopped.";
       }
@@ -369,9 +368,8 @@ export class PlaybackController extends EventTarget {
     while (true) {
       signal.throwIfAborted();
       if (this.handleId !== handleId) throw new Error("Playback cache changed");
-      const entry = this.requireCache(handleId);
-      if (!entry.source_path) throw new Error("Cache source media is unavailable");
-      const cache = entry.status;
+      const cache = this.requireCache(handleId);
+      if (!cache.source_path) throw new Error("Cache source media is unavailable");
       if (cache.phase === "running") building = false;
       if (rangeReady(position, cache.buffered_until)) break;
       if (cache.phase === "failed") throw new Error(cache.error || "Cache generation failed. Retry the cache.");

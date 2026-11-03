@@ -10,9 +10,9 @@ import { element } from "./controls.ts";
 
 /** 根据缓存状态和源文件可用性决定按钮边界, 不让播放隐式触发构建. */
 export function cacheActions(entry: CacheEntry): CacheActions {
-  const phase = entry.status.phase;
+  const phase = entry.phase;
   return {
-    play: entry.source_path !== null && entry.status.buffered_until > 0
+    play: entry.source_path !== null && entry.buffered_until > 0
       && !["loading", "stopping"].includes(phase),
     encoding: phase === "running" ? "stop"
       : entry.source_path !== null && ["ready", "failed"].includes(phase) ? "retry" : null,
@@ -123,9 +123,9 @@ export class CacheList {
   private row(entry: CacheEntry): HTMLDetailsElement {
     const expanded = this.expanded.has(entry.handle_id);
     const row = document.createElement("details");
-    row.className = `cache-row${entry.status.phase === "completed" ? " completed" : ""}${entry.handle_id === this.active ? " active" : ""}`;
+    row.className = `cache-row${entry.phase === "completed" ? " completed" : ""}${entry.handle_id === this.active ? " active" : ""}`;
     row.dataset.handleId = entry.handle_id;
-    row.dataset.phase = entry.status.phase;
+    row.dataset.phase = entry.phase;
     row.open = expanded;
 
     const summary = document.createElement("summary");
@@ -137,10 +137,10 @@ export class CacheList {
     identifier.textContent = entry.handle_id.slice(0, 12);
     identifier.title = entry.handle_id;
     const duration = this.library.info(entry.source_path)?.metadata.duration ?? 0;
-    const progress = cacheProgress(entry.status, duration, entry.resources);
+    const progress = cacheProgress(entry, duration, entry.resources);
     const status = document.createElement("span");
     status.className = "cache-summary-state";
-    status.dataset.phase = entry.status.phase;
+    status.dataset.phase = entry.phase;
     status.textContent = progress.state;
     const usage = entry.resources;
     const resources = document.createElement("span");
@@ -185,7 +185,7 @@ export class CacheList {
     tracks.textContent = `Video ${entry.spec.video_stream_index} / Audio ${entry.spec.audio_stream_index ?? "off"} / Subtitles ${entry.spec.subtitle_stream_index ?? "off"}`;
     const status = document.createElement("p");
     status.className = "item-status";
-    status.textContent = `State: ${entry.status.phase} / Published: ${entry.status.buffered_until.toFixed(2)}s${duration > 0 ? ` / Total: ${duration.toFixed(2)}s` : ""}`;
+    status.textContent = `State: ${entry.phase} / Published: ${entry.buffered_until.toFixed(2)}s${duration > 0 ? ` / Total: ${duration.toFixed(2)}s` : ""}`;
     const usage = entry.resources;
     const resources = document.createElement("p");
     resources.className = "item-status";
@@ -198,10 +198,10 @@ export class CacheList {
       diagnostic.textContent = `Source duration unavailable: ${metadataError}`;
       details.append(diagnostic);
     }
-    if (entry.status.error) {
+    if (entry.error) {
       const diagnostic = document.createElement("p");
       diagnostic.className = "item-error";
-      diagnostic.textContent = entry.status.error;
+      diagnostic.textContent = entry.error;
       details.append(diagnostic);
     }
     details.append(this.actions(entry));

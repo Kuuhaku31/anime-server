@@ -1,7 +1,7 @@
 
 // frontend/src/playback/timeline.ts
 // 统一原视频时间轴和已生成范围的边界计算.
-import type { CacheStatus, WorkerResources } from "../state/player-state.ts";
+import type { CacheEntry, WorkerResources } from "../state/player-state.ts";
 
 /** 描述独立于播放位置的缓存进度显示. */
 interface CacheProgress {
@@ -17,8 +17,8 @@ interface CacheProgress {
   text: string;
 }
 
-/** 使用服务端阶段与已验证前缀展示生成进度. */
-export function cacheProgress(cache: CacheStatus, duration: number, resources: WorkerResources): CacheProgress {
+/** 使用缓存快照的阶段与已验证前缀展示生成进度. */
+export function cacheProgress(cache: Pick<CacheEntry, "phase" | "buffered_until">, duration: number, resources: WorkerResources): CacheProgress {
   const knownDuration = Number.isFinite(duration) && duration > 0;
   const seconds = Math.max(0, knownDuration ? Math.min(duration, cache.buffered_until) : cache.buffered_until);
   const percent = cache.phase === "completed" ? 100 : knownDuration ? Math.min(100, 100 * seconds / duration) : 0;

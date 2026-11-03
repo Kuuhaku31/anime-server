@@ -12,7 +12,7 @@ function entry(handleId = "a".repeat(32), phase = "ready", sourcePath = "/media/
   return {
     handle_id: handleId, source_path: sourcePath,
     spec: { media_id: "b".repeat(32), version: "test", video_stream_index: 0, audio_stream_index: null, subtitle_stream_index: null },
-    status: { phase, buffered_until: bufferedUntil, error: null },
+    phase, buffered_until: bufferedUntil, error: null,
     resources: { encoder_slots: 0, process_slots: 0, ffmpeg_threads: 0 },
   };
 }
@@ -230,7 +230,7 @@ test("encoding toggle dispatches pause and retry with pending protection", async
     assert.equal(options.method, "POST");
     if (url.endsWith("/stop")) return new Promise((resolve) => { resolveStop = resolve; });
     assert.equal(url, `/api/cache/${cache.handle_id}/retry`);
-    return Response.json({ cache: { ...cache, status: { ...cache.status, phase: "running" } } });
+    return Response.json({ cache: { ...cache, phase: "running" } });
   });
   new CacheList(store, () => assert.fail("encoding must not start playback"), new MediaLibrary());
   const container = nodes.get("#caches");
@@ -239,13 +239,13 @@ test("encoding toggle dispatches pause and retry with pending protection", async
   container.emit("click", action(row(container, cache.handle_id), "encoding"));
   assert.equal(action(row(container, cache.handle_id), "encoding").disabled, true);
   container.emit("click", action(row(container, cache.handle_id), "encoding"));
-  resolveStop(Response.json({ ...cache, status: { ...cache.status, phase: "stopping" } }));
+  resolveStop(Response.json({ ...cache, phase: "stopping" }));
   await new Promise(setImmediate);
   assert.equal(action(row(container, cache.handle_id), "encoding").disabled, true);
   container.emit("click", action(row(container, cache.handle_id), "encoding"));
   assert.deepEqual(requests, [`/api/cache/${cache.handle_id}/stop`]);
 
-  store.entries.set(cache.handle_id, { ...cache, status: { ...cache.status, phase: "ready" } });
+  store.entries.set(cache.handle_id, { ...cache, phase: "ready" });
   store.dispatchEvent(new Event("change"));
   assert.equal(action(row(container, cache.handle_id), "encoding").textContent, "Retry / resume");
   container.emit("click", action(row(container, cache.handle_id), "encoding"));
@@ -271,7 +271,7 @@ test("collapsed progress follows source duration and completion without duplicat
   library.metadata = { metadata: { duration: 32 } };
   library.dispatchEvent(new Event("change"));
   assert.equal(bars()[0].value, 25);
-  store.entries.set(cache.handle_id, { ...cache, status: { ...cache.status, buffered_until: 16 } });
+  store.entries.set(cache.handle_id, { ...cache, buffered_until: 16 });
   store.dispatchEvent(new Event("change"));
   assert.equal(bars()[0].value, 50);
   assert.match(bars()[0].attributes["aria-label"], /0:16 of 0:32/);
@@ -281,7 +281,7 @@ test("collapsed progress follows source duration and completion without duplicat
 
   library.metadata = null;
   library.error = "Source could not be probed";
-  store.entries.set(cache.handle_id, { ...cache, status: { ...cache.status, phase: "completed" } });
+  store.entries.set(cache.handle_id, { ...cache, phase: "completed" });
   list.select(cache.handle_id);
   assert.match(row(container, cache.handle_id).className, /completed active/);
   assert.equal(bars()[0].value, 100);

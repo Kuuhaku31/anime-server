@@ -14,7 +14,7 @@ use crate::{
     utils,
 };
 
-use super::{CacheError, CacheSnapshot, CacheStatus};
+use super::{CacheError, CacheSnapshot};
 
 #[cfg(test)]
 #[path = "../../tests/cache/handle.rs"]
@@ -85,7 +85,7 @@ impl CacheInstanceHandle {
         let error = match phase { Phase::Failed { error } => Some(error.clone()), _ => None };
         Ok(CacheSnapshot {
             handle_id: self.handle_id.clone(), spec: self.spec.clone(),
-            status: CacheStatus { phase: phase.kind(), buffered_until, error },
+            phase: phase.kind(), buffered_until, error,
             resources: self.resources.snapshot(),
             source_path: None,
         })

@@ -35,6 +35,10 @@ async fn concurrent_opens_share_one_handle_and_completed_cache_survives_restart(
     assert!(manager.media_path(&first.handle_id, "../init.mp4").await.is_err());
     let json = serde_json::to_value(manager.status(&first.handle_id).await?)?;
     assert_eq!(json["handle_id"], first.handle_id);
+    assert_eq!(json["phase"], "completed");
+    assert!(json["buffered_until"].as_f64().unwrap() > 8.9);
+    assert_eq!(json.get("error"), Some(&serde_json::Value::Null));
+    assert!(json.get("status").is_none());
     assert!(json.get("folder").is_none());
     assert_eq!(json["resources"]["ffmpeg_threads"], 0);
     manager.shutdown().await?;
@@ -44,7 +48,7 @@ async fn concurrent_opens_share_one_handle_and_completed_cache_survives_restart(
     wait_phase(&restored, &first.handle_id, "completed").await?;
     assert_eq!(restored.handles.lock().await.len(), 1);
     assert_eq!(tokio::fs::read(folder.join("segment_000000.m4s")).await?, published);
-    assert!(restored.status(&first.handle_id).await?.status.buffered_until > 8.9);
+    assert!(restored.status(&first.handle_id).await?.buffered_until > 8.9);
     restored.remove(&first.handle_id).await?;
     assert!(!folder.exists());
     assert!(restored.media_path(&first.handle_id, "index.m3u8").await.is_err());
@@ -145,13 +149,13 @@ async fn recovered_partial_cache_appends_without_overwriting_the_prefix() -> Res
     tokio::fs::write(folder.join("segment_000002.m4s"), b"broken tail").await?;
     let manager = CacheManager::new(root.clone(), &processes).await?;
     wait_phase(&manager, &snapshot.handle_id, "ready").await?;
-    assert_eq!(manager.status(&snapshot.handle_id).await?.status.buffered_until, 8.0);
+    assert_eq!(manager.status(&snapshot.handle_id).await?.buffered_until, 8.0);
     let (_sender, mut cancel) = tokio::sync::watch::channel(false);
     let occupied = processes.encoding_budget(2, 2, &mut cancel).await?;
     manager.retry(&snapshot.handle_id, source.clone(), metadata.clone(), &config, &processes).await?;
     let stopped = manager.stop(&snapshot.handle_id).await?;
-    assert_eq!(stopped.status.phase, "ready");
-    assert_eq!(stopped.status.buffered_until, 8.0);
+    assert_eq!(stopped.phase, "ready");
+    assert_eq!(stopped.buffered_until, 8.0);
     assert_eq!(stopped.resources, WorkerResources::default());
     assert!(folder.exists());
     manager.retry(&snapshot.handle_id, source.clone(), metadata.clone(), &config, &processes).await?;
@@ -163,7 +167,7 @@ async fn recovered_partial_cache_appends_without_overwriting_the_prefix() -> Res
     drop(manager);
     let manager = CacheManager::new(root, &processes).await?;
     wait_phase(&manager, &snapshot.handle_id, "ready").await?;
-    assert_eq!(manager.status(&snapshot.handle_id).await?.status.buffered_until, 8.0);
+    assert_eq!(manager.status(&snapshot.handle_id).await?.buffered_until, 8.0);
     drop(occupied);
     manager.retry(&snapshot.handle_id, source, metadata, &config, &processes).await?;
     wait_phase(&manager, &snapshot.handle_id, "completed").await?;

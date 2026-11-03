@@ -11,7 +11,7 @@ function entry(handleId = "a".repeat(32)) {
   return {
     handle_id: handleId, source_path: "/media/video.mkv",
     spec: { media_id: "b".repeat(32), video_stream_index: 0, audio_stream_index: null, subtitle_stream_index: null, version: "test" },
-    status: { phase: "ready", buffered_until: 8, error: null },
+    phase: "ready", buffered_until: 8, error: null,
     resources: { encoder_slots: 0, process_slots: 0, ffmpeg_threads: 0 },
   };
 }
@@ -46,16 +46,16 @@ test("retry stop and errors update only their cache entry", async (context) => {
     calls.push({ url, method: options.method ?? "GET" });
     if (fail) return new Response("cannot delete cache", { status: 500 });
     if (url.endsWith("/retry")) {
-      return Response.json({ cache: { ...cache, status: { ...cache.status, phase: "running" },
+      return Response.json({ cache: { ...cache, phase: "running",
         resources: { encoder_slots: 1, process_slots: 1, ffmpeg_threads: 2 } }, media: {} });
     }
     return Response.json(cache);
   });
   await store.retry(cache.handle_id);
   assert.equal(store.resources.ffmpeg_threads, 2);
-  assert.equal(store.entries.get(cache.handle_id).status.phase, "running");
+  assert.equal(store.entries.get(cache.handle_id).phase, "running");
   await store.stop(cache.handle_id);
-  assert.equal(store.entries.get(cache.handle_id).status.phase, "ready");
+  assert.equal(store.entries.get(cache.handle_id).phase, "ready");
   assert.equal(store.resources.ffmpeg_threads, 0);
   fail = true;
   await assert.rejects(store.remove(cache.handle_id), /cannot delete cache/);

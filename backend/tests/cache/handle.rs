@@ -43,7 +43,7 @@ async fn ready_run_reserves_its_worker_before_stop() -> Result<()> {
     handle.run(directory.path.join("missing.mkv"), crate::testing::metadata(),
         &AppConfigManager::default(), &ProcessManager::new(2, 2)).await?;
     assert!(handle.stop().await?, "run returned before registering its worker");
-    assert_eq!(handle.snapshot().await?.status.phase, "stopping");
+    assert_eq!(handle.snapshot().await?.phase, "stopping");
     Ok(())
 }
 
@@ -61,7 +61,7 @@ async fn stop_cancels_a_deferred_run_after_recovery_becomes_ready() -> Result<()
         &AppConfigManager::default(), &ProcessManager::new(2, 2)).await?;
     transition(&mut *handle.phase.lock().await, Some(Phase::Ready { cancel }))?;
     assert!(!handle.stop().await?);
-    assert_eq!(handle.snapshot().await?.status.phase, "ready");
+    assert_eq!(handle.snapshot().await?.phase, "ready");
     assert!(std::fs::read_dir(&directory.path)?.next().is_none());
     Ok(())
 }
@@ -86,7 +86,7 @@ async fn pause_does_not_cancel_loading_recovery() -> Result<()> {
     *handle.phase.lock().await = Some(Phase::Loading { started: true, cancel });
     tokio::time::timeout(Duration::from_millis(100), handle.pause()).await??;
     assert!(!*receiver.borrow());
-    assert_eq!(handle.snapshot().await?.status.phase, "loading");
+    assert_eq!(handle.snapshot().await?.phase, "loading");
     Ok(())
 }
 
@@ -108,7 +108,7 @@ async fn stopping_keeps_published_assets_available() -> Result<()> {
     assert!(handle.media_path("segment_000001.m4s").await.is_err());
     assert!(handle.media_path("instance.json").await.is_err());
     handle.pause().await?;
-    assert_eq!(handle.snapshot().await?.status.phase, "ready");
+    assert_eq!(handle.snapshot().await?.phase, "ready");
     Ok(())
 }
 

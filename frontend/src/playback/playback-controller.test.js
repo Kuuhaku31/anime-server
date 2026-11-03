@@ -1,5 +1,4 @@
 
-
 // frontend/src/playback/playback-controller.test.js
 // 在无浏览器环境验证构建与播放分离, 本地等待和缓存生命周期.
 import assert from "node:assert/strict";
@@ -109,7 +108,7 @@ function server(context, generated = 120) {
       const handleId = createHash("md5").update(JSON.stringify(spec)).digest("hex");
       const cache = {
         handle_id: handleId, spec, source_path: body.path,
-        status: { phase: "running", buffered_until: generated, error: null },
+        phase: "running", buffered_until: generated, error: null,
         resources: { encoder_slots: 1, process_slots: 1, ffmpeg_threads: 2 },
       };
       caches.set(handleId, cache);
@@ -155,7 +154,7 @@ test("the shared cache list refreshes paused playback and slows down after compl
   video.pause();
   let changes = 0;
   controller.addEventListener("change", () => { changes += 1; });
-  const cache = [...api.caches.values()][0].status;
+  const cache = [...api.caches.values()][0];
   cache.buffered_until = 60;
   timers.get(1000)();
   await until(() => controller.cache.buffered_until === 60);
@@ -287,7 +286,7 @@ test("seek waits for new segments without another build and can be redirected", 
   const video = new Video();
   const controller = new PlaybackController(video);
   await operation(controller, () => controller.open(file));
-  const cache = [...api.caches.values()][0].status;
+  const cache = [...api.caches.values()][0];
   cache.buffered_until = 20;
   await controller.caches.refresh();
   controller.seek(65.375);
@@ -322,7 +321,7 @@ test("resuming waits for the target range and stop cancels the wait", async (con
   await until(() => controller.message.includes("Waiting for 0:12"));
   assert.equal(video.src, "");
   assert.equal(controller.position, 12.375);
-  const cache = [...api.caches.values()][0].status;
+  const cache = [...api.caches.values()][0];
   cache.buffered_until = 16;
   await until(() => !controller.pending);
   assert.equal(controller.position, 12.375);
@@ -347,7 +346,7 @@ test("stopping generation ends an uncovered initial playback wait without rebuil
   controller.open(file);
   await until(() => controller.message.includes("Waiting for 0:12"));
   const cache = [...api.caches.values()][0];
-  cache.status.phase = "ready";
+  cache.phase = "ready";
   cache.resources = { encoder_slots: 0, process_slots: 0, ffmpeg_threads: 0 };
   await until(() => !controller.pending);
   assert.match(controller.error, /generation is stopped/);
@@ -365,7 +364,7 @@ test("the exact cache boundary waits but even a sub-half-second covered target s
   await until(() => controller.message.includes("Waiting for 0:12"));
   assert.equal(video.src, "");
   assert.equal(controller.position, 12.375);
-  const cache = [...api.caches.values()][0].status;
+  const cache = [...api.caches.values()][0];
   cache.buffered_until = 12.376;
   await until(() => !controller.pending);
   assert.equal(controller.error, "");
@@ -385,15 +384,16 @@ test("a published prefix remains usable while an uncovered failed range reports 
   const video = new Video();
   const controller = new PlaybackController(video);
   await operation(controller, () => controller.open(file));
-  const cache = [...api.caches.values()][0].status;
+  const cache = [...api.caches.values()][0];
   cache.phase = "failed";
   cache.buffered_until = 20;
+  cache.error = "Source decoding failed";
   await controller.report();
   assert.equal(controller.error, "");
   assert.equal(controller.message, "Playing cached range. Cache generation stopped.");
   assert.equal(video.paused, false);
   await operation(controller, () => controller.seek(30));
-  assert.match(controller.error, /Cache generation failed/);
+  assert.match(controller.error, /Source decoding failed/);
   assert.equal(api.caches.size, 1);
   await operation(controller, () => controller.stop());
 });
@@ -456,7 +456,7 @@ test("cache playback requires an available source even after completion", async 
   const controller = new PlaybackController(video);
   const built = await controller.caches.build({ path: file[0] });
   const cache = api.caches.get(built.cache.handle_id);
-  cache.status.phase = "completed";
+  cache.phase = "completed";
   cache.source_path = null;
   await operation(controller, () => controller.openCached(cache.handle_id));
   assert.match(controller.error, /source media is unavailable/);
