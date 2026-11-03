@@ -6,10 +6,10 @@ use std::{path::Path, process::Stdio};
 
 use anyhow::{ensure, Context, Result};
 use serde::Deserialize;
-use tokio::{io::AsyncWriteExt, process::Command, sync::watch};
+use tokio::{process::Command, sync::watch};
 use tracing::warn;
 
-use crate::models::{CacheSpec, MediaMetadata};
+use crate::{models::{CacheSpec, MediaMetadata}, utils::atomic_file};
 
 
 use super::{
@@ -231,25 +231,6 @@ pub(super) async fn remove_file(path: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
     }
-}
-
-/// 在同目录写入并同步临时文件后原子替换目标.
-pub(crate) async fn atomic_file(directory: &Path, name: &str, content: &[u8]) -> Result<()> {
-    // 文件数据和目录项按顺序落盘, 重启只会看到旧版本或完整的新版本.
-    let temporary = directory.join(format!("{name}.tmp"));
-    let mut file = tokio::fs::File::create(&temporary).await?;
-    file.write_all(content).await?;
-    file.sync_all().await?;
-    drop(file);
-    tokio::fs::rename(temporary, directory.join(name)).await?;
-    sync_directory(directory).await
-}
-
-/// 确保目录项变更持久化.
-pub(crate) async fn sync_directory(directory: &Path) -> Result<()> {
-    let directory = directory.to_owned();
-    tokio::task::spawn_blocking(move || std::fs::File::open(directory)?.sync_all()).await??;
-    Ok(())
 }
 
 /// 仅在已有可播放分片时发布正式清单.

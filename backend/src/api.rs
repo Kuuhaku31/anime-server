@@ -14,15 +14,13 @@ use serde_json::json;
 use tower_http::services::ServeFile;
 
 use crate::{
-    cache::CacheSnapshot, constants::CACHE_VERSION, dandanplay, db::DatabaseManager,
-    models::{
+    cache::CacheSnapshot, constants::CACHE_VERSION, dandanplay::{self, DanmakuError}, db::DatabaseManager, models::{
         CacheSpec,
         MediaConfigs,
         MediaMetadata,
         PlaybackQuery,
         ScanChanges,
-    },
-    process::{self, ProcessManager}, scanner::ScannerManager, services,
+    }, process::{self, ProcessManager}, scanner::ScannerManager, services,
 };
 
 
@@ -45,6 +43,17 @@ struct SaveMediaEpisodeRequest {
     episode_id: Option<i64>,
 }
 
+/// 按剧集手动加载弹幕, refresh 为 true 时绕过已有缓存.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LoadDanmakuRequest {
+    /// 浏览器可无损表示的正整数 DandanPlay 剧集 ID.
+    episode_id: u64,
+    /// 是否显式要求重新访问上游, 缺省使用已有缓存.
+    #[serde(default)]
+    refresh: bool,
+}
+
 // 各项 JSON 响应类型
 type GetConfigResponse = Json<ConfigResponseBody>;
 type ListMediaResponse = Json<Vec<ListMediaResponseItem>>;
@@ -56,6 +65,8 @@ type SaveMediaConfigsResponse = StatusCode;
 type SaveMediaEpisodeResponse = Json<MediaEpisodeResponseBody>;
 /// 返回识别后实际保存的 ID 和本次是否取得唯一匹配.
 type IdentifyMediaResponse = Json<IdentifyMediaResponseBody>;
+/// 直接返回完整时间有序弹幕数组, 不附带包装对象.
+type LoadDanmakuResponse = Json<Vec<dandanplay::DanmakuComment>>;
 type BuildCacheResponse = Json<BuildCacheResponseBody>;
 type ListCacheResponse = Json<CacheListResponseBody>;
 type CacheDetailResponse = Json<CacheSnapshot>;
@@ -143,6 +154,8 @@ pub(crate) fn router() -> Router {
     .route("/api/media/rescan", post(rescan_media))
     .route("/api/media/identify", post(identify_media))
     .route("/api/media/configs", put(save_media_configs))
+
+    .route("/api/danmaku", post(load_danmaku))
 
     .route("/api/cache", get(list_cache).post(build_cache))
     .route("/api/cache/{handle_id}", get(cache_detail).delete(delete_cache))
@@ -269,6 +282,24 @@ async fn identify_media(input: Result<Json<PathBuf>, JsonRejection>) -> Result<I
         } else { ApiError::internal(error) }
     })?;
     Ok(Json(IdentifyMediaResponseBody { file_id: file.media_id, episode_id, matched: result.is_some() }))
+}
+
+/// 校验弹幕请求并读取或刷新文件缓存, 不改动数据库或播放任务.
+async fn load_danmaku(input: Result<Json<LoadDanmakuRequest>, JsonRejection>)
+-> Result<LoadDanmakuResponse, ApiError>
+{
+    let Json(input) = input.map_err(ApiError::bad)?;
+    let config = services::config().dandanplay.as_ref().ok_or_else(|| ApiError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        message: "DandanPlay identification is not configured; \
+        set DANDAN_APP_ID and DANDAN_APP_SECRET in the server environment"
+        .to_owned(),
+    })?;
+    dandanplay::load_danmaku(config, input.episode_id, input.refresh).await
+    .map(Json).map_err(|error| match error {
+        DanmakuError::Cache(error) => ApiError::internal(format!("{error:#}")),
+        DanmakuError::Upstream(error) => ApiError::upstream(error),
+    })
 }
 
 
@@ -466,7 +497,8 @@ impl ApiError {
 
     /// 保留外部 API 的超时语义, 其他网络和协议错误返回 502.
     fn upstream(error: anyhow::Error) -> Self {
-        let timeout = error.downcast_ref::<reqwest::Error>().is_some_and(|error| error.is_timeout());
+        let timeout = error.downcast_ref::<reqwest::Error>().is_some_and(|error| error.is_timeout())
+            || error.downcast_ref::<tokio::time::error::Elapsed>().is_some();
         Self {
             status: if timeout { StatusCode::GATEWAY_TIMEOUT } else { StatusCode::BAD_GATEWAY },
             message: format!("{error:#}"),

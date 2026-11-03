@@ -20,7 +20,7 @@ position 和三个流索引组成 MediaConfigs, episode_id 不属于播放配置
 播放配置接口完整替换这四个字段, 不覆盖剧集关联.
 episode_id 由独立接口手动保存, 清空或在唯一精确识别后替换,
 HTTP 接口限制为浏览器可精确表示的正整数, 最大为 9007199254740991.
-数据库不保存观看日期或媒体探测快照, 本轮也不保存候选标题和弹幕内容.
+数据库不保存观看日期, 媒体探测快照, 候选标题或弹幕内容.
 
 ## file_path
 
@@ -67,6 +67,10 @@ media_id 只覆盖前 16 MiB, 不是全文件内容校验或安全认证标识.
 只有不兼容旧身份结构才需要备份后使用空数据库重扫, 本次新增字段无需删库.
 不要让测试和生产实例共用 DATA_DIR.
 
-`/data/ddp-ani/` 和 `/data/ddp-danmaku/` 是独立于数据库 schema 的 API 缓存预留目录.
+`/data/ddp-ani/` 仍是番剧 API 缓存预留目录.
+`/data/ddp-danmaku/<episode_id>.json` 保存 DandanPlay 原始弹幕 JSON, 独立于数据库 schema.
+弹幕加载或刷新只读写对应文件, 不修改 file.episode_id 或播放配置.
+修改或清空关联不会删除旧弹幕缓存, 多个媒体可以共享同一剧集缓存.
+弹幕文件可独立备份, 不影响 main.db 的迁移和媒体身份.
 播放缓存位于 `/cache/playback/`, 由宿主机 CACHE_DIR 独立挂载, 不保存在 DATA_DIR 中.
 播放缓存完成状态来自 instance.json 和 HLS 文件, 不写入数据库.

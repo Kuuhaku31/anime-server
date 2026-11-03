@@ -20,9 +20,9 @@ mod metadata;
 mod worker;
 pub(crate) use assets::RenderAssets;
 pub(crate) use ffmpeg::{
-    atomic_file, media_filename, read_playlist, regular_bytes, segment_name,
-    sync_directory, write_playlist, CachedMedia,
+    media_filename, read_playlist, regular_bytes, segment_name, write_playlist, CachedMedia,
 };
+pub(crate) use crate::utils::{atomic_file, sync_directory};
 pub(crate) use fragment::{normalize, Init, Tail};
 pub(crate) use worker::{EncodingWorker, WorkerResources, WorkerUsage};
 

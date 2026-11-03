@@ -1,13 +1,13 @@
 
 // backend/src/utils.rs
-//! 提供健康检查, 媒体工具检查和内容标识辅助函数.
+//! 提供健康检查, 媒体工具检查, 内容标识和原子文件发布辅助函数.
 
 use std::fs::File;
 use std::path::Path;
 
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use md5::Md5;
-use tokio::process::Command;
+use tokio::{io::AsyncWriteExt, process::Command};
 
 use crate::process::checked_output;
 use crate::constants::FALLBACK_FONT;
@@ -87,4 +87,32 @@ pub(crate) fn random_id() -> Result<String> {
     let mut bytes = [0_u8; 16];
     File::open("/dev/urandom")?.read_exact(&mut bytes)?;
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// 在同目录写入并同步临时文件后原子替换目标, 调用方串行化同名发布.
+pub(crate) async fn atomic_file(directory: &Path, name: &str, content: &[u8]) -> Result<()> {
+    let temporary = directory.join(format!("{name}.tmp"));
+    let mut file = tokio::fs::File::create(&temporary).await?;
+    let result = async {
+        file.write_all(content).await?;
+        file.sync_all().await?;
+        drop(file);
+        tokio::fs::rename(&temporary, directory.join(name)).await?;
+        sync_directory(directory).await
+    }.await;
+    if result.is_err() {
+        match tokio::fs::remove_file(&temporary).await {
+            Ok(()) => {},
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+            Err(error) => return Err(error).context(format!("cannot clean temporary file after {result:?}")),
+        }
+    }
+    result
+}
+
+/// 确保原子替换后的目录项已经持久化.
+pub(crate) async fn sync_directory(directory: &Path) -> Result<()> {
+    let directory = directory.to_owned();
+    tokio::task::spawn_blocking(move || std::fs::File::open(directory)?.sync_all()).await??;
+    Ok(())
 }

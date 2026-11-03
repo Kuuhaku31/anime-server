@@ -1,7 +1,7 @@
 # 核心架构
 
 API 是业务枢纽, 使用按路径访问的媒体模型连接配置, 数据库, 扫描, 缓存和进程管理器,
-并协调 DandanPlay 文件识别及剧集关联保存.
+并协调 DandanPlay 文件识别, 剧集关联保存和原始弹幕文件缓存.
 播放通过稳定 handle_id 直接访问缓存资源, 没有 SessionManager 或服务端播放映射.
 
 ## 实例与依赖
@@ -32,6 +32,8 @@ CacheManager 的查询和资源接口只接收 handle_id, 不接收客户端提�
 
 `dandanplay.rs` 只封装 HTTPS 请求, 签名和上游协议校验, 不注册新 Manager,
 不读取 services getter, 不持有数据库或扫描器. API 显式提供凭据和文件描述.
+`danmaku.rs` 负责弹幕文件缓存与规范化列表, API 向其提供剧集 ID, 刷新标志和可选凭据,
+不注册新 Manager, 不持有数据库或 CacheManager.
 ProcessManager 仍只负责本地媒体进程, 不承担外部 HTTP 调用.
 
 ## 共享模型
@@ -46,6 +48,7 @@ ProcessManager 仍只负责本地媒体进程, 不承担外部 HTTP 调用.
 | MediaEntry     | file_id, path, configs, episode_id                                      |
 | MediaEpisode   | file_id, episode_id                                                     |
 | MediaIdentification | file_id, episode_id, matched                                        |
+| DanmakuComment | time, mode, color, sender, comment_id, content                           |
 | MediaInfo      | metadata, configs                                                       |
 | MediaMetadata  | duration, format, video_streams, audio_streams, subtitle_streams        |
 | StreamInfo     | stream_index, codec_name, language, title, is_default, is_forced        |
@@ -86,7 +89,8 @@ MediaMetadata 内部额外保留容器起点, 字体附件和视频色彩信息,
 现有 media_id 表在启动事务中增补可空列, 无需删除媒体索引或观看记录.
 
 识别先校验路径并重新计算前 16 MiB MD5, 每次显式请求都访问上游, 不因已有 ID 而跳过.
-缺省的可选 DandanPlay 凭据不影响本地功能, 只有识别请求返回未配置错误.
+缺省的可选 DandanPlay 凭据不影响本地功能和弹幕缓存命中,
+只有识别或需要下载弹幕的请求返回未配置错误.
 AppConfigManager 在启动时从 DANDAN_APP_ID 和 DANDAN_APP_SECRET 读取凭据,
 两项必须同时提供或同时留空, 不从 config.json 加载, 也不参与 JSON 序列化.
 Compose 负责将根目录 .env 中的认证参数传入容器, 后端不直接读取该文件.
@@ -101,7 +105,34 @@ Compose 负责将根目录 .env 中的认证参数传入容器, 后端不直接�
 响应提供最终 episode_id 和 matched 标志, 无唯一匹配不被误报为识别成功.
 前端按 file_id 共享编辑草稿和请求状态, 使同内容副本同步,
 metadata 或播放高亮重绘保留正在输入的值和焦点.
-识别不创建或改变任何播放缓存, 当前不下载或渲染弹幕.
+识别不创建或改变任何播放缓存, 也不隐式下载弹幕.
+
+## 弹幕文件缓存与时间同步
+
+`POST /api/danmaku` 接收 episode_id 和 refresh. 原始上游 JSON 按数字 ID 保存在
+`/data/ddp-danmaku/<episode_id>.json`, 不进入 SQLite, 不参与 handle_id 或 HLS 生命周期.
+普通加载优先读取已有文件并校验, 强制刷新跳过读取. 不自动过期, 不静默修复坏缓存.
+每次新下载先完成协议校验, 再复用 utils 的原子写入辅助函数保存原始字节.
+上游失败保留旧缓存, 错误不会转换成空列表或缓存成功响应.
+
+模块通过弱引用索引维护在途 episode ID 的异步锁, 同一剧集读取与发布串行化,
+不同剧集独立进行; 全局索引锁不跨越网络等待, 已结束请求的弱引用会被清理.
+原始文件和上游正文均限制为 32 MiB, 缓存命中不依赖应用凭据.
+DandanPlay 下载携带 withRelated=true 和 chConvert=0, 全链最多 20 秒,
+最多 3 次 HTTPS 重定向且不向后续目标转发认证头.
+
+API 直接返回 `Vec<DanmakuComment>` 对应的 JSON 数组, 不附带 episode_id, comments 或缓存来源包装字段.
+前端使用 `DanmakuComment[]`, 当前剧集关联来自 Library, 不依赖响应内的 episode ID.
+p 展开为时间, 模式, RGB 颜色和发送者, m 作为纯文本内容,
+cid 转字符串以避免 JavaScript 大整数精度损失. 条目严格校验后按时间稳定排序.
+合法空数组以及官方 count=0 且 comments=null 返回空列表, 协议缺失或无效条目明确报错.
+
+前端 `DanmakuPanel` 独立持有数据, DOM 索引和在途 AbortController.
+`main.ts` 从 Library 查询当前播放路径的 episode ID, 同步 PlaybackController 的绝对播放位置.
+媒体或关联改变时清空并取消旧请求, 身份检查阻止迟到响应覆盖新状态, 不自动下载.
+播放与 seek 使用二分查找定位最后一条已到达弹幕, 只在活动索引改变时更新高亮和列表滚动,
+不重建整表或滚动整个页面. 全屏期间隐藏, 退出或尺寸改变后恢复当前定位.
+弹幕异常仅显示局部诊断, 不影响本地播放, 生成任务或已经加载的列表.
 
 ## 缓存身份与目录
 

@@ -137,6 +137,11 @@ export class Library extends EventTarget {
     return file ? this.metadata.get(file.file_id) ?? null : null;
   }
 
+  /** 返回当前路径已保存的剧集 ID, 未登记路径不推测关联. */
+  episodeId(path: string | null): number | null {
+    return this.files.find((file) => file.path === path)?.episode_id ?? null;
+  }
+
   /** 为缓存摘要加载源时长, 与媒体展开共享在途请求和失败记录. */
   ensureMetadata(path: string): Promise<void> {
     const file = this.files.find((entry) => entry.path === path);
@@ -362,6 +367,7 @@ export class Library extends EventTarget {
     for (const file of this.files) {
       if (file.file_id === result.file_id) file.episode_id = result.episode_id;
     }
+    this.dispatchEvent(new Event("change"));
   }
 
   /** 显式构建当前行所选轨道的缓存, 不切换播放器或保存观看配置. */

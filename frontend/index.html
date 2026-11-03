@@ -1,6 +1,6 @@
 
 <!-- frontend/index.html -->
-<!-- 定义简洁播放器和可展开的媒体及缓存列表. -->
+<!-- 定义简洁播放器, 时间同步弹幕和可展开的媒体及缓存列表. -->
 <!doctype html>
 <html lang="en">
 
@@ -73,6 +73,22 @@
         </div>
       </div>
       <div id="meta">Select a video from the library</div>
+      <!-- 弹幕列表独立于视频画面, 只有显式加载或刷新才请求后端. -->
+      <section id="danmaku-panel" class="danmaku-panel" aria-labelledby="danmaku-title">
+        <div class="danmaku-heading">
+          <div>
+            <h2 id="danmaku-title">Comments</h2>
+            <p id="danmaku-episode">DandanPlay episode ID: Not associated</p>
+          </div>
+          <div class="danmaku-actions">
+            <button id="danmaku-load" type="button" disabled>Load comments</button>
+            <button id="danmaku-refresh" type="button" disabled>Refresh comments</button>
+          </div>
+        </div>
+        <p id="danmaku-status" class="danmaku-status" role="status">Select a media file to load comments.</p>
+        <p id="danmaku-error" class="danmaku-error" role="alert"></p>
+        <ol id="danmaku-list" class="danmaku-list" tabindex="0" aria-label="Comments ordered by playback time"></ol>
+      </section>
     </section>
     <aside class="library-sidebar" aria-label="Media and caches">
     <section class="panel files-panel">

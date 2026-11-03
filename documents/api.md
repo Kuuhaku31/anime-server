@@ -18,6 +18,7 @@
 | GET    | `/api/media/{file_id}/metadata`      | 探测单个媒体的实时 metadata       |
 | PUT    | `/api/media/{file_id}/episode`       | 单独保存或清空共享剧集 ID         |
 | POST   | `/api/media/identify`               | 按文件路径请求 DandanPlay 识别    |
+| POST   | `/api/danmaku`                       | 按剧集读取或强制刷新弹幕文件缓存  |
 | POST   | `/api/media/scan`                    | 全量扫描媒体目录                  |
 | POST   | `/api/media/rescan`                  | 按路径重扫并返回轻量媒体条目      |
 | PUT    | `/api/media/configs`                 | 按路径保存完整播放配置            |
@@ -227,6 +228,62 @@ Compose 从根目录 .env 传入, 不从 config.json 获取, 详见 [development
 连接超时为 5 秒, 整个上游请求最多 20 秒, 响应正文限制为 1 MiB.
 这些错误不等同于没有匹配, 失败时保留原关联并允许用户显式重试.
 
+## 弹幕加载
+
+`POST /api/danmaku` 请求:
+
+```json
+{ "episode_id": 1234567, "refresh": false }
+```
+
+episode_id 必须为 `1..9007199254740991` 范围内的整数, 不能为 null, 字符串或小数.
+refresh 缺省为 false, 显式提供时必须为布尔值. 拒绝未知字段, 非法请求返回 `400`.
+接口只根据剧集 ID 访问弹幕, 不查询或修改数据库, 不扫描媒体, 探测 metadata 或构建播放缓存.
+
+成功返回 `200`:
+
+```json
+[
+  {
+    "time": 12.5,
+    "mode": 1,
+    "color": 16777215,
+    "sender": "user-id",
+    "comment_id": "9223372036854775807",
+    "content": "example"
+  }
+]
+```
+
+响应直接使用弹幕数组, 空列表为 `[]`, 不包含 episode_id 或 comments 包装对象,
+也不公开 `cached` 或缓存路径. episode_id 仅用于请求和前端当前媒体关联.
+原始弹幕缓存为 `/data/ddp-danmaku/<episode_id>.json`,
+保留上游 `{count, comments: [{cid, p, m}]}` JSON 的原始字节, 不写入规范化响应.
+加载已有缓存时重新校验; 缓存缺失或 refresh=true 时下载, 校验成功后通过同目录临时文件原子替换.
+缓存不设置 TTL, 不自动刷新. 同剧集请求串行化, 等待中的普通加载会重新检查缓存以避免重复下载.
+
+规范化规则:
+
+- p 使用 `时间,模式,颜色,发送者` 格式, time 必须有限且非负.
+- mode 保留原始非负整数, 1 为滚动, 4 为底部, 5 为顶部, 未知模式不丢弃.
+- color 为 `0..16777215` 的 RGB 整数, sender 为原始字符串, content 为 m 的纯文本.
+- cid 为整数或字符串时无损转换为 comment_id 字符串, 缺失或 null 时返回 null.
+- 返回数组按 time 稳定升序排序, 相同时间保持上游顺序, 不去重或过滤.
+- 上游 comments 必须显式提供; 合法空数组返回空列表, 官方 `count:0, comments:null` 也视为空列表.
+  其他 null, 缺失数组或无效条目报错, 条目错误带原始索引, 不用默认值伪造成功.
+
+上游请求为 `GET https://api.dandanplay.net/api/v2/comment/{episode_id}?withRelated=true&chConvert=0`.
+包含关联弹幕, 不转换简繁体. 签名只计算不含 query 的 API 路径, 复用环境变量凭据.
+首次请求禁用自动重定向; 最多手动跟随 3 次 HTTPS 跳转, 不接受 URL 内嵌凭据,
+后续请求不发送 X-AppId, X-Timestamp, X-Signature 或 Referer.
+连接超时 5 秒, 下载和重定向整个链路最多 20 秒. 上游正文和单份本地缓存最多 32 MiB.
+
+缓存命中不要求配置认证. 缓存缺失或强制刷新且未配置时返回 `503`.
+上游 HTTP, 网络, 业务或解析错误返回 `502`, 超时返回 `504`.
+本地读取, 缓存格式或持久化失败返回 `500`; 不存在之外的读取错误不会静默转为上游请求.
+坏缓存可通过显式 Refresh 修复. 上游失败或新临时文件写入失败不替换旧缓存,
+刷新失败不回退旧内容并伪装成功; 前端可保留自己已显示的列表同时显示错误.
+
 ## 构建缓存
 
 默认创建只提交路径:
@@ -398,7 +455,7 @@ HTTP 请求取消不会中断已经开始的 stop 或 delete 清理.
 | 500    | 数据库, 全量扫描, 缓存或其他内部操作失败                    |
 | 502    | DandanPlay 网络, HTTP, 业务状态或响应协议错误               |
 | 503    | 尚未配置 DandanPlay 应用凭据                               |
-| 504    | DandanPlay 识别请求超时                                    |
+| 504    | DandanPlay 识别或弹幕下载请求超时                          |
 
 `GET /health` 返回 `{"status":"ok"}`, 不扫描或探测媒体.
 其他路径交给 `/app/web` 的静态文件服务.

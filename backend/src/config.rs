@@ -26,7 +26,7 @@ pub(crate) struct AppConfigManager {
     pub(crate) max_total_ffmpeg_threads: usize,
     /// 控制媒体进程产出首个结果的超时时间秒数.
     pub(crate) startup_timeout_seconds: u64,
-    /// 从环境变量读取的可选识别凭据, 不参与 JSON 配置读写.
+    /// 从环境变量读取的识别和弹幕凭据, 不参与 JSON 配置读写.
     #[serde(skip)]
     pub(crate) dandanplay: Option<DandanplayConfig>,
 }
@@ -56,7 +56,7 @@ impl AppConfigManager {
         Ok(config)
     }
 
-    /// 校验扫描周期, 并发, 线程, 超时及可选识别凭据.
+    /// 校验扫描周期, 并发, 线程, 超时及可选 DandanPlay 凭据.
     pub(crate) fn validate(&self) -> Result<()> {
         ensure!(self.scan_interval_seconds > 0, "scan_interval_seconds must be positive");
         ensure!(

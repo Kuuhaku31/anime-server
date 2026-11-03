@@ -78,6 +78,22 @@ export interface MediaIdentification extends MediaEpisode {
   matched: boolean;
 }
 
+/** 描述可直接显示的单条弹幕, 标识字符串不丢失大整数精度. */
+export interface DanmakuComment {
+  /** 应出现的有限非负播放秒数. */
+  time: number;
+  /** 原始弹幕模式编号. */
+  mode: number;
+  /** 24 位十进制 RGB 颜色值. */
+  color: number;
+  /** 上游发送者 ID. */
+  sender: string;
+  /** 原始 cid 的字符串表示, 缺失时为 null. */
+  comment_id: string | null;
+  /** 原始弹幕内容, 仅作为纯文本显示. */
+  content: string;
+}
+
 /** 描述播放器已获取元数据的媒体路径. */
 export type PlaybackMedia = [path: string, info: MediaInfo];
 

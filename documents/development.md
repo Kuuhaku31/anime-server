@@ -95,25 +95,33 @@ DANDAN_APP_SECRET=YOUR_APP_SECRET
 更新 `.env` 后使用 `docker compose up -d --build` 重新创建服务,
 仅执行 docker compose restart 不会更新容器已有的环境变量.
 
-两项均未设置或为空字符串时禁用自动识别, 只配置一项会明确拒绝启动.
+两项均未设置或为空字符串时无法访问识别和弹幕上游, 只配置一项会明确拒绝启动.
 非空参数必须是合法 UTF-8, DANDAN_APP_ID 必须能用作非空 HTTP 请求头,
 DANDAN_APP_SECRET 不能只有空白字符. 无效值不回显到错误或日志.
 凭据只保留在服务端内存, 不参与 JSON 配置的读取和序列化,
 `/api/config` 仍只返回主题偏好, 调试输出隐藏凭据.
 不要复用参考项目的应用密钥, 不要将真实密钥写入仓库或前端代码.
 未配置时仍可手动保存或清空 episode ID, 也不影响本地播放.
-只有用户点击 Identify 时才访问上游, 未配置时显示 `503` 诊断.
+Identify, 弹幕缓存未命中的 Load comments 和 Refresh comments 才访问上游,
+未配置时显示 `503` 诊断. 已有弹幕缓存可以在无凭据或离线状态下加载.
 
 使用 DandanPlay 官方 `POST /api/v2/match`, 模式为 hashAndFileName.
 签名为 `Base64(SHA256(DANDAN_APP_ID + Unix秒时间戳 + "/api/v2/match" + DANDAN_APP_SECRET))`.
 请求只包含文件名, 前 16 MiB MD5 和文件大小, videoDuration 为 0,
 不上传完整路径或文件内容. 服务时钟需准确, 并能访问官方 HTTPS API.
-客户端使用系统信任的 CA 根证书, 禁止跟随重定向,
+客户端使用系统信任的 CA 根证书, 文件识别禁止跟随重定向,
 连接超时 5 秒, 总请求超时 20 秒, 响应正文最多 1 MiB.
 Identify 可重复点击, 唯一精确匹配覆盖已有 ID, 不再提供模糊候选选择.
 无唯一匹配保留原 ID, 不会自动采用首个搜索结果, 响应 matched 为 false.
 外部失败明确上报为 `502` 或 `504`, 保留原 ID, 不伪装为没有匹配.
-本轮不下载番剧详情或弹幕, `/data/ddp-ani` 与 `/data/ddp-danmaku` 仍为预留目录.
+`/data/ddp-ani` 仍为番剧详情预留目录, `/data/ddp-danmaku/<episode_id>.json` 保存原始弹幕 JSON.
+弹幕调用官方 `GET /api/v2/comment/{episode_id}?withRelated=true&chConvert=0`,
+包含关联弹幕且不转换简繁体, 签名路径不包含 query.
+官方接口可能返回 CDN Location, 最多手动跟随 3 次 HTTPS 跳转且不转发应用认证头或 Referer,
+因此运行环境还需允许访问该 HTTPS 加速服务.
+连接超时 5 秒, 下载与重定向链合计最多 20 秒, 正文与本地缓存上限均为 32 MiB.
+缓存不自动过期; 损坏时 Load 明确报错, 使用 Refresh 获取有效数据后原子替换.
+失败不会返回旧缓存伪装成功, 也不影响已有媒体关联和播放.
 
 ### 媒体进程预算
 
@@ -189,6 +197,37 @@ tests/fixtures/runtime.rs 提供隔离临时目录和合成媒体.
 构建和资源读取分离, 本地 Stop 不停止转码, 删除当前句柄后卸载播放器,
 无源缓存禁止播放, 过期响应不能复活已删除的 Map 条目.
 后端额外覆盖按 handle_id 查询, 稳定源路径选择, 停止保留前缀和 worker 占用归零.
+
+### 弹幕隔离验证
+
+使用独立 DATA_DIR 和 CACHE_DIR, 只使用合成凭据和本地 HTTPS 响应夹具,
+不要把真实密钥写进脚本, 日志或浏览器. 本地签名夹具需校验
+GET 路径, withRelated=true, chConvert=0 以及不含 query 的签名,
+CDN 跳转目标应确认没有收到 X-AppId, X-Timestamp, X-Signature 或 Referer.
+本地 CA 只通过验证进程的信任环境配置注入, 不改动宿主机系统证书.
+
+请求示例:
+
+```bash
+curl --fail http://127.0.0.1:56081/api/danmaku \
+  -H 'Content-Type: application/json' \
+  -d '{"episode_id":1234567,"refresh":false}'
+curl --fail http://127.0.0.1:56081/api/danmaku \
+  -H 'Content-Type: application/json' \
+  -d '{"episode_id":1234567,"refresh":true}'
+```
+
+核对首次下载原始字节落盘, 重复 Load 不访问上游, 并发未命中只下载一次,
+Refresh 成功替换而失败保留原文件. 无凭据时已有缓存仍可读取,
+缓存缺失或 Refresh 返回 503. 覆盖合法空列表, 缺失字段, 无效 p/cid,
+大整数 cid 精度, 非法 episode ID, 32 MiB 超限, 超时和重定向边界.
+缓存读取失败或格式损坏返回 500, 无效上游返回 502, 超时返回 504, 不伪造空列表.
+
+浏览器验证普通 Load 与 Refresh 标志, 播放和前后 seek 定位,
+同时间组选择最后一条, 首条之前回到顶部, 长文本及次要字段完整换行.
+切换媒体或修改/清空 ID 后旧请求不能覆盖新状态, 不自动加载.
+刷新失败保留已显示列表, 原生及页内全屏隐藏列表且退出后恢复定位.
+使用合成媒体和独立浏览器上下文, 验证结束停止服务并清理夹具.
 
 ## Docker 验证
 
@@ -283,3 +322,7 @@ docker rm anime-server-verify
 | 识别返回 502 或 504 | 核对应用授权, 系统时钟, HTTPS 网络和服务端日志       |
 | 识别没有精确结果    | 原 ID 保持不变, 可重新识别或手动输入 ID, 不需要修改播放缓存 |
 | 识别返回 409        | 文件在请求期间已更换或消失, 刷新媒体列表后重试         |
+| 弹幕按钮不可用      | 先播放已有缓存, 为当前媒体保存或识别有效 episode ID   |
+| 弹幕 Load 返回 500  | 检查 DATA_DIR 权限和缓存格式, 坏缓存可用 Refresh 修复  |
+| 弹幕下载返回 503    | 缓存未命中或要求刷新, 需要配置 DandanPlay 应用凭据     |
+| 弹幕下载 502 / 504  | 检查官方 API 和 CDN 的 HTTPS 访问, 时钟和上游响应      |

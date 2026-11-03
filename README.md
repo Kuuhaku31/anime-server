@@ -2,7 +2,7 @@
 
 本地视频 Web 服务, 使用单个 Docker 容器部署. Rust/Axum 提供媒体接口,
 SQLite 保存播放配置和 DandanPlay 剧集关联, FFmpeg 生成可共享和恢复的 HLS 缓存,
-TypeScript/HLS.js 提供常驻播放器和右侧文件及缓存任务列表.
+TypeScript/HLS.js 提供常驻播放器, 时间同步弹幕列表和右侧文件及缓存任务列表.
 
 ## 挂载与端口
 
@@ -10,7 +10,7 @@ TypeScript/HLS.js 提供常驻播放器和右侧文件及缓存任务列表.
 | ---------- | ---------- | ----------------------------------- |
 | 配置目录   | `/config/` | 只读, 保存 `config.json`            |
 | 视频目录   | `/media/`  | 只读, 保存媒体文件                  |
-| 数据目录   | `/data/`   | 读写, 保存数据库和 API 缓存预留目录 |
+| 数据目录   | `/data/`   | 读写, 保存数据库和弹幕 API 缓存     |
 | 缓存目录   | `/cache/`  | 读写, 保存播放缓存和任务临时文件    |
 
 容器固定监听 `8080`, 宿主机通过根目录 `.env` 设置映射:
@@ -28,6 +28,7 @@ CACHE_DIR=/srv/anime-server/cache
 |-- main.db
 |-- ddp-ani/
 `-- ddp-danmaku/
+    `-- <episode_id>.json    # DandanPlay 原始弹幕 JSON
 
 /cache/
 `-- playback/
@@ -42,8 +43,9 @@ CACHE_DIR=/srv/anime-server/cache
 
 `instance.json` 只包含媒体内容标识, 三类流索引和编码版本.
 字幕与字体临时文件位于任务自己的 `.work-<random_id>/` 内, 任务结束时清理.
-`ddp-ani/` 和 `ddp-danmaku/` 仍为 API 缓存预留目录.
-文件识别结果中的 episode ID 保存到 main.db, 本轮不包含番剧缓存, 弹幕下载或渲染.
+`ddp-ani/` 仍为番剧 API 缓存预留目录, `ddp-danmaku/` 按剧集保存原始弹幕 JSON.
+文件识别的 episode ID 保存到 main.db, 弹幕内容不进入数据库.
+弹幕仅在播放器下方以时间同步列表显示, 不增加视频画面弹幕层.
 如需复用原数据目录内的播放缓存, 将 `CACHE_DIR` 指向宿主机 `${DATA_DIR}/cache` 对应的绝对路径.
 
 ## 代码与文档
@@ -52,8 +54,9 @@ CACHE_DIR=/srv/anime-server/cache
 backend/src/
 |-- main.rs, services.rs      # 启动与 OnceLock 全局实例
 |-- config.rs                 # JSON 运行配置与环境认证参数
-|-- api.rs                    # 媒体接口, 剧集关联与缓存资源读取
-|-- dandanplay.rs             # 开放 API 签名与文件识别
+|-- api.rs                    # 媒体接口, 剧集关联, 弹幕与缓存资源
+|-- dandanplay.rs             # 开放 API 签名, 文件识别与弹幕下载
+|-- danmaku.rs                # 原始弹幕文件缓存与规范化响应
 |-- db.rs                     # 唯一数据库连接池与事务仓储
 |-- scanner.rs                # 媒体目录和单路径扫描
 |-- cache.rs, cache/handle.rs # 全量句柄表与六状态生命周期
@@ -64,7 +67,7 @@ frontend/src/
 |-- api/                      # 同源 HTTP 客户端
 |-- state/                    # 共享数据契约和 handle_id 缓存 Map
 |-- playback/                 # 本地等待目标与 HLS 引擎
-`-- ui/                       # 控件, 媒体列表和缓存任务列表
+`-- ui/                       # 控件, 媒体列表, 缓存任务和弹幕列表
 ```
 
 - [核心架构](documents/architecture.md)
@@ -200,8 +203,46 @@ Docker Compose 将这两项传入容器环境, 后端启动时读取, 不直接�
 不会收到媒体完整路径或视频内容.
 签名和匹配协议参考 [NipaPlay-Reload](https://github.com/AimesSoft/NipaPlay-Reload)
 与 [anime-tool](https://github.com/Kuuhaku31/anime-tool), 不复用其应用凭据.
-当前只提供文件识别和 episode ID 关联, 不下载或显示弹幕.
+识别和弹幕加载相互独立, 保存或识别 ID 不自动下载弹幕.
 
+5. 弹幕加载
+
+播放器下方显示当前媒体的 DandanPlay episode ID, Load comments 和 Refresh comments,
+以及独立滚动的弹幕列表. 切换媒体或修改其 ID 会清空旧列表并取消旧请求, 不自动加载.
+
+缓存结构:
+
+```text
+/data/
+`-- ddp-danmaku/
+    `-- <episode_id>.json
+```
+
+前端向 `POST /api/danmaku` 发送:
+
+```json
+{ "episode_id": 1234567, "refresh": false }
+```
+
+Load comments 优先读取已有缓存, 缺失时访问 DandanPlay; Refresh comments 发送
+`refresh:true`, 始终跳过缓存检查. 同剧集请求串行化, 并发缓存未命中不会重复下载.
+上游使用 `GET /api/v2/comment/{episode_id}?withRelated=true&chConvert=0`,
+复用环境变量中的应用凭据, 包含关联弹幕且不转换简繁体.
+缓存命中不需要凭据, 需要下载但未配置凭据时明确返回 `503`.
+
+后端校验新结果后原子保存原始 JSON, 直接返回按时间稳定排序的弹幕 JSON 数组,
+不包含 `episode_id`, `comments` 或 `cached` 包装字段, 空列表返回 `[]`.
+每条包含 time, content, mode, color, sender 和字符串 comment_id.
+缓存损坏时明确报错, 可用 Refresh comments 修复, 不静默返回空列表.
+上游失败不替换旧缓存, 前端刷新失败也保留已显示列表并显示错误.
+弹幕缓存不自动过期或清理, 单份原始 JSON 上限为 32 MiB.
+
+表项以左侧完整内容为主, 右侧显示时间, 模式, 颜色, sender 和 cid 位于次要信息行.
+列表高亮并滚动到最近一条 `time <= 当前播放位置` 的弹幕,
+同时间定位最后一条, seek 前后跳转立即重新定位, 首条之前取消高亮并回到顶部.
+原生全屏和页内全屏隐藏弹幕列表, 退出后恢复当前位置.
+本轮不实现视频画面弹幕层, 过滤, 发送或用户登录.
+完整请求, 响应和错误语义见 [HTTP API](documents/api.md#弹幕加载).
 
 ### 前端的构建请求 `PlaybackQuery`
 

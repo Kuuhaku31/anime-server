@@ -1,6 +1,6 @@
 
 /* frontend/style.css */
-/* 定义简洁播放器和紧凑可展开双列表的主题. */
+/* 定义播放器, 时间同步弹幕和紧凑可展开双列表的主题. */
 * {
   box-sizing: border-box;
 }
@@ -395,6 +395,126 @@ main {
   flex-direction: column;
   overflow: hidden;
 }
+/* 弹幕占用左栏有限高度, 只滚动自身, 不挤压视频和右侧两个列表. */
+.danmaku-panel {
+  display: flex;
+  flex-direction: column;
+  flex: 0 1 32%;
+  min-height: 110px;
+  max-height: 320px;
+  min-width: 0;
+  overflow: hidden;
+  border-top: 1px solid var(--border);
+}
+.danmaku-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  flex-shrink: 0;
+  gap: 6px 12px;
+  padding: 10px 14px 4px;
+}
+.danmaku-heading > div {
+  min-width: 0;
+}
+.danmaku-heading h2 {
+  margin-bottom: 3px;
+  font-size: 15px;
+}
+#danmaku-episode {
+  font-size: 11px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.danmaku-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.danmaku-actions button {
+  padding: 6px 9px;
+  font-size: 11px;
+}
+.danmaku-status,
+.danmaku-error {
+  flex-shrink: 0;
+  padding: 3px 14px 6px;
+  font-size: 11px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.danmaku-error {
+  max-height: 48px;
+  overflow: auto;
+  color: #e75f6d;
+}
+.danmaku-error:empty {
+  display: none;
+}
+.danmaku-list {
+  flex: 1;
+  min-height: 0;
+  margin: 0;
+  padding: 0 8px 8px;
+  list-style: none;
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-color: var(--border) transparent;
+}
+.danmaku-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 4px 12px;
+  min-width: 0;
+  padding: 9px;
+  border: 1px solid transparent;
+  border-bottom-color: var(--border);
+  border-radius: 6px;
+}
+.danmaku-row.current {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+.danmaku-content {
+  min-width: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.danmaku-time {
+  padding-top: 2px;
+  text-align: right;
+  white-space: nowrap;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+}
+.danmaku-details {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px 12px;
+  font-size: 10px;
+  line-height: 1.4;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.danmaku-details > span {
+  min-width: 0;
+}
+.danmaku-color {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.danmaku-swatch {
+  width: 10px;
+  height: 10px;
+  border: 1px solid var(--muted);
+  border-radius: 2px;
+}
 .video-frame {
   flex: 1;
   min-height: 140px;
@@ -587,7 +707,7 @@ video {
   --range-buffer: rgb(255 255 255 / 45%);
   --range-track: rgb(255 255 255 / 20%);
 }
-.player-panel:is(:fullscreen, .expanded) :is(.section-heading, #meta, #stop, #restart),
+.player-panel:is(:fullscreen, .expanded) :is(.section-heading, #meta, #stop, #restart, .danmaku-panel),
 .player-panel:is(:fullscreen, .expanded) .playback-feedback {
   display: none;
 }
@@ -650,6 +770,7 @@ button:focus-visible,
 select:focus-visible,
 input:focus-visible,
 .player-panel:focus-visible,
+.danmaku-list:focus-visible,
 summary:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
@@ -866,8 +987,12 @@ summary:focus-visible {
     z-index: 5;
     height: auto;
   }
+  .danmaku-panel {
+    flex: 0 0 170px;
+    max-height: 28vh;
+  }
   .video-stage {
-    height: min(32vh, 360px);
+    height: clamp(140px, 18vh, 240px);
   }
   .player-panel:fullscreen .video-stage,
   .player-panel.expanded .video-stage {
