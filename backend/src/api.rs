@@ -14,7 +14,7 @@ use serde_json::json;
 use tower_http::services::ServeFile;
 
 use crate::{
-    cache::CacheSnapshot, constants::CACHE_VERSION, dandanplay::{self, DanmakuError}, db::DatabaseManager, models::{
+    cache::CacheSnapshot, config::DanmakuSettings, constants::CACHE_VERSION, dandanplay::{self, DanmakuError}, db::DatabaseManager, models::{
         CacheSpec,
         MediaConfigs,
         MediaMetadata,
@@ -56,6 +56,8 @@ struct LoadDanmakuRequest {
 
 // 各项 JSON 响应类型
 type GetConfigResponse = Json<ConfigResponseBody>;
+/// 返回已原子保存并生效的完整弹幕设置.
+type SaveDanmakuSettingsResponse = Json<DanmakuSettings>;
 type ListMediaResponse = Json<Vec<ListMediaResponseItem>>;
 type MediaMetadataResponse = Json<MediaMetadataResponseBody>;
 type ScanMediaResponse = Json<ScanChanges>;
@@ -79,6 +81,8 @@ type PlaybackAssetResponse = Response;
 struct ConfigResponseBody {
     /// 网页是否默认启用深色模式.
     default_dark_mode: bool,
+    /// 服务端当前保存的画面弹幕设置.
+    danmaku: DanmakuSettings,
 }
 
 /// 描述媒体列表中数据库登记的单个路径及共享配置.
@@ -146,6 +150,7 @@ struct CacheListResponseBody {
 pub(crate) fn router() -> Router {
     Router::new()
     .route("/api/config", get(get_config))
+    .route("/api/config/danmaku", put(save_danmaku_settings))
 
     .route("/api/media", get(list_media))
     .route("/api/media/{file_id}/metadata", get(media_metadata))
@@ -165,9 +170,25 @@ pub(crate) fn router() -> Router {
     .route("/playback/{handle_id}/{asset_name}", get(playback_asset))
 }
 
-/// 提供前端初始化所需的公开配置
+/// 提供前端初始化所需的主题和当前已保存弹幕设置.
 async fn get_config() -> GetConfigResponse {
-    Json(ConfigResponseBody { default_dark_mode: services::config().default_dark_mode })
+    Json(ConfigResponseBody {
+        default_dark_mode: services::config().default_dark_mode,
+        danmaku: services::web_config().danmaku().await,
+    })
+}
+
+/// 完整校验并保存弹幕设置, 其他启动配置不参与热更新.
+async fn save_danmaku_settings(input: Result<Json<DanmakuSettings>, JsonRejection>)
+-> Result<SaveDanmakuSettingsResponse, ApiError>
+{
+    let Json(settings) = input.map_err(ApiError::bad)?;
+    settings.validate().map_err(ApiError::bad)?;
+    // 客户端断开后仍完成磁盘发布和内存提交, 避免半途取消导致两者不一致.
+    let saved = tokio::spawn(async move {
+        services::web_config().save_danmaku(settings, services::config()).await
+    }).await.map_err(ApiError::internal)?.map_err(ApiError::internal)?;
+    Ok(Json(saved))
 }
 
 /// 只读取数据库中的路径, 播放配置和剧集 ID.

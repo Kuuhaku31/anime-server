@@ -94,6 +94,30 @@ export interface DanmakuComment {
   content: string;
 }
 
+/** 描述服务端持久化的完整画面弹幕设置. */
+export interface DanmakuSettings {
+  /** 是否在视频画面显示已加载弹幕. */
+  enabled: boolean;
+  /** 使用 CSS 像素表示的字号. */
+  font_size: number;
+  /** 文字边缘描边宽度, 0 表示关闭. */
+  outline_width: number;
+  /** 填充和描边共用的不透明度. */
+  opacity: number;
+  /** 滚动弹幕从顶部向下可使用的画面百分比. */
+  display_area_percent: number;
+  /** 加到视频时间的秒数, 正值让弹幕提前出现. */
+  time_offset_seconds: number;
+}
+
+/** 描述浏览器可读取的公开配置, 不包含服务端凭据或进程预算. */
+export interface WebConfig {
+  /** 默认页面主题是否为深色. */
+  default_dark_mode: boolean;
+  /** 最近一次成功保存的弹幕设置. */
+  danmaku: DanmakuSettings;
+}
+
 /** 描述播放器已获取元数据的媒体路径. */
 export type PlaybackMedia = [path: string, info: MediaInfo];
 

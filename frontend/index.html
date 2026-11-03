@@ -1,12 +1,12 @@
 
 <!-- frontend/index.html -->
-<!-- 定义简洁播放器, 时间同步弹幕和可展开的媒体及缓存列表. -->
+<!-- 定义带画面弹幕和设置的播放器, 时间列表及可展开媒体和缓存列表. -->
 <!doctype html>
 <html lang="en">
 
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <title>Anime Server</title>
 </head>
 
@@ -32,6 +32,7 @@
       <div class="video-frame">
         <div class="video-stage">
           <video id="player" playsinline preload="metadata" disablepictureinpicture disableremoteplayback></video>
+          <canvas id="danmaku-canvas" class="danmaku-canvas" width="0" height="0" aria-hidden="true"></canvas>
         </div>
       </div>
       <div class="player-controls">
@@ -50,6 +51,12 @@
             <output id="clock">0:00 / 0:00</output>
           </div>
           <div class="control-group">
+            <button id="danmaku-toggle" class="icon-button" type="button" aria-label="Show on-screen comments" aria-pressed="false" title="Show on-screen comments" disabled>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v12H9l-5 4ZM7 8h10M7 12h6" /></svg>
+            </button>
+            <button id="danmaku-settings-toggle" class="icon-button" type="button" aria-label="Comment settings" aria-expanded="false" aria-controls="danmaku-settings" title="Comment settings">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h7M15 7h5M4 17h3M11 17h9" /><circle cx="13" cy="7" r="2" /><circle cx="9" cy="17" r="2" /></svg>
+            </button>
             <button id="mute" class="icon-button" type="button" aria-label="Mute" aria-pressed="false" title="Mute (M)">
               <svg class="icon-volume" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9h4l5-4v14l-5-4H4ZM17 8a6 6 0 0 1 0 8M20 5a10 10 0 0 1 0 14" /></svg>
               <svg class="icon-muted" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9h4l5-4v14l-5-4H4ZM17 9l5 6M22 9l-5 6" /></svg>
@@ -63,7 +70,32 @@
             </button>
           </div>
         </div>
+        <p id="danmaku-render-error" role="alert"></p>
       </div>
+      <!-- 设置留在播放器元素内, 原生元素全屏和页内全屏都可访问. -->
+      <form id="danmaku-settings" class="danmaku-settings" aria-label="On-screen comment settings" novalidate hidden>
+        <div class="danmaku-settings-heading">
+          <h2>On-screen comments</h2>
+          <button id="danmaku-settings-close" type="button" aria-label="Close comment settings">Close</button>
+        </div>
+        <fieldset id="danmaku-settings-fields" disabled>
+          <label class="danmaku-enabled"><input id="danmaku-enabled" type="checkbox" /> Show on-screen comments</label>
+          <div class="danmaku-setting-grid">
+            <label>Font size (px)<input id="danmaku-font-size" type="number" min="12" max="72" step="any" inputmode="decimal" required /></label>
+            <label>Outline (px)<input id="danmaku-outline" type="number" min="0" max="6" step="any" inputmode="decimal" required /></label>
+            <label>Opacity (0.1-1)<input id="danmaku-opacity" type="number" min="0.1" max="1" step="any" inputmode="decimal" required /></label>
+            <label>Scrolling area (%)<input id="danmaku-area" type="number" min="10" max="100" step="any" inputmode="decimal" required /></label>
+            <label>Time offset (s)<input id="danmaku-offset" type="number" min="-120" max="120" step="any" required /></label>
+          </div>
+          <p class="danmaku-settings-hint">Positive offset shows comments earlier. The area limit only affects scrolling comments. Busy lanes may be reused.</p>
+          <div class="danmaku-settings-actions">
+            <button id="danmaku-apply" type="submit">Apply</button>
+            <button id="danmaku-save" class="primary-button" type="button">Save</button>
+          </div>
+        </fieldset>
+        <p id="danmaku-settings-status" role="status">Loading saved settings...</p>
+        <p id="danmaku-settings-error" role="alert"></p>
+      </form>
       <div class="playback-feedback">
         <span id="playback-status" role="status">Select a video from the library</span>
         <div id="error" role="alert"></div>

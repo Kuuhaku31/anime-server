@@ -1,6 +1,6 @@
 
 // frontend/src/ui/danmaku-panel.ts
-// 手动加载弹幕并按当前播放时间高亮和滚动, 不在视频画面绘制弹幕.
+// 手动加载弹幕并同步时间列表, 为画面渲染器发布同一份只读数组.
 
 import { loadDanmaku } from "../api/anime-server.ts";
 import { formatTime } from "../playback/timeline.ts";
@@ -8,9 +8,10 @@ import type { DanmakuComment } from "../state/player-state.ts";
 import { element } from "./controls.ts";
 
 /** 管理当前媒体的弹幕请求和列表, 不修改播放控制器或缓存任务. */
-export class DanmakuPanel {
+export class DanmakuPanel extends EventTarget {
   /** 绑定手动加载与刷新, 页面隐藏时释放在途请求和布局观察. */
   constructor() {
+    super();
     this.loadButton.onclick = () => { void this.load(false); };
     this.refreshButton.onclick = () => { void this.load(true); };
     this.resizeObserver = new ResizeObserver(() => this.followPosition(true));
@@ -28,6 +29,9 @@ export class DanmakuPanel {
     this.renderStatus();
   }
 
+  /** 暴露最近一次成功加载的原始数组, null 表示当前媒体尚未加载. */
+  get data(): readonly DanmakuComment[] | null { return this.comments; }
+
   /** 同步媒体关联和播放位置, 切换媒体或关联时清空旧列表且不自动加载. */
   sync(path: string | null, episodeId: number | null, position: number): void {
     this.position = position;
@@ -37,6 +41,7 @@ export class DanmakuPanel {
       this.path = path;
       this.episodeId = episodeId;
       this.comments = null;
+      this.dispatchEvent(new Event("change"));
       this.rows = [];
       this.active = -1;
       this.error = "";
@@ -99,6 +104,7 @@ export class DanmakuPanel {
       for (const row of rows) fragment.append(row);
       this.list.replaceChildren(fragment);
       this.comments = comments;
+      this.dispatchEvent(new Event("change"));
       this.rows = rows;
       this.active = -1;
       this.followPosition(true);

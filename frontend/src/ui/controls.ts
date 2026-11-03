@@ -85,6 +85,17 @@ export function attachControls(controller: PlaybackController, video: HTMLVideoE
     void toggleFullscreen().catch((error) => controller.fail(error));
   };
   document.addEventListener("fullscreenchange", syncFullscreen);
+  panel.addEventListener("danmaku-settings-change", revealControls);
+  window.addEventListener("resize", syncViewport);
+  window.addEventListener("orientationchange", syncViewport);
+  window.visualViewport?.addEventListener("resize", syncViewport);
+  window.visualViewport?.addEventListener("scroll", syncViewport);
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) return;
+    cancelClick();
+    panel.classList.remove("expanded");
+    syncFullscreen();
+  });
   panel.addEventListener("pointermove", revealControls);
   panel.addEventListener("pointerdown", revealControls);
   panel.addEventListener("focusin", revealControls);
@@ -152,7 +163,7 @@ export function attachControls(controller: PlaybackController, video: HTMLVideoE
     try {
       if (document.fullscreenElement === panel) await document.exitFullscreen();
       else if (panel.classList.contains("expanded")) panel.classList.remove("expanded");
-      else if (panel.requestFullscreen) {
+      else if (!isAppleMobile() && panel.requestFullscreen) {
         try { await panel.requestFullscreen(); }
         catch (error) {
           console.info("Using in-page fullscreen because the Fullscreen API was rejected", error);
@@ -175,16 +186,34 @@ export function attachControls(controller: PlaybackController, video: HTMLVideoE
     fullscreen.title = `${fullscreenLabel.textContent} (F)`;
     document.body.classList.toggle("player-expanded", panel.classList.contains("expanded"));
     panel.classList.toggle("fullscreen-error", active && !!controller.error);
+    syncViewport();
     hovering = controls.matches(":hover");
     revealControls();
+  }
+
+  /** 页内全屏跟随移动端可见视口, 地址栏或软键盘变化不遮住退出入口. */
+  function syncViewport(): void {
+    if (!panel.classList.contains("expanded")) return;
+    const viewport = window.visualViewport;
+    panel.style.setProperty("--player-viewport-width", `${viewport?.width ?? window.innerWidth}px`);
+    panel.style.setProperty("--player-viewport-height", `${viewport?.height ?? window.innerHeight}px`);
+    panel.style.setProperty("--player-viewport-left", `${viewport?.offsetLeft ?? 0}px`);
+    panel.style.setProperty("--player-viewport-top", `${viewport?.offsetTop ?? 0}px`);
   }
 
   /** 用户仍在操作或播放需要处理时保持控件可见. */
   function canHide(): boolean {
     const focus = document.activeElement;
-    return activePage && isFullscreen() && !video.paused && !video.ended
+    return activePage && !document.hidden && isFullscreen() && !video.paused && !video.ended
       && !controller.pending && !controller.error && !scrubbing && !hovering
+      && !panel.classList.contains("danmaku-settings-open")
       && !(focus && controls.contains(focus) && focus.matches(":focus-visible"));
+  }
+
+  /** iPad 桌面 UA 也必须留在网页层, 不进入无法覆盖 Canvas 的系统视频全屏. */
+  function isAppleMobile(): boolean {
+    return typeof navigator !== "undefined" && (/iPad|iPhone|iPod/i.test(navigator.userAgent)
+      || navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
   }
 
   /** 取消旧倒计时, 避免退出全屏后残留隐藏动作. */

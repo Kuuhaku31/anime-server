@@ -7,12 +7,14 @@ use std::{path::Path, sync::OnceLock};
 use anyhow::{anyhow, Result};
 
 use crate::{
-    cache::CacheManager, config::AppConfigManager, constants,
+    cache::CacheManager, config::{AppConfigManager, WebConfigManager}, constants,
     db::DatabaseManager, process::ProcessManager, scanner::ScannerManager,
 };
 
 /// 全局应用配置实例.
 static CONFIG: OnceLock<AppConfigManager> = OnceLock::new();
+/// 可运行时读取和持久化的 Web 配置实例.
+static WEB_CONFIG: OnceLock<WebConfigManager> = OnceLock::new();
 /// 全局数据库实例.
 static DATABASE: OnceLock<DatabaseManager> = OnceLock::new();
 /// 全局媒体扫描实例.
@@ -25,6 +27,7 @@ static PROCESS: OnceLock<ProcessManager> = OnceLock::new();
 /// 初始化全部管理器, 管理器自身不读取全局 getter 或保存彼此.
 pub(crate) async fn initialize(config_path: &Path) -> Result<()> {
     let config = register(&CONFIG, AppConfigManager::load(config_path)?, "config")?;
+    register(&WEB_CONFIG, WebConfigManager::new(config_path, config)?, "web config")?;
     for directory in [constants::DATA_DIR, constants::DDP_ANI_CACHE_DIR, constants::DDP_DANMAKU_CACHE_DIR] {
         tokio::fs::create_dir_all(directory).await?;
     }
@@ -39,6 +42,11 @@ pub(crate) async fn initialize(config_path: &Path) -> Result<()> {
 /// 返回唯一应用配置实例.
 pub(crate) fn config() -> &'static AppConfigManager {
     CONFIG.get().expect("application config is not initialized")
+}
+
+/// 返回独立于启动期预算的 Web 配置实例.
+pub(crate) fn web_config() -> &'static WebConfigManager {
+    WEB_CONFIG.get().expect("web config manager is not initialized")
 }
 
 /// 返回唯一数据库实例.

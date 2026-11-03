@@ -3,8 +3,8 @@
 // 封装媒体配置, 剧集识别, 弹幕加载, 缓存管理和稳定句柄资源地址.
 
 import type {
-  CacheBuild, CacheEntry, CacheList, DanmakuComment, MediaConfigs, MediaEntry, MediaEpisode, MediaIdentification,
-  MediaInfo, PlaybackQuery, ScanChanges,
+  CacheBuild, CacheEntry, CacheList, DanmakuComment, DanmakuSettings, MediaConfigs, MediaEntry, MediaEpisode, MediaIdentification,
+  MediaInfo, PlaybackQuery, ScanChanges, WebConfig,
 } from "../state/player-state.ts";
 
 /** 保留服务端返回的 HTTP 状态和错误正文. */
@@ -35,6 +35,16 @@ export function jsonRequest<T>(url: string, body: unknown, method = "POST", sign
   return request<T>(url, {
     method, signal, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
   });
+}
+
+/** 读取主题和当前已保存的画面弹幕设置. */
+export function getConfig(): Promise<WebConfig> {
+  return request("/api/config");
+}
+
+/** 完整替换服务端弹幕设置, 成功响应表示配置已经写入磁盘. */
+export function saveDanmakuSettings(settings: DanmakuSettings): Promise<DanmakuSettings> {
+  return jsonRequest("/api/config/danmaku", settings, "PUT");
 }
 
 /** 获取数据库中的媒体路径和共享配置, 不触发媒体探测. */

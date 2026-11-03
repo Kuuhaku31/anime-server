@@ -14,6 +14,7 @@
 | 方法   | 路径                                 | 作用                              |
 | ------ | ------------------------------------ | --------------------------------- |
 | GET    | `/api/config`                        | 读取配置                          |
+| PUT    | `/api/config/danmaku`                | 完整保存画面弹幕设置             |
 | GET    | `/api/media`                         | 获取媒体 ID, 路径, 播放配置和剧集 ID |
 | GET    | `/api/media/{file_id}/metadata`      | 探测单个媒体的实时 metadata       |
 | PUT    | `/api/media/{file_id}/episode`       | 单独保存或清空共享剧集 ID         |
@@ -154,7 +155,56 @@ position 必须为 null 或有限非负秒数, 流索引必须为 null 或非负
 配置共享于同内容的所有路径, 不随缓存停止或删除而删除.
 此接口不修改 episode_id, 不能通过 configs 对象保存剧集关联.
 
-`GET /api/config` 返回 `{"default_dark_mode":true}`, 不公开完整运行配置或 DandanPlay 凭据.
+## 画面弹幕配置
+
+`GET /api/config` 返回当前服务端公开配置, 不包含进程预算, 内部路径或 DandanPlay 凭据:
+
+```json
+{
+  "default_dark_mode": true,
+  "danmaku": {
+    "enabled": true,
+    "font_size": 28,
+    "outline_width": 1.5,
+    "opacity": 0.9,
+    "display_area_percent": 75,
+    "time_offset_seconds": 0
+  }
+}
+```
+
+`PUT /api/config/danmaku` 的请求和成功 `200` 响应都是完整设置对象, 不带 danmaku 包装:
+
+```json
+{
+  "enabled": true,
+  "font_size": 28,
+  "outline_width": 1.5,
+  "opacity": 0.9,
+  "display_area_percent": 75,
+  "time_offset_seconds": 0
+}
+```
+
+| 字段 | 约束与语义 |
+| --- | --- |
+| enabled | boolean, 控制画面弹幕, 不隐藏下方列表 |
+| font_size | 12..72 CSS px, 允许小数 |
+| outline_width | 0..6 CSS px, 0 关闭描边 |
+| opacity | 0.1..1, 同时作用于文字和描边 |
+| display_area_percent | 10..100, 仅限制滚动区域, 至少一行 |
+| time_offset_seconds | -120..120 秒, 正值使弹幕提前出现 |
+
+所有字段必填, 不接受未知字段, null, 字符串数字或非有限值.
+格式和边界错误返回 `400`. 这是完整替换, 不是 PATCH.
+后端串行化保存, 原子写入完整 config.json 后才发布运行时弹幕值.
+并发保存以最后一个成功请求为准. 客户端断开不会中断已经开始的磁盘和内存提交.
+I/O 失败返回 `500`, 保留原运行时值, 不用旧值伪装保存成功.
+`/config` 和 config.json 必须对容器运行用户可写, 单独只读挂载文件无法原子替换.
+其他启动配置保留启动时的值, 不通过此接口修改或热更新.
+
+前端 Apply 不发送请求, Save 调用此接口并应用响应. 刷新页面重新读取已保存值,
+其他已打开页面不自动更新. 弹幕下载 API, 原始缓存和媒体剧集关联不受设置变更影响.
 
 ## 剧集 ID 与文件识别
 

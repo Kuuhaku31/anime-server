@@ -12,7 +12,7 @@ services:
       DANDAN_APP_ID: "${DANDAN_APP_ID:-}"
       DANDAN_APP_SECRET: "${DANDAN_APP_SECRET:-}"
     volumes:
-      - "${CONFIG_DIR}:/config:ro"
+      - "${CONFIG_DIR}:/config"
       - "${MEDIA_DIR}:/media:ro"
       - "${DATA_DIR}:/data"
       - "${CACHE_DIR:?Set CACHE_DIR to an absolute cache directory}:/cache"

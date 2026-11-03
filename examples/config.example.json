@@ -4,5 +4,13 @@
   "max_processes": 2,
   "ffmpeg_threads": 2,
   "max_total_ffmpeg_threads": 16,
-  "startup_timeout_seconds": 90
+  "startup_timeout_seconds": 90,
+  "danmaku": {
+    "enabled": true,
+    "font_size": 28,
+    "outline_width": 1.5,
+    "opacity": 0.9,
+    "display_area_percent": 75,
+    "time_offset_seconds": 0
+  }
 }

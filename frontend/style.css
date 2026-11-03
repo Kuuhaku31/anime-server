@@ -1,6 +1,6 @@
 
 /* frontend/style.css */
-/* 定义播放器, 时间同步弹幕和紧凑可展开双列表的主题. */
+/* 定义播放器, Canvas 弹幕设置, 移动全屏和紧凑可展开双列表的主题. */
 * {
   box-sizing: border-box;
 }
@@ -539,6 +539,113 @@ video {
   min-height: 0;
   overflow: hidden;
 }
+/* 覆盖层只绘制真实视频内容, 不拦截播放手势或暴露重复的无障碍文本. */
+.danmaku-canvas {
+  position: absolute;
+  z-index: 1;
+  pointer-events: none;
+}
+.danmaku-settings {
+  position: absolute;
+  z-index: 3;
+  top: max(12px, env(safe-area-inset-top));
+  right: max(14px, env(safe-area-inset-right));
+  width: 360px;
+  max-width: calc(100% - 28px - env(safe-area-inset-right) - env(safe-area-inset-left));
+  max-height: calc(100% - 24px - env(safe-area-inset-top) - env(safe-area-inset-bottom));
+  overflow: auto;
+  overscroll-behavior: contain;
+  scroll-padding-top: 64px;
+  padding: 16px;
+  color: var(--foreground);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 12px 40px rgb(0 0 0 / 35%);
+  font-size: 12px;
+}
+.danmaku-settings[hidden] {
+  display: none;
+}
+.danmaku-settings-heading,
+.danmaku-settings-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.danmaku-settings-heading h2 {
+  font-size: 16px;
+}
+/* 小屏滚动和软键盘缩小视口后, 关闭入口仍固定在弹层顶部. */
+.danmaku-settings-heading {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding-bottom: 10px;
+  background: var(--panel);
+}
+.danmaku-settings-heading button {
+  padding: 7px 10px;
+}
+.danmaku-settings fieldset {
+  min-width: 0;
+  margin: 14px 0 0;
+  padding: 0;
+  border: 0;
+}
+.danmaku-enabled {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.danmaku-settings input {
+  accent-color: var(--accent);
+}
+.danmaku-setting-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-block: 14px;
+}
+.danmaku-setting-grid label {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+.danmaku-setting-grid input {
+  width: 100%;
+  min-width: 0;
+  padding: 8px;
+  color: var(--foreground);
+  background: var(--button);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  font-size: 16px;
+}
+.danmaku-settings-hint,
+#danmaku-settings-status {
+  margin-block: 12px;
+  color: var(--muted);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.danmaku-settings-actions {
+  justify-content: flex-end;
+}
+#danmaku-settings-error,
+#danmaku-render-error {
+  color: #e75f6d;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+#danmaku-settings-error:empty,
+#danmaku-render-error:empty {
+  display: none;
+}
+#danmaku-toggle[aria-pressed="true"] {
+  color: var(--accent);
+}
 .player-controls {
   padding: 10px 14px;
   border-top: 1px solid var(--border);
@@ -707,6 +814,11 @@ video {
   --range-buffer: rgb(255 255 255 / 45%);
   --range-track: rgb(255 255 255 / 20%);
 }
+.player-panel.expanded {
+  inset: var(--player-viewport-top, 0) auto auto var(--player-viewport-left, 0);
+  width: var(--player-viewport-width, 100vw);
+  height: var(--player-viewport-height, 100dvh);
+}
 .player-panel:is(:fullscreen, .expanded) :is(.section-heading, #meta, #stop, #restart, .danmaku-panel),
 .player-panel:is(:fullscreen, .expanded) .playback-feedback {
   display: none;
@@ -714,7 +826,7 @@ video {
 .player-panel:is(:fullscreen, .expanded) .video-frame {
   position: absolute;
   inset: 0;
-  padding: 0;
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
   min-height: 0;
   display: block;
 }
@@ -728,7 +840,8 @@ video {
   position: absolute;
   z-index: 2;
   inset: auto 0 0;
-  padding: 48px clamp(16px, 3vw, 48px) 20px;
+  padding: 48px max(clamp(16px, 3vw, 48px), env(safe-area-inset-right))
+    max(20px, calc(env(safe-area-inset-bottom) + 8px)) max(clamp(16px, 3vw, 48px), env(safe-area-inset-left));
   border: 0;
   background: linear-gradient(transparent, rgb(0 0 0 / 80%) 65%);
   transition: opacity 180ms ease, visibility 180ms ease;
@@ -765,6 +878,7 @@ video {
 }
 body.player-expanded {
   overflow: hidden;
+  overscroll-behavior: none;
 }
 button:focus-visible,
 select:focus-visible,

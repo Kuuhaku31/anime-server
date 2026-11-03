@@ -6,8 +6,8 @@ API 是业务枢纽, 使用按路径访问的媒体模型连接配置, 数据库
 
 ## 实例与依赖
 
-`services.rs` 使用五个 `OnceLock` 注册唯一实例, 不使用 `static mut`, unsafe 或运行时替换.
-初始化顺序是 AppConfigManager, DatabaseManager, ProcessManager, CacheManager,
+`services.rs` 使用六个 `OnceLock` 注册唯一实例, 不使用 `static mut`, unsafe 或替换 Manager 实例.
+初始化顺序是 AppConfigManager, WebConfigManager, DatabaseManager, ProcessManager, CacheManager,
 ScannerManager. Axum Router 不注入业务 AppState.
 
 API, main 和后台扫描入口读取 services getter, 然后显式传入协作所需引用.
@@ -18,6 +18,7 @@ Manager 不调用 services getter, 不互相保存.
 | 组件                | 持有的数据                                   | 职责与边界                            |
 | ------------------- | -------------------------------------------- | ------------------------------------- |
 | AppConfigManager    | JSON 运行字段与环境加载的 DandanplayConfig   | 配置读取, 默认值和环境认证校验        |
+| WebConfigManager    | config.json 路径, RwLock<DanmakuSettings>    | 弹幕设置快照, 串行保存和原子发布     |
 | DatabaseManager     | 私有 SqlitePool                              | 播放配置, 剧集关联和扫描事务          |
 | ScannerManager      | 媒体根目录, 扫描 Mutex                       | 路径边界, 前缀哈希, 全量和单路径扫描  |
 | CacheManager        | root, handles                                | 管理全部实例目录与唯一句柄的对应关系  |
@@ -36,6 +37,12 @@ CacheManager 的查询和资源接口只接收 handle_id, 不接收客户端提�
 不注册新 Manager, 不持有数据库或 CacheManager.
 ProcessManager 仍只负责本地媒体进程, 不承担外部 HTTP 调用.
 
+WebConfigManager 只热更新 DanmakuSettings, 不修改 AppConfigManager 的启动期预算和环境凭据.
+GET 读取已保存快照, PUT 在写锁内将新设置与启动配置合并, 复用 utils 原子写盘后更新快照.
+配置序列化始终跳过凭据, 写入失败不替换运行时值. API 在独立任务中完成保存,
+避免客户端取消恰好发生在磁盘发布与内存提交之间.
+同一个 CONFIG_DIR 只供一个服务实例使用, 不跨进程协调写入.
+
 ## 共享模型
 
 前端媒体列表只包含数据库内容 ID, 容器内绝对路径, 共享播放配置和 episode ID.
@@ -49,6 +56,8 @@ ProcessManager 仍只负责本地媒体进程, 不承担外部 HTTP 调用.
 | MediaEpisode   | file_id, episode_id                                                     |
 | MediaIdentification | file_id, episode_id, matched                                        |
 | DanmakuComment | time, mode, color, sender, comment_id, content                           |
+| DanmakuSettings | enabled, font_size, outline_width, opacity, display_area_percent, time_offset_seconds |
+| WebConfig | default_dark_mode, danmaku |
 | MediaInfo      | metadata, configs                                                       |
 | MediaMetadata  | duration, format, video_streams, audio_streams, subtitle_streams        |
 | StreamInfo     | stream_index, codec_name, language, title, is_default, is_forced        |
@@ -127,12 +136,42 @@ p 展开为时间, 模式, RGB 颜色和发送者, m 作为纯文本内容,
 cid 转字符串以避免 JavaScript 大整数精度损失. 条目严格校验后按时间稳定排序.
 合法空数组以及官方 count=0 且 comments=null 返回空列表, 协议缺失或无效条目明确报错.
 
-前端 `DanmakuPanel` 独立持有数据, DOM 索引和在途 AbortController.
-`main.ts` 从 Library 查询当前播放路径的 episode ID, 同步 PlaybackController 的绝对播放位置.
+前端 `DanmakuPanel` 持有数据, DOM 索引和在途 AbortController, 通过 change 事件发布只读数组引用.
+`main.ts` 从 Library 查询当前播放路径的 episode ID, 同步 PlaybackController 的绝对播放位置和已应用时间偏移.
 媒体或关联改变时清空并取消旧请求, 身份检查阻止迟到响应覆盖新状态, 不自动下载.
 播放与 seek 使用二分查找定位最后一条已到达弹幕, 只在活动索引改变时更新高亮和列表滚动,
 不重建整表或滚动整个页面. 全屏期间隐藏, 退出或尺寸改变后恢复当前定位.
 弹幕异常仅显示局部诊断, 不影响本地播放, 生成任务或已经加载的列表.
+
+## 画面弹幕与 Web 设置
+
+`DanmakuRenderer` 直接消费 DanmakuPanel 的同一数组, 不请求数据或复制另一份弹幕列表.
+Canvas 位于 video-stage, CSS 像素范围使用视频的 contain 内容矩形, backing store 使用最高 3 倍 DPR.
+ResizeObserver, 媒体尺寸, 方向和 visualViewport 变化触发重算. Canvas 不接收指针事件,
+无障碍文本仍由原始列表提供, 覆盖层折叠控制空白以显示单行文本.
+
+时间直接取自 video.currentTime, 再加 time_offset_seconds. 支持时使用 requestVideoFrameCallback,
+否则使用一个 requestAnimationFrame 循环. 暂停和 buffering 不积累墙钟位移,
+页面隐藏或卸载取消时钟, 恢复时从当前时间重建.
+seek, 数据替换, 样式和尺寸变化清空旧轨道, 二分定位当前可见时间窗.
+控制器等待和媒体未就绪时不在旧画面上绘制新媒体的弹幕.
+
+`DanmakuLayout` 将 mode 1 和未知值作为右向左滚动, mode 5 和 mode 4 分别顶部和底部固定.
+滚动时长随画面宽度缩放到 4..9 秒, 固定时长为 3.8 秒. 轨道高度包含字号, 描边和行间距.
+三种模式共用物理轨道, 滚动只使用顶部设置区域, 固定模式不受该比例限制.
+先选择空轨道, 再选择入口有间距且前项离屏前不会追尾的安全轨道;
+所有轨道繁忙时复用最早可接纳轨道, 不按密度丢弃条目.
+滚动前项的安全接纳时间取入口释放与追尾约束的较大值, 并以其完全离屏时间为上界.
+
+`DanmakuSettingsPanel` 分开保存草稿, 已应用设置和已保存基线. Apply 只发本地 change,
+Save 发送完整设置, 收到成功响应后更新基线和预览, 失败保留两者并显示局部诊断.
+设置启停不取消手动加载或清空原始列表, 不向 localStorage 写入配置.
+其他页面通过下次 GET /api/config 获取新设置, 没有配置轮询或推送.
+
+播放器全屏包含视频, Canvas, 控件和设置弹层. Apple 移动设备包括桌面 UA 的触控 iPad
+都只使用 expanded 页内全屏, 不调用视频或元素的系统全屏入口.
+桌面和 Android 优先使用元素 Fullscreen API. visualViewport 与安全区内边距保证退出入口可见,
+页内全屏不承诺隐藏浏览器工具栏或锁定横屏.
 
 ## 缓存身份与目录
 

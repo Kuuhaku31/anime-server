@@ -27,10 +27,12 @@ DATA_DIR=/srv/anime-server/data
 CACHE_DIR=/srv/anime-server/cache
 ```
 
-配置只读挂载为 `/config`, 媒体只读挂载为 `/media`,
+配置读写挂载为 `/config`, 媒体只读挂载为 `/media`,
 数据读写挂载为 `/data`, 播放缓存通过 CACHE_DIR 独立读写挂载为 `/cache`.
 端口映射为 `${PORT}:8080`, PORT 必须在 `1..65535` 内.
 CACHE_DIR 必填且使用宿主机绝对路径, 后端固定使用容器内的 `/cache`.
+CONFIG_DIR 和其中的 config.json 必须对容器运行用户可写, 用于保存画面弹幕设置.
+升级时移除 `/config:ro`, 挂载整个配置目录, 不要只挂载无法原子替换的单个文件.
 
 ```bash
 mkdir -p /srv/anime-server/config /srv/anime-server/data /srv/anime-server/cache
@@ -41,7 +43,7 @@ docker compose ps
 curl --fail http://localhost:56080/health
 ```
 
-不要让多个进程使用相同 DATA_DIR 或 CACHE_DIR. 当前没有缓存目录锁, 隔离由部署保证.
+不要让多个进程使用相同 CONFIG_DIR, DATA_DIR 或 CACHE_DIR. 跨进程写入隔离由部署保证.
 如果用户没有 Docker socket 权限, 使用宿主机已授权的 Docker 访问方式,
 不要为方便调试修改 socket 为全员可写.
 
@@ -52,7 +54,7 @@ curl --fail http://localhost:56080/health
 
 ## 运行配置
 
-`/config/config.json` 只保存扁平的本地运行字段, 不保存识别认证参数:
+`/config/config.json` 保存扁平的启动字段和 danmaku 样式对象, 不保存识别认证参数:
 
 ```json
 {
@@ -61,7 +63,15 @@ curl --fail http://localhost:56080/health
   "max_processes": 2,
   "ffmpeg_threads": 2,
   "max_total_ffmpeg_threads": 16,
-  "startup_timeout_seconds": 90
+  "startup_timeout_seconds": 90,
+  "danmaku": {
+    "enabled": true,
+    "font_size": 28,
+    "outline_width": 1.5,
+    "opacity": 0.9,
+    "display_area_percent": 75,
+    "time_offset_seconds": 0
+  }
 }
 ```
 
@@ -73,11 +83,21 @@ curl --fail http://localhost:56080/health
 | ffmpeg_threads           | 1..32, 单个编码任务使用的固定线程数           |
 | max_total_ffmpeg_threads | ffmpeg_threads..256, 所有编码任务共享线程预算 |
 | startup_timeout_seconds  | 10..600, 字幕准备及首个可发布结果的超时       |
+| danmaku.enabled | boolean, 默认 true, 不影响下方列表 |
+| danmaku.font_size | 12..72 CSS px, 默认 28 |
+| danmaku.outline_width | 0..6 CSS px, 默认 1.5, 0 关闭 |
+| danmaku.opacity | 0.1..1, 默认 0.9 |
+| danmaku.display_area_percent | 10..100, 默认 75, 只约束滚动弹幕且最少一行 |
+| danmaku.time_offset_seconds | -120..120 秒, 默认 0, 正值使弹幕提前出现 |
 
-缺省字段使用默认值, 未知字段报错.
+配置文件中缺省对象和缺省字段使用默认值, 未知字段报错, 浮点值必须有限.
 旧 web/playback 嵌套对象, cache_max_bytes, idle_timeout_seconds 和 max_variant_threads 已删除.
 旧 dandanplay 字段也已移除, 即使值为 null 也不再接受, 认证信息仅从环境变量读取.
-配置变更需要重启服务.
+只有弹幕设置支持通过 UI 的 Save 或 PUT /api/config/danmaku 运行时保存.
+Apply 只预览, 刷新页面丢弃未保存设置. Save 先原子落盘再更新服务端快照,
+失败显示错误且不改变运行时值, 其他页面刷新后读取.
+保存会使用启动时的其他配置字段重写完整文件, 手动修改其他启动字段前请先停止服务,
+避免未重启的文件修改被后续 Save 覆盖. 其他配置和直接修改文件仍需重启生效.
 
 ### DandanPlay 识别凭据
 
@@ -99,7 +119,7 @@ DANDAN_APP_SECRET=YOUR_APP_SECRET
 非空参数必须是合法 UTF-8, DANDAN_APP_ID 必须能用作非空 HTTP 请求头,
 DANDAN_APP_SECRET 不能只有空白字符. 无效值不回显到错误或日志.
 凭据只保留在服务端内存, 不参与 JSON 配置的读取和序列化,
-`/api/config` 仍只返回主题偏好, 调试输出隐藏凭据.
+`/api/config` 只返回主题和画面弹幕设置, 调试输出隐藏凭据.
 不要复用参考项目的应用密钥, 不要将真实密钥写入仓库或前端代码.
 未配置时仍可手动保存或清空 episode ID, 也不影响本地播放.
 Identify, 弹幕缓存未命中的 Load comments 和 Refresh comments 才访问上游,
@@ -227,6 +247,14 @@ Refresh 成功替换而失败保留原文件. 无凭据时已有缓存仍可读�
 同时间组选择最后一条, 首条之前回到顶部, 长文本及次要字段完整换行.
 切换媒体或修改/清空 ID 后旧请求不能覆盖新状态, 不自动加载.
 刷新失败保留已显示列表, 原生及页内全屏隐藏列表且退出后恢复定位.
+Canvas 仍需在全屏可见, 检查滚动, 顶部, 底部, 黑色描边反转及高密度轨道复用.
+暂停和 buffering 不移动, 前后 seek 不补播中间弹幕, 倍速不产生时间漂移.
+resize 和视频黑边变化后, Canvas 必须与实际视频内容对齐, 不覆盖黑边或拦截点击.
+分别验证 Apply 不发请求, Save 落盘, 刷新和重启保留设置, 非法字段返回 400,
+只读配置挂载返回 500 且运行时设置不变. 保存失败不撤销当前预览.
+桌面验证元素全屏和失败回退, iPhone UA 和触控 MacIntel UA 都应只进入页内全屏.
+移动视口检查横竖屏, 设置弹层滚动, 安全区和软键盘期间退出入口仍可访问.
+Chromium 的移动 UA 模拟不能替代真实 iOS Safari, 原生设备验证需单独执行.
 使用合成媒体和独立浏览器上下文, 验证结束停止服务并清理夹具.
 
 ## Docker 验证
@@ -238,7 +266,7 @@ Refresh 成功替换而失败保留原文件. 无凭据时已有缓存仍可读�
 docker build -t anime-server:verify .
 docker run -d --name anime-server-verify \
   -p 127.0.0.1:56081:8080 \
-  -v /tmp/anime-server-verify/config:/config:ro \
+  -v /tmp/anime-server-verify/config:/config \
   -v /tmp/anime-server-verify/media:/media:ro \
   -v /tmp/anime-server-verify/data:/data \
   -v /tmp/anime-server-verify/cache:/cache \
