@@ -1,6 +1,7 @@
 # 核心架构
 
-API 是业务枢纽, 使用按路径访问的媒体模型连接配置, 数据库, 扫描, 缓存和进程管理器.
+API 是业务枢纽, 使用按路径访问的媒体模型连接配置, 数据库, 扫描, 缓存和进程管理器,
+并协调 DandanPlay 文件识别及剧集关联保存.
 播放通过稳定 handle_id 直接访问缓存资源, 没有 SessionManager 或服务端播放映射.
 
 ## 实例与依赖
@@ -16,8 +17,8 @@ Manager 不调用 services getter, 不互相保存.
 
 | 组件                | 持有的数据                                   | 职责与边界                            |
 | ------------------- | -------------------------------------------- | ------------------------------------- |
-| AppConfigManager    | 六个顶层配置字段                             | 配置读取, 默认值和合法性检查          |
-| DatabaseManager     | 私有 SqlitePool                              | 唯一连接池, 按路径配置查询和扫描事务  |
+| AppConfigManager    | JSON 运行字段与环境加载的 DandanplayConfig   | 配置读取, 默认值和环境认证校验        |
+| DatabaseManager     | 私有 SqlitePool                              | 播放配置, 剧集关联和扫描事务          |
 | ScannerManager      | 媒体根目录, 扫描 Mutex                       | 路径边界, 前缀哈希, 全量和单路径扫描  |
 | CacheManager        | root, handles                                | 管理全部实例目录与唯一句柄的对应关系  |
 | CacheInstanceHandle | spec, handle_id, path, phase, resources      | 恢复, 启停, 状态转换, 分片发布和 worker 占用 |
@@ -29,16 +30,22 @@ API 只使用缓存管理器的快照和资源接口, 不访问句柄内部状�
 CacheManager 的查询和资源接口只接收 handle_id, 不接收客户端提供的缓存目录.
 列表复制句柄后释放全局 Map 锁, 再按 handle_id 排序读取快照.
 
+`dandanplay.rs` 只封装 HTTPS 请求, 签名和上游协议校验, 不注册新 Manager,
+不读取 services getter, 不持有数据库或扫描器. API 显式提供凭据和文件描述.
+ProcessManager 仍只负责本地媒体进程, 不承担外部 HTTP 调用.
+
 ## 共享模型
 
-前端媒体列表只包含数据库内容 ID, 容器内绝对路径和共享配置.
+前端媒体列表只包含数据库内容 ID, 容器内绝对路径, 共享播放配置和 episode ID.
 同内容副本各自作为列表项, metadata 由 `/api/media/{file_id}/metadata` 按需探测,
 前端按 `file_id` 在内存缓存探测结果. 另有 `Map<handle_id, CacheEntry>` 保存全部缓存的内存快照,
 页面刷新后由服务端重建, 不持久化到浏览器存储.
 
 | 模型           | 字段                                                                    |
 | -------------- | ----------------------------------------------------------------------- |
-| MediaFile      | file_id, path, configs                                                  |
+| MediaEntry     | file_id, path, configs, episode_id                                      |
+| MediaEpisode   | file_id, episode_id                                                     |
+| MediaIdentification | file_id, episode_id, matched                                        |
 | MediaInfo      | metadata, configs                                                       |
 | MediaMetadata  | duration, format, video_streams, audio_streams, subtitle_streams        |
 | StreamInfo     | stream_index, codec_name, language, title, is_default, is_forced        |
@@ -51,11 +58,12 @@ CacheManager 的查询和资源接口只接收 handle_id, 不接收客户端提�
 
 MediaMetadata 内部额外保留容器起点, 字体附件和视频色彩信息,
 供时间轴归一化, 字幕和 HDR 处理使用, 不作为 HTTP 字段公开.
-文件名由前端从路径提取, 不再保存大小, 观看时间或识别字段.
+文件名由路径提取, 大小仅在显式识别时读取, 不保存观看时间.
+识别只持久化 episode ID, 不扩展 MediaConfigs 或 CacheSpec.
 
 ## 数据库与扫描
 
-`file` 以文件前 16 MiB 的 MD5 `media_id` 为主键, 保存共享 MediaConfigs.
+`file` 以文件前 16 MiB 的 MD5 `media_id` 为主键, 保存共享 MediaConfigs 和可空 episode_id.
 `file_path` 以 `(media_id, path)` 为复合主键, 同时要求 path 唯一.
 同一内容可以有多个路径, 同一路径只能关联一个当前内容身份.
 
@@ -63,14 +71,37 @@ MediaMetadata 内部额外保留容器起点, 字体附件和视频色彩信息,
 全量扫描每次重算身份, 不依赖大小或修改时间.
 全量结果在一个事务中应用, 文件移动且原路径被复用时不会丢失原内容的配置.
 
-单路径扫描用于手动重扫和播放前重新计算身份. 文件消失时删除该路径,
-当前数据库保留没有路径的 file 配置, 不因删除缓存而删除观看配置.
-媒体列表只查询数据库并返回 file_id, path 和共享配置, 不运行 ffprobe.
+单路径扫描用于手动重扫, 构建和识别时重新计算身份. 文件消失时删除该路径,
+当前数据库保留没有路径的 file 配置和剧集关联, 不因删除缓存而删除观看配置.
+媒体列表只查询数据库并返回 file_id, path, configs 和 episode_id, 不运行 ffprobe.
 前端仅在展开单个条目时按 file_id 请求 metadata, 相同内容的展开副本共享请求与结果.
 重扫会使受影响内容的 metadata 缓存失效, 展开状态保留并重新探测.
 缓存列表按 media_id 查询排序后的路径, 跳过已经消失的副本,
 不在每次轮询中运行 ffprobe. 重试必须重扫源路径并比对原 media_id,
 内容已被替换则明确拒绝, 不把旧句柄续接到新媒体.
+
+## 剧集关联与识别
+
+手动更新仅保存 file.episode_id, 播放进度和轨道保存只修改原四个字段.
+现有 media_id 表在启动事务中增补可空列, 无需删除媒体索引或观看记录.
+
+识别先校验路径并重新计算前 16 MiB MD5, 每次显式请求都访问上游, 不因已有 ID 而跳过.
+缺省的可选 DandanPlay 凭据不影响本地功能, 只有识别请求返回未配置错误.
+AppConfigManager 在启动时从 DANDAN_APP_ID 和 DANDAN_APP_SECRET 读取凭据,
+两项必须同时提供或同时留空, 不从 config.json 加载, 也不参与 JSON 序列化.
+Compose 负责将根目录 .env 中的认证参数传入容器, 后端不直接读取该文件.
+上游请求携带文件名, MD5 和大小, 以 SHA-256 后 Base64 的应用签名认证,
+不上传原始密钥, 完整路径或媒体内容, 不为识别获取 metadata.
+
+`match_file` 返回 `Result<Option<u64>>`, 只保留精确且唯一的有效 ID, 不公开候选模型.
+模糊结果和无匹配返回 None, 外部业务或协议错误继续报错.
+网络等待不持有扫描锁或数据库事务. 返回后重算身份并核对大小,
+通过路径条件确认仍绑定同一内容, 使用 COALESCE(新 ID, episode_id) 写回:
+唯一结果覆盖当前 ID, 包括并发手动写入的关联; None 保留数据库当前值.
+响应提供最终 episode_id 和 matched 标志, 无唯一匹配不被误报为识别成功.
+前端按 file_id 共享编辑草稿和请求状态, 使同内容副本同步,
+metadata 或播放高亮重绘保留正在输入的值和焦点.
+识别不创建或改变任何播放缓存, 当前不下载或渲染弹幕.
 
 ## 缓存身份与目录
 
@@ -87,7 +118,7 @@ CacheSpec 是 instance.json 和 handle_id 的唯一来源:
 ```
 
 Rust 按上述声明顺序序列化紧凑 JSON, 保留显式 null 后计算 MD5.
-path, position, metadata 和线程数都不参与身份.
+path, position, metadata, episode_id 和线程数都不参与身份.
 缓存配置通过 `PartialEq` 比较, 不再使用 CacheIdentity, CacheRequest, EncodeSpec 或 PlaybackSelection.
 
 宿主机通过 `.env` 中的 CACHE_DIR 将播放缓存目录独立挂载到容器 `/cache`.

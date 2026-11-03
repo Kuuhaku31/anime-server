@@ -52,7 +52,7 @@ export interface MediaInfo {
   configs: MediaConfigs;
 }
 
-/** 描述媒体列表中数据库登记的路径和共享播放配置. */
+/** 描述媒体列表中数据库登记的路径, 播放配置和剧集关联. */
 export interface MediaEntry {
   /** 数据库内容记录 ID. */
   file_id: string;
@@ -60,6 +60,22 @@ export interface MediaEntry {
   path: string;
   /** 同内容路径共享的播放配置. */
   configs: MediaConfigs;
+  /** 同内容路径共享的 DandanPlay 剧集 ID, null 表示尚未关联. */
+  episode_id: number | null;
+}
+
+/** 描述独立于播放配置保存的剧集关联. */
+export interface MediaEpisode {
+  /** 后端确认的媒体内容标识. */
+  file_id: string;
+  /** 当前保存的剧集 ID, null 表示用户清空或未识别. */
+  episode_id: number | null;
+}
+
+/** 描述识别后的持久化结果, 区分唯一匹配与保留的原 ID. */
+export interface MediaIdentification extends MediaEpisode {
+  /** 本次是否取得并保存了唯一精确匹配. */
+  matched: boolean;
 }
 
 /** 描述播放器已获取元数据的媒体路径. */

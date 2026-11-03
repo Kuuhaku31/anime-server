@@ -24,7 +24,7 @@ async fn copies_share_configs_and_replaced_paths_get_the_correct_identity() -> R
     assert_eq!(database.get_file_by_path(&second.path).await?, Some((first.media_id.clone(), configs.clone())));
     let listed = database.list_paths_with_configs().await?;
     assert_eq!(listed.len(), 2);
-    assert_eq!(listed[0], (first.media_id.clone(), PathBuf::from("/media/copy.mkv"), configs.clone()));
+    assert_eq!(listed[0], (first.media_id.clone(), PathBuf::from("/media/copy.mkv"), configs.clone(), None));
     assert_eq!(database.paths_with_configs_by_id(&first.media_id).await?,
         vec![(PathBuf::from("/media/copy.mkv"), configs.clone())]);
     assert!(database.paths_with_configs_by_id(&"c".repeat(32)).await?.is_empty());

@@ -14,8 +14,10 @@
 | 方法   | 路径                                 | 作用                              |
 | ------ | ------------------------------------ | --------------------------------- |
 | GET    | `/api/config`                        | 读取配置                          |
-| GET    | `/api/media`                         | 获取媒体 ID, 路径和播放配置       |
+| GET    | `/api/media`                         | 获取媒体 ID, 路径, 播放配置和剧集 ID |
 | GET    | `/api/media/{file_id}/metadata`      | 探测单个媒体的实时 metadata       |
+| PUT    | `/api/media/{file_id}/episode`       | 单独保存或清空共享剧集 ID         |
+| POST   | `/api/media/identify`               | 按文件路径请求 DandanPlay 识别    |
 | POST   | `/api/media/scan`                    | 全量扫描媒体目录                  |
 | POST   | `/api/media/rescan`                  | 按路径重扫并返回轻量媒体条目      |
 | PUT    | `/api/media/configs`                 | 按路径保存完整播放配置            |
@@ -42,13 +44,15 @@
       "video_stream_index": 0,
       "audio_stream_index": null,
       "subtitle_stream_index": null
-    }
+    },
+    "episode_id": null
   }
 ]
 ```
 
 列表只查询数据库, 不对媒体文件运行 ffprobe. 每个路径单独返回,
-相同内容的路径使用相同 `file_id` 并共享 configs.
+相同内容的路径使用相同 `file_id` 并共享 configs 和 episode_id.
+episode_id 独立于播放配置, 不参与缓存身份.
 
 展开或播放单个媒体时, 前端调用 `GET /api/media/{file_id}/metadata`.
 成功返回 `200`:
@@ -115,7 +119,8 @@ total 是扫描完成后数据库中的路径数量, 多副本分别计数.
     "video_stream_index": 0,
     "audio_stream_index": null,
     "subtitle_stream_index": null
-  }
+  },
+  "episode_id": null
 }
 ```
 
@@ -146,8 +151,81 @@ position 必须为 null 或有限非负秒数, 流索引必须为 null 或非负
 
 构建本身不保存偏好或观看进度, 由前端通过此接口显式保存.
 配置共享于同内容的所有路径, 不随缓存停止或删除而删除.
+此接口不修改 episode_id, 不能通过 configs 对象保存剧集关联.
 
-`GET /api/config` 返回 `{"default_dark_mode":true}`, 不公开完整运行配置.
+`GET /api/config` 返回 `{"default_dark_mode":true}`, 不公开完整运行配置或 DandanPlay 凭据.
+
+## 剧集 ID 与文件识别
+
+`PUT /api/media/{file_id}/episode` 请求:
+
+```json
+{ "episode_id": 1234567 }
+```
+
+episode_id 必须为 `1..9007199254740991` 范围内的整数或显式 null.
+字段不可省略, 不接受字符串, 小数或未知字段. 清空关联时发送 `{"episode_id":null}`.
+成功返回 `200`:
+
+```json
+{
+  "file_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "episode_id": 1234567
+}
+```
+
+内容不存在或没有登记路径时返回 `404`. 手动保存不调用外部 API, 不探测媒体,
+只更新同内容共享的 episode_id, 不改变播放进度或轨道偏好.
+
+`POST /api/media/identify` 请求体是 JSON 路径字符串:
+
+```json
+"/media/series/episode.mkv"
+```
+
+后端先校验媒体目录边界并重扫内容身份. 每次请求都重新识别, 已有非空 ID 也不跳过上游.
+读取文件名, 前 16 MiB MD5 和文件大小,
+向 `https://api.dandanplay.net/api/v2/match` 发送 `hashAndFileName` 请求.
+videoDuration 使用协议允许的 0, 不为识别运行 ffprobe.
+使用服务端凭据生成 X-AppId, X-Timestamp 和 X-Signature, 不发送原始密钥,
+媒体完整路径或文件内容.
+
+`match_file` 返回 `Result<Option<u64>>`, 只有 `isMatched=true` 且恰好一个有效 ID 时返回 Some.
+ID 必须为 `1..9007199254740991` 范围内的整数, 唯一精确结果覆盖已有或手动保存的 ID.
+成功响应包含 `file_id`, 数据库最终的 `episode_id` 和本次唯一匹配标志 `matched`, 不返回候选列表.
+例如唯一精确匹配:
+
+```json
+{
+  "file_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "episode_id": 1234567,
+  "matched": true
+}
+```
+
+无匹配或模糊结果返回 `200` 和 `matched: false`, 即使模糊结果只有一项也不会保存.
+此时保留数据库写回时的 ID, 包括识别期间并发手动保存的关联, 不自动清空.
+例如未取得唯一匹配且原 ID 为 1234567:
+
+```json
+{
+  "file_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "episode_id": 1234567,
+  "matched": false
+}
+```
+
+原关联为空时 episode_id 仍为 null. 前端以 matched 判断本次结果, 不能把非空 ID 当作匹配成功.
+唯一匹配成功时则以识别结果覆盖写回时的 ID, 包括请求期间的手动修改.
+用户仍可通过保存 ID 接口手动覆盖或清空关联.
+上游返回后会再次扫描并核对路径内容和大小, 文件已消失或改变返回 `409`,
+不把旧识别结果写入新内容.
+
+可选凭据来自服务端环境变量 DANDAN_APP_ID 和 DANDAN_APP_SECRET,
+Compose 从根目录 .env 传入, 不从 config.json 获取, 详见 [development.md](development.md).
+未配置返回 `503`. 上游 HTTP, 业务和协议错误返回 `502`, 超时返回 `504`.
+连接超时为 5 秒, 整个上游请求最多 20 秒, 响应正文限制为 1 MiB.
+这些错误不等同于没有匹配, 失败时保留原关联并允许用户显式重试.
 
 ## 构建缓存
 
@@ -315,9 +393,12 @@ HTTP 请求取消不会中断已经开始的 stop 或 delete 清理.
 | ------ | ----------------------------------------------------------- |
 | 400    | JSON 或字段无效, 路径形状不合法, 流选择不存在, 配置数值非法 |
 | 404    | 源路径不可用, handle 不存在, 资源尚不可用或禁止访问         |
-| 409    | 句柄正在停止, 不能同时接受新的构建或重试                    |
+| 409    | 句柄正在停止, 或源文件在识别期间发生变化                    |
 | 422    | 媒体无法读取或探测, 单路径扫描失败, 重试时内容身份已改变    |
 | 500    | 数据库, 全量扫描, 缓存或其他内部操作失败                    |
+| 502    | DandanPlay 网络, HTTP, 业务状态或响应协议错误               |
+| 503    | 尚未配置 DandanPlay 应用凭据                               |
+| 504    | DandanPlay 识别请求超时                                    |
 
 `GET /health` 返回 `{"status":"ok"}`, 不扫描或探测媒体.
 其他路径交给 `/app/web` 的静态文件服务.

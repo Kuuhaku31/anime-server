@@ -103,6 +103,12 @@ class Select extends Element {
   constructor() { super("select"); }
 }
 
+/** 支持剧集输入控件的真实类型检查. */
+class Input extends Element {
+  /** 初始化为文本输入标签. */
+  constructor() { super("input"); }
+}
+
 /** 构造流元数据样本. */
 function stream(index, codec = "h264", language = "eng", isDefault = false, isForced = false) {
   return { stream_index: index, codec_name: codec, language, title: null, is_default: isDefault, is_forced: isForced };
@@ -124,7 +130,7 @@ function info(position = null, configs = {}) {
 /** 构造数据库返回的轻量路径列表条目. */
 function entry(path, fileId, position = null) {
   return {
-    file_id: fileId, path,
+    file_id: fileId, path, episode_id: null,
     configs: { position, video_stream_index: null, audio_stream_index: null, subtitle_stream_index: null },
   };
 }
@@ -134,12 +140,13 @@ function dom() {
   globalThis.Element = Element;
   globalThis.HTMLButtonElement = Button;
   globalThis.HTMLSelectElement = Select;
+  globalThis.HTMLInputElement = Input;
   const nodes = new Map(["#files", "#files-count", "#scan", "#files-sort"]
     .map((selector) => [selector, new Element(selector === "#files-sort" ? "select" : "div")]));
   globalThis.document = {
     querySelector: (selector) => nodes.get(selector),
     createElement: (tag) => tag === "button" ? new Button()
-      : tag === "select" ? new Select() : new Element(tag),
+      : tag === "select" ? new Select() : tag === "input" ? new Input() : new Element(tag),
   };
   return nodes;
 }

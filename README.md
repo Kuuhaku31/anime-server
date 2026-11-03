@@ -1,7 +1,7 @@
 # Anime Server
 
 本地视频 Web 服务, 使用单个 Docker 容器部署. Rust/Axum 提供媒体接口,
-SQLite 保存播放配置, FFmpeg 生成可共享和恢复的 HLS 缓存,
+SQLite 保存播放配置和 DandanPlay 剧集关联, FFmpeg 生成可共享和恢复的 HLS 缓存,
 TypeScript/HLS.js 提供常驻播放器和右侧文件及缓存任务列表.
 
 ## 挂载与端口
@@ -42,7 +42,8 @@ CACHE_DIR=/srv/anime-server/cache
 
 `instance.json` 只包含媒体内容标识, 三类流索引和编码版本.
 字幕与字体临时文件位于任务自己的 `.work-<random_id>/` 内, 任务结束时清理.
-`ddp-ani/` 和 `ddp-danmaku/` 为 API 缓存预留目录, 当前没有番剧识别接口.
+`ddp-ani/` 和 `ddp-danmaku/` 仍为 API 缓存预留目录.
+文件识别结果中的 episode ID 保存到 main.db, 本轮不包含番剧缓存, 弹幕下载或渲染.
 如需复用原数据目录内的播放缓存, 将 `CACHE_DIR` 指向宿主机 `${DATA_DIR}/cache` 对应的绝对路径.
 
 ## 代码与文档
@@ -50,14 +51,15 @@ CACHE_DIR=/srv/anime-server/cache
 ```text
 backend/src/
 |-- main.rs, services.rs      # 启动与 OnceLock 全局实例
-|-- config.rs                 # 扁平 AppConfigManager
-|-- api.rs, api/              # 媒体接口, 缓存构建管理与资源读取
+|-- config.rs                 # JSON 运行配置与环境认证参数
+|-- api.rs                    # 媒体接口, 剧集关联与缓存资源读取
+|-- dandanplay.rs             # 开放 API 签名与文件识别
 |-- db.rs                     # 唯一数据库连接池与事务仓储
 |-- scanner.rs                # 媒体目录和单路径扫描
 |-- cache.rs, cache/handle.rs # 全量句柄表与六状态生命周期
 |-- process.rs, process/      # 探测, 子进程, 资源预算与 HLS 处理
-|-- models.rs, models/        # MediaInfo, PlaybackQuery 与 CacheSpec
-`-- tests/                    # 集中 Rust 测试和夹具
+`-- models.rs                # 媒体模型, PlaybackQuery 与 CacheSpec
+backend/tests/               # 集中 Rust 测试和夹具
 frontend/src/
 |-- api/                      # 同源 HTTP 客户端
 |-- state/                    # 共享数据契约和 handle_id 缓存 Map
@@ -76,10 +78,10 @@ frontend/src/
 
 - `handle_id`: 服务端计算的稳定缓存标识, 不作为访问凭证
 - `Map<handle_id, CacheEntry>`: 内存中保存全部缓存的状态, 生成进度, 实际流选择和 worker 资源
-- 前端媒体列表: `List<(Path, MediaInfo)>`: 媒体文件在后端容器内的路径及其对应的信息
+- 前端媒体列表: `MediaEntry[]`, 包含 file_id, path, configs 和可空 episode_id
 
 页面刷新后从 `GET /api/cache` 重建 Map, 不把任务快照保存在 localStorage.
-文件列表的 Play 构建并播放, Build 只提交转码且不切换播放器.
+文件列表的 Build 只提交转码且不切换播放器, 剧集关联也不触发播放或构建.
 缓存列表的 Play 只读取已有缓存, Retry / resume 重新构建, Stop build 保留已发布前缀,
 Delete 经确认后立即停止并删除缓存, 包括其他浏览器正在使用的缓存.
 播放器的 Stop 只停止本地播放, 不发送服务端删除或停止转码请求.
@@ -107,6 +109,7 @@ MediaInfo 包含
 包括以下主要模块:
 
 - AppConfigManager
+
 - API接口枢纽
 - 缓存管理器
   - 持有 `HashMap<handle_id, Arc<CacheInstanceHandle>>`
@@ -118,7 +121,7 @@ MediaInfo 包含
 
 - 文件表
   媒体标识: 媒体文件前16MiB MD5哈希值为主键,
-  对应的文件各项配置
+  对应的文件各项播放配置和可空 DandanPlay episode ID
 
 - 文件路径表
   MD5哈希值和文件在容器内的路径为主键
@@ -129,9 +132,8 @@ MediaInfo 包含
 
 - 前端 向后端发送前端媒体列表请求
 - 后端 收到请求, 查询 数据库文件路径表 获得所有文件路径及其对应的 MD5 哈希值
-- 后端 根据 MD5 哈希值查询文件表 构建 `List<(Path, configs)>`
-- 后端 根据文件路径*调用工具访问文件获得对应 metadata*, 构建 `List<(Path, MediaInfo)>`
-- 后端 向前端发送 `List<(Path, MediaInfo)>`
+- 后端 根据 MD5 哈希值查询文件表, 返回 file_id, path, configs 和 episode_id
+- 列表不读取媒体内容或运行 ffprobe, metadata 由前端按 file_id 单独按需请求
 
 2. 前端 构建缓存
 
@@ -157,6 +159,49 @@ MediaInfo 包含
 - retry 按 `media_id` 选择稳定排序后的首个现存源路径, 重扫身份并重新验证流选择
 - 没有源路径的缓存仍显示且可以删除, 但不允许播放或重试
 - 不存在 SessionManager, session_id, 会话释放或心跳
+
+4. 弹幕识别
+
+- 数据库文件表保存 Dandanplay episode ID 与媒体标识的对应关系
+- 前端 媒体列表展示 Dandanplay episode ID 的 UI 控件:
+  - ID 显示/编辑框: 用户可编辑并写回数据库
+  - 识别按钮: 可重复点击并访问 DandanPlay API, 无需先清空已有 ID.
+    唯一精确结果覆盖原 ID, 无唯一结果时保留原 ID, 具体流程如下:
+
+- 用户点击识别按钮
+- 前端 把媒体文件地址发送给后端
+- 后端 API枢纽 根据地址获得该文件前16MiB 的 MD5 哈希值, 文件大小, 文件名
+- 后端 API枢纽 根据这些参数访问Dandanplay API 进行文件识别
+- 后端 API枢纽 将唯一识别结果写回数据库, 返回最终 ID 和本次是否匹配
+
+实际接口为 `PUT /api/media/{file_id}/episode` 和 `POST /api/media/identify`.
+识别请求使用 JSON 路径字符串, 与单文件重扫一致.
+`match_file` 返回 `Result<Option<u64>>`, 只在上游标记精确且结果唯一有效时返回 ID.
+唯一结果覆盖已有或手动保存的 ID, 模糊结果或没有匹配返回 None, 不再提供候选选择.
+无唯一匹配和上游请求失败都保留原关联, 分别显示结果或错误, 不随意采用第一项.
+识别 API 返回最终 episode_id 和 matched 标志, 可区分新匹配与保留的旧 ID.
+输入框清空后点击 Save ID 会保存 NULL, 同内容副本共享 ID, 播放进度保存不会覆盖它.
+现有 media_id 数据库启动时自动增补 episode_id 字段, 保留已有记录.
+
+识别认证从环境变量获取, 在项目根目录 `.env` 中设置自己获授权的参数:
+
+```dotenv
+DANDAN_APP_ID=YOUR_APP_ID
+DANDAN_APP_SECRET=YOUR_APP_SECRET
+```
+
+Docker Compose 将这两项传入容器环境, 后端启动时读取, 不直接加载 `.env` 文件.
+修改 `.env` 后执行 `docker compose up -d --build` 重新创建服务, 仅 restart 不会更新容器环境.
+直接运行后端时需向进程导出这两个环境变量.
+`config.json` 不再接受 dandanplay 字段, 升级时请移除旧认证配置.
+两项均未设置或为空时不影响本地播放和手动编辑, 识别请求会明确返回未配置错误.
+仅设置一项或提供无效值时启动报错, 不回退到 JSON 中的凭据.
+凭据仅由后端读取, 浏览器不接收密钥; 上游只收到文件名, 前 16 MiB MD5 和文件大小,
+不会收到媒体完整路径或视频内容.
+签名和匹配协议参考 [NipaPlay-Reload](https://github.com/AimesSoft/NipaPlay-Reload)
+与 [anime-tool](https://github.com/Kuuhaku31/anime-tool), 不复用其应用凭据.
+当前只提供文件识别和 episode ID 关联, 不下载或显示弹幕.
+
 
 ### 前端的构建请求 `PlaybackQuery`
 

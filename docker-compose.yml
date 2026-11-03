@@ -7,6 +7,10 @@ services:
     stop_grace_period: 40s
     ports:
       - "${PORT}:8080"
+    # 只向容器传递识别认证参数, 两项留空时保留本地功能.
+    environment:
+      DANDAN_APP_ID: "${DANDAN_APP_ID:-}"
+      DANDAN_APP_SECRET: "${DANDAN_APP_SECRET:-}"
     volumes:
       - "${CONFIG_DIR}:/config:ro"
       - "${MEDIA_DIR}:/media:ro"

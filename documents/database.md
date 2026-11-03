@@ -2,7 +2,7 @@
 
 数据库固定为 `/data/main.db`, 由 DATA_DIR 持久化.
 DatabaseManager 独占唯一 SqlitePool, 启用外键并执行 `backend/sql/init.sql`.
-不再保留旧表结构或旧仓储兼容接口.
+不保留旧身份结构或旧仓储兼容接口, 当前 media_id 表允许增量增加剧集字段.
 
 ## file
 
@@ -13,10 +13,14 @@ DatabaseManager 独占唯一 SqlitePool, 启用外键并执行 `backend/sql/init
 | video_stream_index    | INTEGER | 可空且非负, 视频全局流索引     |
 | audio_stream_index    | INTEGER | 可空且非负, 音频全局流索引     |
 | subtitle_stream_index | INTEGER | 可空且非负, 字幕全局流索引     |
+| episode_id            | INTEGER | 可空且为正数, DandanPlay 剧集 ID |
 
-以上四个配置字段组成 MediaConfigs.
+position 和三个流索引组成 MediaConfigs, episode_id 不属于播放配置.
 扫描新内容时配置均为 null, 播放偏好由前端显式保存.
-保存接口完整替换配置, 不自动写入识别结果, 观看日期或媒体探测快照.
+播放配置接口完整替换这四个字段, 不覆盖剧集关联.
+episode_id 由独立接口手动保存, 清空或在唯一精确识别后替换,
+HTTP 接口限制为浏览器可精确表示的正整数, 最大为 9007199254740991.
+数据库不保存观看日期或媒体探测快照, 本轮也不保存候选标题和弹幕内容.
 
 ## file_path
 
@@ -31,14 +35,19 @@ DatabaseManager 独占唯一 SqlitePool, 启用外键并执行 `backend/sql/init
 
 ## 一致性
 
-媒体配置按内容共享, 列表和 HTTP 操作按 path 定位.
+媒体配置和 episode_id 按内容共享. 列表和识别按 path 定位,
+手动剧集保存按媒体 file_id 定位.
 单路径内容变化时在事务中移除原关联并写入新关联,
-若新内容已登记则复用其配置, 否则从空配置开始.
+若新内容已登记则复用其配置和剧集关联, 否则从空配置和 NULL ID 开始.
 
 全量扫描的新增, 更新和移除统一在一个事务中提交.
-所有新路径建立后才清理没有任何路径的 file 行,
-防止文件移动且旧位置被新内容占用时错误删除原内容配置.
-单路径删除也清理失去最后一个副本的配置.
+文件移动或路径删除只移除路径关联, 无路径的 file 行仍保留播放配置和剧集 ID.
+重新扫描同内容文件时可恢复这些信息, 删除播放缓存也不删除关联.
+
+识别期间不跨网络请求持有数据库事务或扫描锁.
+返回后再次扫描并校验内容, 使用路径与 media_id 条件更新.
+唯一精确结果覆盖写回时的 ID, 包括其他客户端在识别期间手动保存的关联.
+无唯一结果时通过 COALESCE(新 ID, episode_id) 保留数据库当前值, 外部错误也不修改关联.
 
 ScannerManager 串行化全量和单路径扫描, 每次重算前缀哈希,
 不依赖文件大小或修改时间. 哈希失败不会被当作文件已经消失,
@@ -50,10 +59,13 @@ media_id 只覆盖前 16 MiB, 不是全文件内容校验或安全认证标识.
 
 ## 升级与备份
 
-旧数据库不迁移, 不自动销毁数据.
-遇到旧 schema 会明确拒绝启动.
-升级前先停止实例并备份 main.db 及相关 SQLite 文件,
-再使用新的空数据库重新扫描. 不要让测试和生产实例共用 DATA_DIR.
+从已有 media_id 和四个播放字段的数据库升级时, 启动事务通过 ALTER TABLE
+增补 episode_id 列, 已有记录初始为 NULL, 原有路径和观看记录不变.
+首次创建数据库直接包含该字段, 重复启动不会重复添加.
+更早的 pre16mib_md5 等不兼容 schema 仍明确拒绝启动, 不删除或猜测转换旧数据.
+升级前停止实例并备份 main.db 及相关 SQLite 文件.
+只有不兼容旧身份结构才需要备份后使用空数据库重扫, 本次新增字段无需删库.
+不要让测试和生产实例共用 DATA_DIR.
 
 `/data/ddp-ani/` 和 `/data/ddp-danmaku/` 是独立于数据库 schema 的 API 缓存预留目录.
 播放缓存位于 `/cache/playback/`, 由宿主机 CACHE_DIR 独立挂载, 不保存在 DATA_DIR 中.

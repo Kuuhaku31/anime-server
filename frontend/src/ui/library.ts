@@ -1,9 +1,11 @@
 
 // frontend/src/ui/library.ts
-// 展示轻量媒体列表, 展开时按需探测元数据并创建缓存.
+// 展示轻量媒体列表, 编辑剧集关联并按需探测元数据和创建缓存.
 
-import { getMediaMetadata, listMedia, rescanMedia, scanMedia } from "../api/anime-server.ts";
-import type { MediaEntry, MediaInfo, PlaybackMedia, PlaybackQuery, StreamInfo, StreamSelection } from "../state/player-state.ts";
+import { getMediaMetadata, identifyMedia, listMedia, rescanMedia, saveMediaEpisode, scanMedia } from "../api/anime-server.ts";
+import type {
+  MediaEntry, MediaEpisode, MediaInfo, PlaybackMedia, PlaybackQuery, StreamInfo, StreamSelection,
+} from "../state/player-state.ts";
 import { formatTime } from "../playback/timeline.ts";
 import { element } from "./controls.ts";
 
@@ -93,6 +95,7 @@ export class Library extends EventTarget {
     };
     this.container.addEventListener("click", (event) => this.click(event));
     this.container.addEventListener("change", (event) => this.change(event));
+    this.container.addEventListener("input", (event) => this.episodeInput(event));
     const scan = element<HTMLButtonElement>("#scan");
     scan.onclick = async () => {
       scan.disabled = true;
@@ -113,6 +116,7 @@ export class Library extends EventTarget {
     this.metadata = new Map([...this.metadata].filter(([fileId]) => fileIds.has(fileId)));
     this.metadataErrors = new Map([...this.metadataErrors].filter(([fileId]) => fileIds.has(fileId)));
     this.loading = new Map([...this.loading].filter(([fileId]) => fileIds.has(fileId)));
+    this.episodes = new Map([...this.episodes].filter(([fileId]) => fileIds.has(fileId)));
     for (const file of this.files) {
       const info = this.metadata.get(file.file_id);
       if (info && !validSelection(info, this.selections.get(file.path))) {
@@ -162,6 +166,8 @@ export class Library extends EventTarget {
   private loading = new Map<string, Promise<void>>();
   /** 按内容 ID 缓存的 metadata 请求错误. */
   private metadataErrors = new Map<string, string>();
+  /** 按内容 ID 共享的输入草稿和局部请求状态. */
+  private episodes = new Map<string, EpisodeEditor>();
   /** 显示缓存构建请求的回调. */
   private build: (query: PlaybackQuery) => Promise<unknown>;
   /** 展示全局操作失败的回调. */
@@ -208,6 +214,8 @@ export class Library extends EventTarget {
     if (button.dataset.action === "build") void this.createCache(file);
     else if (button.dataset.action === "scan") void this.rescan(path);
     else if (button.dataset.action === "metadata") void this.loadMetadata(file, true);
+    else if (button.dataset.action === "episode-save") void this.saveEpisode(file);
+    else if (button.dataset.action === "episode-identify") void this.identifyEpisode(file);
   }
 
   /** 加载单个 metadata 并在同内容列表项间共享结果. */
@@ -269,6 +277,93 @@ export class Library extends EventTarget {
     } else return;
   }
 
+  /** 保存输入草稿, metadata 更新和播放高亮重绘不会抹掉未提交内容. */
+  private episodeInput(event: Event): void {
+    const target = event.target;
+    if (!(target instanceof HTMLInputElement) || !this.container.contains(target)) return;
+    const file = this.files.find((item) => item.path === target.dataset.path);
+    if (!file || target.dataset.episode !== file.file_id) return;
+    this.episodeState(file).draft = target.value;
+    for (const input of this.container.querySelectorAll<HTMLInputElement>("input[data-episode]")) {
+      if (input !== target && input.dataset.episode === file.file_id) input.value = target.value;
+    }
+  }
+
+  /** 为展开的同内容条目复用编辑状态, 草稿为空时使用数据库值. */
+  private episodeState(file: MediaEntry): EpisodeEditor {
+    let state = this.episodes.get(file.file_id);
+    if (!state) {
+      state = { draft: null, pending: null, message: null, error: null };
+      this.episodes.set(file.file_id, state);
+    }
+    return state;
+  }
+
+  /** 显式保存输入的剧集 ID, 清空输入时仅移除剧集关联. */
+  private async saveEpisode(file: MediaEntry): Promise<void> {
+    const state = this.episodeState(file);
+    if (state.pending) return;
+    const draft = (state.draft ?? String(file.episode_id ?? "")).trim();
+    const episodeId = draft === "" ? null : Number(draft);
+    if (episodeId !== null && (!Number.isSafeInteger(episodeId) || episodeId <= 0
+      || !/^\d+$/.test(draft))) {
+      state.error = "Episode ID must be a positive integer up to 9007199254740991. Leave it blank to clear.";
+      this.render();
+      return;
+    }
+    state.pending = "save";
+    state.error = null;
+    state.message = null;
+    this.render();
+    try {
+      const result = await saveMediaEpisode(file.file_id, episodeId);
+      this.applyEpisode(result);
+      state.draft = null;
+      state.message = result.episode_id === null ? "Episode association cleared." : `Episode ${result.episode_id} saved.`;
+    } catch (error) {
+      state.error = error instanceof Error ? error.message : String(error);
+    } finally {
+      state.pending = null;
+      this.render();
+    }
+  }
+
+  /** 允许重复识别, 显示唯一结果或未匹配时保留的原 ID. */
+  private async identifyEpisode(file: MediaEntry): Promise<void> {
+    const state = this.episodeState(file);
+    if (state.pending) return;
+    state.pending = "identify";
+    state.error = null;
+    state.message = null;
+    this.render();
+    try {
+      const result = await identifyMedia(file.path);
+      if (result.file_id !== file.file_id) await this.load();
+      const current = this.files.find((item) => item.path === file.path);
+      if (!current || current.file_id !== result.file_id) {
+        throw new Error("Media identity changed. Refresh the list before identifying again.");
+      }
+      this.applyEpisode(result);
+      const currentState = this.episodeState(current);
+      currentState.draft = null;
+      currentState.message = result.matched ? `Episode ${result.episode_id} saved.`
+        : result.episode_id !== null ? `No unique match found. Keeping episode ${result.episode_id}.`
+          : "No unique match found. Enter an episode ID manually.";
+    } catch (error) {
+      state.error = error instanceof Error ? error.message : String(error);
+    } finally {
+      state.pending = null;
+      this.render();
+    }
+  }
+
+  /** 将后端确认的 ID 同步到所有同内容副本, 不替换播放配置. */
+  private applyEpisode(result: MediaEpisode): void {
+    for (const file of this.files) {
+      if (file.file_id === result.file_id) file.episode_id = result.episode_id;
+    }
+  }
+
   /** 显式构建当前行所选轨道的缓存, 不切换播放器或保存观看配置. */
   private async createCache(file: MediaEntry): Promise<void> {
     const selection = this.selections.get(file.path);
@@ -314,10 +409,21 @@ export class Library extends EventTarget {
 
   /** 按展开集合和排序结果渲染紧凑行, 所有文本通过 textContent 设置. */
   private render(): void {
+    const active = document.activeElement;
+    const focused = active instanceof HTMLInputElement && this.container.contains(active) && active.dataset.episode
+      ? { path: active.dataset.path, start: active.selectionStart, end: active.selectionEnd } : null;
     element("#files-count").textContent = String(this.files.length);
     const rows = sortFiles(this.files, this.sort, this.metadata).map((file) => this.row(file));
     this.container.replaceChildren(...rows);
     if (!rows.length) this.container.textContent = "No media files found. Check the media mount and scan again.";
+    if (focused) {
+      const input = rows.find((row) => row.dataset.filePath === focused.path)
+        ?.querySelector<HTMLInputElement>("input[data-episode]");
+      if (input && !input.disabled) {
+        input.focus({ preventScroll: true });
+        input.setSelectionRange(focused.start, focused.end);
+      }
+    }
   }
 
   /** 创建一个可独立展开的路径条目及可选详情. */
@@ -342,6 +448,7 @@ export class Library extends EventTarget {
     const position = configs.position === null ? "Not watched" : `Watched ${formatTime(configs.position)}`;
     detail.textContent = info
       ? `${formatTime(info.metadata.duration)} / ${info.metadata.format} / ${position}` : position;
+    if (file.episode_id !== null) detail.textContent += ` / Episode ${file.episode_id}`;
     detail.title = detail.textContent;
     summary.append(name, detail);
     row.append(summary);
@@ -361,7 +468,7 @@ export class Library extends EventTarget {
     const saved = document.createElement("p");
     saved.className = "item-status";
     saved.textContent = `Saved position: ${configs.position === null ? "none" : formatTime(configs.position)}`;
-    details.append(source, saved);
+    details.append(source, saved, this.episodeEditor(file));
 
     if (info) {
       const status = document.createElement("p");
@@ -417,10 +524,63 @@ export class Library extends EventTarget {
     scan.dataset.action = "scan";
     scan.dataset.path = path;
     scan.textContent = this.scanning.has(path) ? "Scanning..." : "Rescan";
-    scan.disabled = this.scanning.has(path) || this.building.has(path);
+    scan.disabled = this.scanning.has(path) || this.building.has(path) || this.episodes.get(fileId)?.pending != null;
     actions.append(scan);
     details.append(actions);
     return details;
+  }
+
+  /** 渲染独立于 metadata 的剧集编辑区, 使用纯文本展示结果和错误. */
+  private episodeEditor(file: MediaEntry): HTMLDivElement {
+    const state = this.episodeState(file);
+    const editor = document.createElement("div");
+    editor.className = "episode-editor";
+    const fields = document.createElement("div");
+    fields.className = "episode-fields";
+    const label = document.createElement("label");
+    label.className = "episode-field";
+    const caption = document.createElement("span");
+    caption.textContent = "DandanPlay episode ID";
+    const input = document.createElement("input");
+    input.type = "text";
+    input.inputMode = "numeric";
+    input.autocomplete = "off";
+    input.placeholder = "Not identified";
+    input.dataset.path = file.path;
+    input.dataset.episode = file.file_id;
+    input.value = state.draft ?? String(file.episode_id ?? "");
+    input.disabled = state.pending !== null;
+    input.setAttribute("aria-label", `DandanPlay episode ID for ${fileName(file)}`);
+    label.append(caption, input);
+    const actions = document.createElement("div");
+    actions.className = "item-actions";
+    const save = document.createElement("button");
+    save.type = "button";
+    save.dataset.action = "episode-save";
+    save.dataset.path = file.path;
+    save.textContent = state.pending === "save" ? "Saving..." : "Save ID";
+    save.disabled = state.pending !== null;
+    const identify = document.createElement("button");
+    identify.type = "button";
+    identify.dataset.action = "episode-identify";
+    identify.dataset.path = file.path;
+    identify.textContent = state.pending === "identify" ? "Identifying..." : "Identify";
+    identify.disabled = state.pending !== null;
+    identify.title = "Send the filename, first 16 MiB MD5 and file size to DandanPlay.";
+    actions.append(save, identify);
+    fields.append(label, actions);
+    const hint = document.createElement("p");
+    hint.className = "item-status";
+    hint.textContent = "Save a blank ID to clear it. Identify sends only the filename, MD5 and file size to DandanPlay; only a unique match replaces the saved ID.";
+    editor.append(fields, hint);
+    if (state.error || state.message) {
+      const message = document.createElement("p");
+      message.className = state.error ? "item-error" : "item-status";
+      message.setAttribute("role", state.error ? "alert" : "status");
+      message.textContent = state.error ?? state.message;
+      editor.append(message);
+    }
+    return editor;
   }
 
   /** 创建一个带默认或显式关闭选择的流选择框. */
@@ -452,6 +612,18 @@ export class Library extends EventTarget {
     label.append(caption, select);
     return label;
   }
+}
+
+/** 保存同内容副本共享的编辑草稿和识别交互状态. */
+interface EpisodeEditor {
+  /** 未提交输入, null 表示显示数据库中的最新 ID. */
+  draft: string | null;
+  /** 当前在途操作, 用于禁用重复提交和同内容副本操作. */
+  pending: "save" | "identify" | null;
+  /** 最近一次操作的可见结果说明. */
+  message: string | null;
+  /** 只影响对应媒体内容的请求或输入诊断. */
+  error: string | null;
 }
 
 /** 浏览器中保存列表排序的存储键. */

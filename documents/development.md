@@ -45,14 +45,14 @@ curl --fail http://localhost:56080/health
 如果用户没有 Docker socket 权限, 使用宿主机已授权的 Docker 访问方式,
 不要为方便调试修改 socket 为全员可写.
 
-本次架构不兼容旧配置, 数据库和 API.
-先停止并备份旧实例, 再用示例配置和空数据库重新扫描,
-不要直接让测试实例操作生产数据.
+升级前停止并备份旧实例, 不要直接让测试实例操作生产数据.
+已有 media_id 与四个播放字段的数据库会自动增加 episode_id, 不需要空库重扫.
+更早的不兼容身份结构仍拒绝启动, 只有此类旧库需要备份后改用空库.
 缺少有效 instance.json 的旧缓存保留原文件并明确阻止启动, 由用户修复或手动移除.
 
 ## 运行配置
 
-`/config/config.json` 为扁平对象:
+`/config/config.json` 只保存扁平的本地运行字段, 不保存识别认证参数:
 
 ```json
 {
@@ -76,7 +76,46 @@ curl --fail http://localhost:56080/health
 
 缺省字段使用默认值, 未知字段报错.
 旧 web/playback 嵌套对象, cache_max_bytes, idle_timeout_seconds 和 max_variant_threads 已删除.
+旧 dandanplay 字段也已移除, 即使值为 null 也不再接受, 认证信息仅从环境变量读取.
 配置变更需要重启服务.
+
+### DandanPlay 识别凭据
+
+向 DandanPlay 申请并使用自己获授权的 App ID 和 App Secret,
+在项目根目录 `.env` 中设置:
+
+```dotenv
+DANDAN_APP_ID=YOUR_APP_ID
+DANDAN_APP_SECRET=YOUR_APP_SECRET
+```
+
+`docker-compose.yml` 显式将这两项传入容器环境, `.env` 不挂载或复制进镜像.
+后端只在启动时读取进程环境, 不自动查找或解析宿主机 `.env`.
+直接运行 Rust 二进制时也必须通过进程环境提供这两项.
+更新 `.env` 后使用 `docker compose up -d --build` 重新创建服务,
+仅执行 docker compose restart 不会更新容器已有的环境变量.
+
+两项均未设置或为空字符串时禁用自动识别, 只配置一项会明确拒绝启动.
+非空参数必须是合法 UTF-8, DANDAN_APP_ID 必须能用作非空 HTTP 请求头,
+DANDAN_APP_SECRET 不能只有空白字符. 无效值不回显到错误或日志.
+凭据只保留在服务端内存, 不参与 JSON 配置的读取和序列化,
+`/api/config` 仍只返回主题偏好, 调试输出隐藏凭据.
+不要复用参考项目的应用密钥, 不要将真实密钥写入仓库或前端代码.
+未配置时仍可手动保存或清空 episode ID, 也不影响本地播放.
+只有用户点击 Identify 时才访问上游, 未配置时显示 `503` 诊断.
+
+使用 DandanPlay 官方 `POST /api/v2/match`, 模式为 hashAndFileName.
+签名为 `Base64(SHA256(DANDAN_APP_ID + Unix秒时间戳 + "/api/v2/match" + DANDAN_APP_SECRET))`.
+请求只包含文件名, 前 16 MiB MD5 和文件大小, videoDuration 为 0,
+不上传完整路径或文件内容. 服务时钟需准确, 并能访问官方 HTTPS API.
+客户端使用系统信任的 CA 根证书, 禁止跟随重定向,
+连接超时 5 秒, 总请求超时 20 秒, 响应正文最多 1 MiB.
+Identify 可重复点击, 唯一精确匹配覆盖已有 ID, 不再提供模糊候选选择.
+无唯一匹配保留原 ID, 不会自动采用首个搜索结果, 响应 matched 为 false.
+外部失败明确上报为 `502` 或 `504`, 保留原 ID, 不伪装为没有匹配.
+本轮不下载番剧详情或弹幕, `/data/ddp-ani` 与 `/data/ddp-danmaku` 仍为预留目录.
+
+### 媒体进程预算
 
 编码任务名额为 max_processes - 1, 至少留一个位置供分片校验.
 默认两个进程名额允许一个编码器与一个校验进程.
@@ -239,3 +278,8 @@ docker rm anime-server-verify
 | 缓存目录无法初始化  | 检查写权限, 未知条目和是否有其他实例共享目录         |
 | 磁盘空间不足        | 没有自动淘汰, 在缓存列表确认后删除明确需要移除的实例   |
 | 构建目录权限错误    | 使用独立输出目录或按宿主机策略修复指定目录所有权     |
+| 识别提示未配置      | 在 .env 设置 DANDAN_APP_ID 和 DANDAN_APP_SECRET, 再用 compose up 重新创建容器 |
+| 认证变量启动报错    | 两项必须同时设置或同时留空, 删除 config.json 中的旧 dandanplay 字段 |
+| 识别返回 502 或 504 | 核对应用授权, 系统时钟, HTTPS 网络和服务端日志       |
+| 识别没有精确结果    | 原 ID 保持不变, 可重新识别或手动输入 ID, 不需要修改播放缓存 |
+| 识别返回 409        | 文件在请求期间已更换或消失, 刷新媒体列表后重试         |

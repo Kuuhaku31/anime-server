@@ -14,7 +14,8 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
 type SqlxErr = sqlx::Error; // 为 sqlx::Error 定义别名, 便于统一管理错误类型.
 
-type MediaPathList = Vec<(String, PathBuf, MediaConfigs)>;
+/// 保存媒体列表所需的内容标识, 路径, 播放配置和剧集关联.
+type MediaPathList = Vec<(String, PathBuf, MediaConfigs, Option<i64>)>;
 type PathAndIdentityList = Vec<(PathBuf, String)>;
 type OptionIdAndConfigs = Option<(String, MediaConfigs)>;
 type PathConfigsList = Vec<(PathBuf, MediaConfigs)>;
@@ -31,22 +32,31 @@ pub(crate) struct DatabaseManager {
 
 impl DatabaseManager {
 
-    /// 执行新 schema, 对旧数据库明确报错而不迁移或删除数据.
+    /// 初始化 schema 并为现有媒体表增补剧集字段, 不接受不兼容的旧身份结构.
     pub(crate) async fn initialize(path: &Path) -> Result<Self> {
         let options = SqliteConnectOptions::new()
             .filename(path).create_if_missing(true).foreign_keys(true);
         let pool = SqlitePoolOptions::new().max_connections(5).connect_with(options).await?;
-        sqlx::raw_sql(include_str!("../sql/init.sql")).execute(&pool).await?;
+        let mut transaction = pool.begin().await?;
+        sqlx::raw_sql(include_str!("../sql/init.sql")).execute(&mut *transaction).await?;
         sqlx::query("SELECT media_id, position, video_stream_index, audio_stream_index, subtitle_stream_index FROM file LIMIT 0")
-            .execute(&pool).await
+            .execute(&mut *transaction).await
             .context("incompatible database schema; back up and remove the old main.db before restarting")?;
+        let has_episode_id: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('file') WHERE name = 'episode_id')",
+        ).fetch_one(&mut *transaction).await?;
+        if !has_episode_id {
+            sqlx::query("ALTER TABLE file ADD COLUMN episode_id INTEGER CHECK (episode_id > 0)")
+                .execute(&mut *transaction).await?;
+        }
+        transaction.commit().await?;
         Ok(Self { pool })
     }
 
     /// 等待全部数据库连接关闭.
     pub(crate) async fn shutdown(&self) { self.pool.close().await; }
 
-    /// 返回所有路径及其对应的配置
+    /// 只读取数据库, 返回所有路径及共享播放配置和剧集 ID.
     pub(crate) async fn list_paths_with_configs(&self)
     -> Result<MediaPathList, SqlxErr>
     {
@@ -56,14 +66,16 @@ impl DatabaseManager {
                    f.position,
                    f.video_stream_index,
                    f.audio_stream_index,
-                   f.subtitle_stream_index
+                   f.subtitle_stream_index,
+                   f.episode_id
             FROM file_path AS fp
             JOIN file AS f ON f.media_id = fp.media_id ORDER BY fp.path
         ";
-        type Row = (String, String, Option<f64>, Option<i32>, Option<i32>, Option<i32>);
+        /// 对应路径, 播放字段和可空剧集 ID 的查询结果.
+        type Row = (String, String, Option<f64>, Option<i32>, Option<i32>, Option<i32>, Option<i64>);
 
         let rows = sqlx::query_as::<_, Row>(sql).fetch_all(&self.pool).await?;
-        Ok(rows.into_iter().map(|(media_id, path, po, v_s, a_s, s_s)|(
+        Ok(rows.into_iter().map(|(media_id, path, po, v_s, a_s, s_s, episode_id)|(
             media_id,
             PathBuf::from(path),
             MediaConfigs {
@@ -71,7 +83,8 @@ impl DatabaseManager {
                 video_stream_index: v_s,
                 audio_stream_index: a_s,
                 subtitle_stream_index: s_s
-            }
+            },
+            episode_id,
         )).collect())
     }
 
@@ -163,6 +176,33 @@ impl DatabaseManager {
 
         if result.rows_affected() == 0 { Err(SqlxErr::RowNotFound) }
         else { Ok(()) }
+    }
+
+    /// 读取指定内容的剧集关联, 缺失记录保留 RowNotFound 错误.
+    pub(crate) async fn episode_id(&self, media_id: &str) -> Result<Option<i64>, SqlxErr> {
+        sqlx::query_scalar("SELECT episode_id FROM file WHERE media_id = ?")
+            .bind(media_id).fetch_one(&self.pool).await
+    }
+
+    /// 单独保存或清空剧集 ID, 不修改任何播放配置.
+    pub(crate) async fn save_episode_id(&self, media_id: &str, episode_id: Option<i64>)
+    -> Result<Option<i64>, SqlxErr> {
+        sqlx::query_scalar(
+            "UPDATE file SET episode_id = ? WHERE media_id = ? \
+             AND EXISTS(SELECT 1 FROM file_path WHERE file_path.media_id = file.media_id) \
+             RETURNING episode_id",
+        ).bind(episode_id).bind(media_id).fetch_one(&self.pool).await
+    }
+
+    /// 仅更新仍绑定同一路径的内容, 唯一结果覆盖原 ID, None 保留写回时的关联.
+    pub(crate) async fn save_identified_episode_id(&self, media_id: &str, path: &Path, episode_id: Option<i64>)
+    -> Result<Option<i64>, SqlxErr> {
+        let path = path.to_str().ok_or_else(|| SqlxErr::Protocol(format!("non-UTF-8 media path: {}", path.display())))?;
+        sqlx::query_scalar(
+            "UPDATE file SET episode_id = COALESCE(?, episode_id) WHERE media_id = ? \
+             AND EXISTS(SELECT 1 FROM file_path WHERE path = ? AND file_path.media_id = file.media_id) \
+             RETURNING episode_id",
+        ).bind(episode_id).bind(media_id).bind(path).fetch_one(&self.pool).await
     }
 
     /// 在事务中替换路径的内容关联

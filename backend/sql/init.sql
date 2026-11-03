@@ -1,6 +1,6 @@
 
 -- backend/sql/init.sql
--- 创建媒体文件配置表和媒体路径关联表.
+-- 创建媒体文件配置, 剧集关联和媒体路径表.
 
 CREATE TABLE IF NOT EXISTS "file"
 (
@@ -8,7 +8,9 @@ CREATE TABLE IF NOT EXISTS "file"
     "position"              REAL CHECK ("position" >= 0),
     "video_stream_index"    INTEGER CHECK ("video_stream_index" >= 0),
     "audio_stream_index"    INTEGER CHECK ("audio_stream_index" >= 0),
-    "subtitle_stream_index" INTEGER CHECK ("subtitle_stream_index" >= 0)
+    "subtitle_stream_index" INTEGER CHECK ("subtitle_stream_index" >= 0),
+    -- 同内容副本共享的 DandanPlay 剧集 ID, NULL 表示尚未关联.
+    "episode_id"            INTEGER CHECK ("episode_id" > 0)
 )
 STRICT;
 

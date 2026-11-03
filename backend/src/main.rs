@@ -14,6 +14,7 @@ mod api;
 mod cache;
 mod config;
 mod constants;
+mod dandanplay;
 mod db;
 mod models;
 mod process;

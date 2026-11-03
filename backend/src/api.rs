@@ -1,5 +1,4 @@
 
-
 // backend/src/api.rs
 // 聚合全局 Manager 并公开 HTTP API 契约.
 
@@ -15,7 +14,7 @@ use serde_json::json;
 use tower_http::services::ServeFile;
 
 use crate::{
-    cache::CacheSnapshot, constants::CACHE_VERSION, db::DatabaseManager,
+    cache::CacheSnapshot, constants::CACHE_VERSION, dandanplay, db::DatabaseManager,
     models::{
         CacheSpec,
         MediaConfigs,
@@ -37,6 +36,15 @@ pub(crate) struct SaveMediaConfigsRequest {
     pub(crate) configs: MediaConfigs,
 }
 
+/// 单独替换媒体内容的剧集 ID, 显式 null 用于清空关联.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SaveMediaEpisodeRequest {
+    /// 正整数剧集 ID 或 null, 不允许省略字段而意外清空.
+    #[serde(deserialize_with = "Option::deserialize")]
+    episode_id: Option<i64>,
+}
+
 // 各项 JSON 响应类型
 type GetConfigResponse = Json<ConfigResponseBody>;
 type ListMediaResponse = Json<Vec<ListMediaResponseItem>>;
@@ -44,6 +52,10 @@ type MediaMetadataResponse = Json<MediaMetadataResponseBody>;
 type ScanMediaResponse = Json<ScanChanges>;
 type RescanMediaResponse = Json<Option<ListMediaResponseItem>>;
 type SaveMediaConfigsResponse = StatusCode;
+/// 返回手动保存后的内容标识和剧集 ID.
+type SaveMediaEpisodeResponse = Json<MediaEpisodeResponseBody>;
+/// 返回识别后实际保存的 ID 和本次是否取得唯一匹配.
+type IdentifyMediaResponse = Json<IdentifyMediaResponseBody>;
 type BuildCacheResponse = Json<BuildCacheResponseBody>;
 type ListCacheResponse = Json<CacheListResponseBody>;
 type CacheDetailResponse = Json<CacheSnapshot>;
@@ -67,6 +79,28 @@ struct ListMediaResponseItem {
     path: PathBuf,
     /// 同内容路径共享的播放配置.
     configs: MediaConfigs,
+    /// 同内容路径共享的 DandanPlay 剧集 ID, null 表示尚未关联.
+    episode_id: Option<i64>,
+}
+
+/// 描述独立于播放配置的剧集关联.
+#[derive(Debug, Serialize)]
+struct MediaEpisodeResponseBody {
+    /// 数据库中的媒体内容标识.
+    file_id: String,
+    /// 当前保存的剧集 ID, 可由用户清空.
+    episode_id: Option<i64>,
+}
+
+/// 区分本次唯一匹配与未匹配时保留的已有剧集关联.
+#[derive(Debug, Serialize)]
+struct IdentifyMediaResponseBody {
+    /// 本次重新扫描确认的媒体内容标识.
+    file_id: String,
+    /// 数据库实际保存的剧集 ID, 无唯一结果时保留原关联.
+    episode_id: Option<i64>,
+    /// 本次识别是否取得并保存了唯一精确匹配.
+    matched: bool,
 }
 
 /// 描述单个媒体实时探测得到的 metadata 和共享配置.
@@ -104,8 +138,10 @@ pub(crate) fn router() -> Router {
 
     .route("/api/media", get(list_media))
     .route("/api/media/{file_id}/metadata", get(media_metadata))
+    .route("/api/media/{file_id}/episode", put(save_media_episode))
     .route("/api/media/scan", post(scan_media))
     .route("/api/media/rescan", post(rescan_media))
+    .route("/api/media/identify", post(identify_media))
     .route("/api/media/configs", put(save_media_configs))
 
     .route("/api/cache", get(list_cache).post(build_cache))
@@ -121,12 +157,13 @@ async fn get_config() -> GetConfigResponse {
     Json(ConfigResponseBody { default_dark_mode: services::config().default_dark_mode })
 }
 
-/// 读取数据库中的路径和配置
+/// 只读取数据库中的路径, 播放配置和剧集 ID.
 async fn list_media()
 -> Result<ListMediaResponse, ApiError>
 {
     let records = services::database().list_paths_with_configs().await.map_err(ApiError::internal)?;
-    Ok(records.into_iter().map(|(file_id, path, configs)| ListMediaResponseItem { file_id, path, configs }).collect::<Vec<_>>().into())
+    Ok(records.into_iter().map(|(file_id, path, configs, episode_id)|
+        ListMediaResponseItem { file_id, path, configs, episode_id }).collect::<Vec<_>>().into())
 }
 
 /// 按数据库内容 ID 探测一个仍存在的媒体副本.
@@ -163,7 +200,8 @@ async fn rescan_media(input: Result<Json<PathBuf>, JsonRejection>)
         else { return Ok(Json(None)); };
     let (file_id, configs) = services::database().get_file_by_path(&file.path).await.map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::missing("media path was removed during rescan"))?;
-    Ok(Json(Some(ListMediaResponseItem { file_id, path: file.path, configs })))
+    let episode_id = services::database().episode_id(&file_id).await.map_err(ApiError::internal)?;
+    Ok(Json(Some(ListMediaResponseItem { file_id, path: file.path, configs, episode_id })))
 }
 
 
@@ -184,6 +222,53 @@ async fn save_media_configs(input: Result<Json<SaveMediaConfigsRequest>, JsonRej
         else { ApiError::internal(error) }
     })?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// 手动保存或清空共享剧集 ID, 不触发扫描, 探测或外部请求.
+async fn save_media_episode(
+    Path(file_id): Path<String>, input: Result<Json<SaveMediaEpisodeRequest>, JsonRejection>,
+) -> Result<SaveMediaEpisodeResponse, ApiError> {
+    let Json(input) = input.map_err(ApiError::bad)?;
+    let episode_id = services::database().save_episode_id(&file_id, input.episode_id).await.map_err(|error| {
+        if matches!(error, sqlx::Error::RowNotFound) { ApiError::missing("media file not found") }
+        else { ApiError::internal(error) }
+    })?;
+    Ok(Json(MediaEpisodeResponseBody { file_id, episode_id }))
+}
+
+/// 根据路径重复识别剧集, 唯一精确匹配覆盖原 ID, 未匹配时保留原关联.
+async fn identify_media(input: Result<Json<PathBuf>, JsonRejection>) -> Result<IdentifyMediaResponse, ApiError> {
+    let Json(path) = input.map_err(ApiError::bad)?;
+    let database = services::database();
+    let scanner = services::scanner();
+    let file = scanner.scan_one(database, &path).await.map_err(ApiError::media)?
+        .ok_or_else(|| ApiError::missing("media file not found"))?;
+    let config = services::config().dandanplay.as_ref().ok_or_else(|| ApiError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        message: "DandanPlay identification is not configured; set DANDAN_APP_ID and DANDAN_APP_SECRET in the server environment".to_owned(),
+    })?;
+    let resolved = scanner.resolve(&file.path).await.map_err(ApiError::media)?;
+    let file_size = tokio::fs::metadata(&resolved).await.map_err(ApiError::media)?.len();
+    let file_name = file.path.file_name().and_then(|name| name.to_str())
+        .ok_or_else(|| ApiError::bad("media filename must be valid UTF-8"))?;
+    let result = dandanplay::match_file(config, file_name, &file.media_id, file_size).await
+        .map_err(ApiError::upstream)?;
+
+    // 外部请求期间不占用扫描锁, 返回后重新确认路径内容再执行条件更新.
+    let current = scanner.scan_one(database, &path).await.map_err(ApiError::media)?
+        .ok_or_else(|| ApiError::conflict("media file disappeared during identification; refresh the list"))?;
+    let resolved = scanner.resolve(&current.path).await.map_err(ApiError::media)?;
+    let current_size = tokio::fs::metadata(resolved).await.map_err(ApiError::media)?.len();
+    if current.media_id != file.media_id || current_size != file_size {
+        return Err(ApiError::conflict("media file changed during identification; refresh the list and retry"));
+    }
+    let matched_id = result.map(i64::try_from).transpose().map_err(|error| ApiError::upstream(error.into()))?;
+    let episode_id = database.save_identified_episode_id(&file.media_id, &path, matched_id).await.map_err(|error| {
+        if matches!(error, sqlx::Error::RowNotFound) {
+            ApiError::conflict("media path changed during identification; refresh the list and retry")
+        } else { ApiError::internal(error) }
+    })?;
+    Ok(Json(IdentifyMediaResponseBody { file_id: file.media_id, episode_id, matched: result.is_some() }))
 }
 
 
@@ -372,6 +457,20 @@ impl ApiError {
     /// 表示媒体, 缓存句柄或资源不存在.
     fn missing(error: impl std::fmt::Display) -> Self {
         Self { status: StatusCode::NOT_FOUND, message: error.to_string() }
+    }
+
+    /// 表示识别期间源路径发生变化, 调用方必须刷新后再尝试.
+    fn conflict(error: impl std::fmt::Display) -> Self {
+        Self { status: StatusCode::CONFLICT, message: error.to_string() }
+    }
+
+    /// 保留外部 API 的超时语义, 其他网络和协议错误返回 502.
+    fn upstream(error: anyhow::Error) -> Self {
+        let timeout = error.downcast_ref::<reqwest::Error>().is_some_and(|error| error.is_timeout());
+        Self {
+            status: if timeout { StatusCode::GATEWAY_TIMEOUT } else { StatusCode::BAD_GATEWAY },
+            message: format!("{error:#}"),
+        }
     }
 
     /// 缓存操作保留缺失和停止冲突语义, 其他错误明确报告为内部失败.

@@ -1,9 +1,11 @@
 
-
 // frontend/src/api/anime-server.ts
-// 封装媒体配置, 缓存构建管理和稳定句柄资源地址.
+// 封装媒体配置, 剧集识别, 缓存管理和稳定句柄资源地址.
 
-import type { CacheBuild, CacheEntry, CacheList, MediaConfigs, MediaEntry, MediaInfo, PlaybackQuery, ScanChanges } from "../state/player-state.ts";
+import type {
+  CacheBuild, CacheEntry, CacheList, MediaConfigs, MediaEntry, MediaEpisode, MediaIdentification,
+  MediaInfo, PlaybackQuery, ScanChanges,
+} from "../state/player-state.ts";
 
 /** 保留服务端返回的 HTTP 状态和错误正文. */
 export class ApiError extends Error {
@@ -53,6 +55,16 @@ export function scanMedia(): Promise<ScanChanges> {
 /** 重扫指定路径并返回轻量数据库条目, 文件已经移除时返回 null. */
 export function rescanMedia(path: string, signal?: AbortSignal): Promise<MediaEntry | null> {
   return jsonRequest("/api/media/rescan", path, "POST", signal);
+}
+
+/** 仅保存或清空剧集 ID, 不改动共享播放进度和轨道偏好. */
+export function saveMediaEpisode(fileId: string, episodeId: number | null): Promise<MediaEpisode> {
+  return jsonRequest(`/api/media/${encodeURIComponent(fileId)}/episode`, { episode_id: episodeId }, "PUT");
+}
+
+/** 将路径字符串发给后端, 由后端读取文件信息并调用识别 API. */
+export function identifyMedia(path: string): Promise<MediaIdentification> {
+  return jsonRequest("/api/media/identify", path);
 }
 
 /** 按路径保存完整播放配置, 卸载时允许使用 keepalive. */

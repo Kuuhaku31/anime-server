@@ -338,6 +338,42 @@ main {
   color: #e75f6d;
   overflow-wrap: anywhere;
 }
+/* 剧集编辑不依赖 metadata, 窄列下输入和按钮自然换行. */
+.episode-editor {
+  display: grid;
+  min-width: 0;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+}
+.episode-fields {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 8px;
+}
+.episode-field {
+  display: grid;
+  flex: 1 1 150px;
+  min-width: 0;
+  gap: 5px;
+}
+.episode-field > span {
+  color: var(--muted);
+  font-size: 11px;
+}
+.episode-field input {
+  width: 100%;
+  min-width: 0;
+  padding: 7px 8px;
+  color: var(--foreground);
+  background: var(--button);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  font: inherit;
+}
 .actions {
   flex: 0 0 auto;
   display: flex;
